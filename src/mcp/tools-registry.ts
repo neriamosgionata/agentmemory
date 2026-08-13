@@ -37,6 +37,12 @@ export const CORE_TOOLS: McpToolDef[] = [
             "alone exceeds the budget it is returned clipped with " +
             "content_truncated: true instead of dropped.",
         },
+        project: {
+          type: "string",
+          description:
+            "Filter results to memories saved under this stable canonical project " +
+            "identifier (same value used with memory_save's project field).",
+        },
       },
       required: ["query"],
     },
@@ -149,6 +155,12 @@ export const CORE_TOOLS: McpToolDef[] = [
           description: "Comma-separated observation IDs to expand",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        project: {
+          type: "string",
+          description:
+            "Filter results to memories saved under this stable canonical project " +
+            "identifier (same value used with memory_save's project field).",
+        },
       },
       required: ["query"],
     },
