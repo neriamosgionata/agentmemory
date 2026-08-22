@@ -42,7 +42,13 @@ export function registerHealthMonitor(
     const systemDelta = currentCpu.system - prevCpuUsage.system;
     const singleCoreCpuPercent =
       elapsedMs > 0 ? ((userDelta + systemDelta) / 1000 / elapsedMs) * 100 : 0;
-    const coreCount = cpus().length;
+    // #1235: clamp here, not just inside normalizeCpuPercent, so the divisor
+    // we record in the snapshot (cores) is the same number we divided by.
+    // Storing the raw (possibly 0) os.cpus().length would make cpu.cores
+    // lie about the divisor in exactly the empty-array edge case the clamp
+    // exists for.
+    const rawCoreCount = cpus().length;
+    const coreCount = rawCoreCount > 0 ? rawCoreCount : 1;
     const cpuPercent = normalizeCpuPercent(singleCoreCpuPercent, coreCount);
     prevCpuUsage = currentCpu;
     prevCpuTime = now;
