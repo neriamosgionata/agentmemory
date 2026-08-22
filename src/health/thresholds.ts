@@ -59,9 +59,15 @@ export function evaluateHealth(
     degraded = true;
   }
 
+  // #1223: prefer the V8 hard ceiling. heapTotal is demand-sized, so the
+  // old ratio reported 'critical' on a process at 10% of its real limit.
+  const heapDenominator =
+    snapshot.memory.heapLimit && snapshot.memory.heapLimit > 0
+      ? snapshot.memory.heapLimit
+      : snapshot.memory.heapTotal;
   const memPercent =
-    snapshot.memory.heapTotal > 0
-      ? (snapshot.memory.heapUsed / snapshot.memory.heapTotal) * 100
+    heapDenominator > 0
+      ? (snapshot.memory.heapUsed / heapDenominator) * 100
       : 0;
   const rss = snapshot.memory.rss ?? 0;
   const rssAboveFloor = rss >= cfg.memoryRssFloorBytes;
