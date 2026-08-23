@@ -192,6 +192,7 @@ export interface SearchResult {
   observation: CompressedObservation;
   score: number;
   sessionId: string;
+  content_truncated?: boolean;
 }
 
 export interface ContextBlock {
@@ -297,6 +298,7 @@ export interface CompactSearchResult {
   type: ObservationType;
   score: number;
   timestamp: string;
+  content_truncated?: boolean;
 }
 
 export interface CompactLessonResult {
