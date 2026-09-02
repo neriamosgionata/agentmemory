@@ -91,7 +91,6 @@ export function registerHealthMonitor(
       memory: {
         heapUsed: mem.heapUsed,
         heapTotal: mem.heapTotal,
-        // #1223: hard ceiling, see thresholds.ts for why this beats heapTotal.
         heapLimit: getHeapStatistics().heap_size_limit,
         rss: mem.rss,
         external: mem.external,

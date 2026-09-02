@@ -229,10 +229,8 @@ export interface HealthSnapshot {
   memory: {
     heapUsed: number;
     heapTotal: number;
-    // #1223: V8's hard ceiling (heap_size_limit). heapTotal is only what
-    // V8 has committed so far and grows to meet demand, so heapUsed over
-    // heapTotal can only ever over-report pressure. Optional so snapshots
-    // persisted before this field keep deserializing.
+    // V8's heap_size_limit. Optional so snapshots persisted before this
+    // field keep deserializing.
     heapLimit?: number;
     rss: number;
     external: number;
