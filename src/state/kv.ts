@@ -1,5 +1,6 @@
 import type { ISdk } from 'iii-sdk'
 import { getEnvVar } from '../config.js'
+import { onGraphDelete, onGraphUpdate, onGraphWrite } from './graph-cache.js'
 
 // Worker-wide invocationTimeoutMs is 180000ms (src/index.ts), sized for
 // LLM-backed functions like mem::graph-extract's provider.compress() call,
@@ -51,11 +52,17 @@ export class StateKV {
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    return this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+    const result = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
       function_id: 'state::set',
       payload: { scope, key, value },
       timeoutMs: KV_TIMEOUT_MS,
     })
+    // Graph writes arrive from graph-extract, mesh sync, import, cascade
+    // and snapshot restore. Patching the cached graph view here — the one
+    // path they all route through — keeps it warm instead of forcing the
+    // next search to re-enumerate the whole graph scope.
+    onGraphWrite(this, scope, key, value)
+    return result
   }
 
   async update<T = unknown>(
@@ -63,7 +70,7 @@ export class StateKV {
     key: string,
     ops: Array<{ type: string; path: string; value?: unknown }>,
   ): Promise<T> {
-    return this.sdk.trigger<
+    const result = await this.sdk.trigger<
       { scope: string; key: string; ops: Array<{ type: string; path: string; value?: unknown }> },
       T
     >({
@@ -71,14 +78,17 @@ export class StateKV {
       payload: { scope, key, ops },
       timeoutMs: KV_TIMEOUT_MS,
     })
+    onGraphUpdate(this, scope)
+    return result
   }
 
   async delete(scope: string, key: string): Promise<void> {
-    return this.sdk.trigger<{ scope: string; key: string }, void>({
+    await this.sdk.trigger<{ scope: string; key: string }, void>({
       function_id: 'state::delete',
       payload: { scope, key },
       timeoutMs: KV_TIMEOUT_MS,
     })
+    onGraphDelete(this, scope, key)
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
