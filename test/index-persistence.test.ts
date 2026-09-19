@@ -951,13 +951,24 @@ describe("IndexPersistence", () => {
       kv.get(bm25Manifest!.shards[0].scope, "data"),
     ).resolves.toEqual(expect.any(String));
 
-    const vectorManifest = await kv.get<TestIndexShardManifest>(
-      BM25_SCOPE,
-      VECTOR_MANIFEST_KEY,
-    );
-    expect(vectorManifest?.generation).toBe("gen_active");
+    const vectorManifest = await kv.get<{
+      v: number;
+      shards: Record<string, { hash: string; chunks: number }>;
+    }>(BM25_SCOPE, VECTOR_MANIFEST_KEY);
+    // Post-#1258 the vector manifest is the v2 bucket form: no generation
+    // component, and the orphan sweep treats the whole legacy registry as
+    // reclaimable while the buckets stay intact.
+    expect(vectorManifest?.v).toBe(2);
+    const activeBucketKeys = Object.keys(vectorManifest!.shards ?? {});
+    expect(activeBucketKeys.length).toBeGreaterThan(0);
     await expect(
-      kv.get(vectorManifest!.shards[0].scope, "data"),
+      kv.get(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(
+          activeBucketKeys[0]!,
+          vectorManifest!.shards[activeBucketKeys[0]!]!.hash,
+        ),
+      ),
     ).resolves.toEqual(expect.any(String));
 
     // Registry must now only contain active generations

@@ -425,9 +425,16 @@ export class IndexPersistence {
       if (m === null || m === undefined) {
         vectorEligible = true;
         activeVectorGen = null;
-      } else if (m && m.v === 1 && Array.isArray(m.shards)) {
+      } else if (isVectorBucketManifest(m)) {
+        // v2 buckets are deterministic and addressed by content, so no
+        // generation can be "active": any legacy v1 generation named in the
+        // registry is unreachable and safe to reclaim after the grace period.
         vectorEligible = true;
-        activeVectorGen = typeof m.generation === "string" ? m.generation : null;
+        activeVectorGen = null;
+      } else if (m && (m as IndexShardManifest).v === 1 && Array.isArray((m as IndexShardManifest).shards)) {
+        const v1 = m as IndexShardManifest;
+        vectorEligible = true;
+        activeVectorGen = typeof v1.generation === "string" ? v1.generation : null;
       } else {
         logger.warn(
           "index persistence: Vector manifest corrupt during orphan sweep, skipping Vector GC",
