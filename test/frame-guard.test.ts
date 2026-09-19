@@ -135,3 +135,34 @@ describe("mem::export frame guard", () => {
     expect(payloadByteLength(result)).toBeLessThan(2048);
   });
 });
+
+describe("payloadByteLength incremental estimator", () => {
+  it("matches JSON.stringify's UTF-8 length on nested payloads", () => {
+    const payload = {
+      version: "0.9.29",
+      sessions: [
+        { id: "ses_1", tags: ["a", "b"], meta: { deep: { n: 1.5, ok: true } } },
+        { id: "ses_2", nested: [null, "日本語テキスト", { k: "v" }] },
+      ],
+      empty: {},
+      list: [],
+      nullable: null,
+      skip: undefined,
+    };
+    const expected = Buffer.byteLength(JSON.stringify(payload), "utf8");
+    expect(payloadByteLength(payload)).toBe(expected);
+  });
+
+  it("treats undefined array items as null like JSON.stringify", () => {
+    const payload = [1, undefined, "x"];
+    expect(payloadByteLength(payload)).toBe(
+      Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    );
+  });
+
+  it("throws on circular structures instead of hanging", () => {
+    const payload: Record<string, unknown> = { a: 1 };
+    payload["self"] = payload;
+    expect(() => payloadByteLength(payload)).toThrow(/circular/i);
+  });
+});

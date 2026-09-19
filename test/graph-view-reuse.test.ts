@@ -194,3 +194,72 @@ describe("graph view reuse (#1300)", () => {
     expect(kv.listCalls.length).toBe(before + 2);
   });
 });
+
+describe("graph view frame-ceiling guard (#1124/#1142)", () => {
+  it("serves snapshot top-N without enumerating when the corpus exceeds the ceiling", async () => {
+    process.env["AGENTMEMORY_GRAPH_VIEW_MAX_ROWS"] = "2";
+    try {
+      const kv = countingKV(
+        [makeNode("gn_live", "live", ["obs_9"])],
+        [makeEdge("ge_live", "gn_live", "gn_live")],
+      );
+      await kv.set("mem:graph:snapshot", "current", {
+        version: 1,
+        topNodes: [makeNode("gn_top", "top", ["obs_1"])],
+        topEdges: [],
+        topDegrees: { gn_top: 0 },
+        stats: {
+          totalNodes: 50_000,
+          totalEdges: 60_000,
+          nodesByType: {},
+          edgesByType: {},
+        },
+        updatedAt: "2026-02-01T10:00:00Z",
+        dirty: false,
+      });
+      const { getGraphView, invalidateGraphCache: invalidate } = await import(
+        "../src/state/graph-cache.js"
+      );
+      invalidate(kv as never);
+
+      const view = await getGraphView(kv as never);
+
+      expect(view.nodes.has("gn_top")).toBe(true);
+      expect(view.nodes.has("gn_live")).toBe(false);
+      expect(kv.listCalls).toEqual([]);
+    } finally {
+      delete process.env["AGENTMEMORY_GRAPH_VIEW_MAX_ROWS"];
+    }
+  });
+
+  it("still enumerates when the snapshot reports a small corpus", async () => {
+    process.env["AGENTMEMORY_GRAPH_VIEW_MAX_ROWS"] = "100";
+    try {
+      const kv = countingKV([makeNode("gn_1", "one", ["obs_1"])], []);
+      await kv.set("mem:graph:snapshot", "current", {
+        version: 1,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: {
+          totalNodes: 1,
+          totalEdges: 0,
+          nodesByType: {},
+          edgesByType: {},
+        },
+        updatedAt: "2026-02-01T10:00:00Z",
+        dirty: false,
+      });
+      const { getGraphView, invalidateGraphCache: invalidate } = await import(
+        "../src/state/graph-cache.js"
+      );
+      invalidate(kv as never);
+
+      const view = await getGraphView(kv as never);
+      expect(view.nodes.has("gn_1")).toBe(true);
+      expect(kv.listCalls.length).toBe(2);
+    } finally {
+      delete process.env["AGENTMEMORY_GRAPH_VIEW_MAX_ROWS"];
+    }
+  });
+});

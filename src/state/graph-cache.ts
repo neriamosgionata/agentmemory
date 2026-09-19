@@ -1,4 +1,4 @@
-import type { GraphEdge, GraphNode } from "../types.js";
+import type { GraphEdge, GraphNode, GraphSnapshot } from "../types.js";
 import { KV } from "./schema.js";
 import type { StateKV } from "./kv.js";
 import { getEnvVar } from "../config.js";
@@ -55,6 +55,13 @@ interface CacheEntry {
 
 const DEFAULT_TTL_MS = 300_000;
 const DEFAULT_IDLE_MS = 600_000;
+// A full `state::list` response larger than the engine's ~16 MiB frame cap
+// drops the whole worker (#1124/#1142). The snapshot is a small row with
+// corpus-wide counts, so it can gate the enumeration before the worker
+// ever asks for it. Above this many rows the view is built from the
+// snapshot's top-N subgraph instead — degraded graph search, live process.
+const SNAPSHOT_KEY = "current";
+const DEFAULT_MAX_ROWS = 100_000;
 
 const GRAPH_SCOPES = new Set<string>([KV.graphNodes, KV.graphEdges]);
 
@@ -164,6 +171,40 @@ function armIdleRelease(entry: CacheEntry): void {
 
 async function buildView(kv: StateKV): Promise<GraphView> {
   const startedAt = Date.now();
+  // Cheap pre-flight: the snapshot carries corpus-wide node/edge counts
+  // without enumerating either scope. Past the ceiling, skip the full list
+  // (the response frame would drop the worker) and serve the top-N
+  // subgraph the snapshot already holds.
+  const maxRows = envMs("AGENTMEMORY_GRAPH_VIEW_MAX_ROWS", DEFAULT_MAX_ROWS);
+  let snapshot: GraphSnapshot | null = null;
+  try {
+    snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
+  } catch {
+    snapshot = null;
+  }
+  const knownRows = snapshot
+    ? (snapshot.stats?.totalNodes ?? 0) + (snapshot.stats?.totalEdges ?? 0)
+    : 0;
+  if (snapshot && knownRows > maxRows) {
+    const next = emptyView();
+    for (const node of snapshot.topNodes ?? []) {
+      if (!node || node.stale) continue;
+      indexNode(next, node);
+    }
+    for (const edge of snapshot.topEdges ?? []) {
+      if (!edge || edge.stale) continue;
+      linkEdge(next, edge);
+    }
+    logger.warn("Graph view degraded to snapshot top-N (row ceiling)", {
+      knownRows,
+      maxRows,
+      nodes: next.nodes.size,
+      edges: next.edges.size,
+      ms: Date.now() - startedAt,
+    });
+    return next;
+  }
+
   // Sequential, not Promise.all: two multi-megabyte WS frames in flight
   // at once doubles the peak parse cost on the worker event loop.
   const rawNodes = await kv.list<GraphNode>(KV.graphNodes);

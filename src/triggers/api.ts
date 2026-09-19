@@ -1357,7 +1357,12 @@ export function registerApiTriggers(
         function_id: "mem::export",
         payload,
       });
-      return { status_code: 200, body: result };
+      // #1334: the refusal used to ride HTTP 200, so scripts kept parsing a
+      // body with success:false and no data. Surface it as 413.
+      const oversized =
+        result && typeof result === "object" &&
+        (result as { oversized?: unknown }).oversized === true;
+      return { status_code: oversized ? 413 : 200, body: result };
     },
   );
   sdk.registerTrigger({
