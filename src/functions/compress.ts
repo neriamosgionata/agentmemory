@@ -133,13 +133,25 @@ export function registerCompressFunction(
             : { valid: false, errors: result.result.errors };
         };
 
-        const { response, retried } = await compressWithRetry(
+        const { response, retried, valid } = await compressWithRetry(
           provider,
           COMPRESSION_SYSTEM,
           prompt,
           validator,
           1,
         );
+
+        if (!valid) {
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::compress", latencyMs, false);
+          }
+          logger.warn("Compression response failed validation after retry", {
+            obsId: data.observationId,
+            retried,
+          });
+          return { success: false, error: "validation_failed" };
+        }
 
         const parsed = parseCompressionXml(response);
         if (!parsed) {

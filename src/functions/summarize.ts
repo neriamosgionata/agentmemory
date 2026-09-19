@@ -311,7 +311,31 @@ export function registerSummarizeFunction(
             session.project,
             compressed.length,
           );
-          if (summary) break;
+          if (summary) {
+            // #1240: a schema failure (e.g. narrative under the length floor)
+            // used to end the call after one attempt, so the retry loop never
+            // saw it. Validate inside the loop and let attempt 2 fix it.
+            const candidate = {
+              title: summary.title,
+              narrative: summary.narrative,
+              keyDecisions: summary.keyDecisions,
+              filesModified: summary.filesModified,
+              concepts: summary.concepts,
+            };
+            const attemptValidation = validateOutput(
+              SummaryOutputSchema,
+              candidate,
+              "mem::summarize",
+            );
+            if (attemptValidation.valid) break;
+            logger.warn("Summary validation failed", {
+              sessionId,
+              attempt,
+              errors: attemptValidation.result.errors,
+            });
+            summary = null;
+            continue;
+          }
           logger.warn("Failed to parse summary XML", { sessionId, attempt });
         }
 

@@ -10,10 +10,10 @@ export async function compressWithRetry(
   userPrompt: string,
   validator: (response: string) => { valid: boolean; errors?: string[] },
   maxRetries = 1,
-): Promise<{ response: string; retried: boolean }> {
+): Promise<{ response: string; retried: boolean; valid: boolean }> {
   const first = await provider.compress(systemPrompt, userPrompt);
   const result = validator(first);
-  if (result.valid) return { response: first, retried: false };
+  if (result.valid) return { response: first, retried: false, valid: true };
 
   for (let i = 0; i < maxRetries; i++) {
     const retry = await provider.compress(
@@ -21,8 +21,13 @@ export async function compressWithRetry(
       userPrompt,
     );
     const retryResult = validator(retry);
-    if (retryResult.valid) return { response: retry, retried: true };
+    if (retryResult.valid)
+      return { response: retry, retried: true, valid: true };
   }
 
-  return { response: first, retried: true };
+  // #1271: do not hand back a response the validator rejected as if it were
+  // good. Returning `first` here made the caller persist preamble, truncated
+  // narratives, and other invalid payloads. The caller now decides whether to
+  // keep the raw observation, retry later, or fail.
+  return { response: first, retried: true, valid: false };
 }

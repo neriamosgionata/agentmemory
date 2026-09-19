@@ -14,8 +14,16 @@ describe('getXmlTag', () => {
     expect(getXmlTag('<title>Hello</title>', 'missing')).toBe('')
   })
 
-  it('returns first match for duplicate tags', () => {
-    expect(getXmlTag('<title>First</title><title>Second</title>', 'title')).toBe('First')
+  it('returns last match for duplicate tags (#1271)', () => {
+    expect(getXmlTag('<title>First</title><title>Second</title>', 'title')).toBe('Second')
+  })
+
+  it('ignores tag-shaped preamble and takes the final payload (#1271)', () => {
+    const response =
+      'Sure, here is a draft. The <title> field must be short.</title> ' +
+      'Final answer:\n<type>decision</type>\n<title>Use JWT</title>'
+    expect(getXmlTag(response, 'title')).toBe('Use JWT')
+    expect(getXmlTag(response, 'type')).toBe('decision')
   })
 
   it('returns empty string for empty tag', () => {
@@ -61,5 +69,15 @@ describe('getXmlChildren', () => {
 
   it('returns empty for invalid parent tag name', () => {
     expect(getXmlChildren('<facts><fact>A</fact></facts>', '.*', 'fact')).toEqual([])
+  })
+
+  it('uses the last parent block when duplicated (#1271)', () => {
+    const xml =
+      '<facts><fact>Draft only</fact></facts>' +
+      '<facts><fact>Real one</fact><fact>Real two</fact></facts>'
+    expect(getXmlChildren(xml, 'facts', 'fact')).toEqual([
+      'Real one',
+      'Real two',
+    ])
   })
 })

@@ -18,7 +18,7 @@ vi.mock("../src/eval/schemas.js", () => ({
 }));
 
 vi.mock("../src/eval/validator.js", () => ({
-  validateOutput: () => ({ valid: true, result: { errors: [] } }),
+  validateOutput: vi.fn(() => ({ valid: true, result: { errors: [] } })),
 }));
 
 vi.mock("../src/eval/quality.js", () => ({
@@ -30,6 +30,7 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import { validateOutput } from "../src/eval/validator.js";
 import { createProvider } from "../src/providers/index.js";
 import type {
   CompressedObservation,
@@ -146,6 +147,35 @@ async function setupHandler(opts: {
   const handler = sdk.functions.get("mem::summarize")!;
   return { handler, kv };
 }
+
+describe("mem::summarize schema retry (#1240)", () => {
+  it("retries once when the parsed summary fails schema validation", async () => {
+    (validateOutput as unknown as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => ({
+        valid: false,
+        result: { errors: ["narrative: Too small"] },
+      }));
+    const provider = makeProvider([
+      summaryXml({ title: "Too short", narrative: "tiny" }),
+      summaryXml({
+        title: "Recovered",
+        narrative: "A sufficiently detailed retry narrative.",
+      }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_retry",
+      obsCount: 5,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_retry" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(2);
+    const stored: any = await kv.get("summaries", "ses_retry");
+    expect(stored?.title).toBe("Recovered");
+  });
+});
 
 describe("mem::summarize chunking", () => {
   const ORIGINAL_ENV = { ...process.env };
