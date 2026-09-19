@@ -591,6 +591,67 @@ describe("Graph Functions", () => {
       expect(snap?.stats.totalNodes).toBe(0);
       expect(snap?.stats.totalEdges).toBe(0);
     });
+
+    it("graph-reset without confirm reports snapshot-only instead of claiming the graph is gone (#1239)", async () => {
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+      const result = (await sdk.trigger("mem::graph-reset", {})) as {
+        success: boolean;
+        snapshotOnly: boolean;
+        nodesRetained: number | null;
+        edgesRetained: number | null;
+      };
+      expect(result.success).toBe(true);
+      expect(result.snapshotOnly).toBe(true);
+      expect(result.nodesRetained).toBeNull();
+      expect(result.edgesRetained).toBeNull();
+
+      const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+      expect(nodes.length).toBe(2);
+    });
+
+    it("graph-reset with confirm:true deletes nodes and edges (#1239)", async () => {
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+      const result = (await sdk.trigger("mem::graph-reset", {
+        confirm: true,
+      })) as {
+        success: boolean;
+        snapshotOnly: boolean;
+        cleared: Record<string, number>;
+        nodesRetained: number;
+        edgesRetained: number;
+      };
+      expect(result.success).toBe(true);
+      expect(result.snapshotOnly).toBe(false);
+      expect(result.cleared["mem:graph:nodes"]).toBe(2);
+      expect(result.cleared["mem:graph:edges"]).toBe(1);
+      expect(result.nodesRetained).toBe(0);
+      expect(result.edgesRetained).toBe(0);
+
+      const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+      const edges = await kv.list<GraphEdge>("mem:graph:edges");
+      expect(nodes.length).toBe(0);
+      expect(edges.length).toBe(0);
+    });
+
+    it("graph-reset with confirm:true refuses above the maxRecords ceiling (#1239)", async () => {
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+      const result = (await sdk.trigger("mem::graph-reset", {
+        confirm: true,
+        maxRecords: 2,
+      })) as {
+        success: boolean;
+        error?: string;
+        totalRecords?: number;
+        ceiling?: number;
+      };
+      expect(result.success).toBe(false);
+      expect(result.error).toBe("graph_too_large");
+      expect(result.totalRecords).toBe(3);
+      expect(result.ceiling).toBe(2);
+
+      const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+      expect(nodes.length).toBe(2);
+    });
   });
 
   // CodeRabbit feedback: cover the timeout-budget fallback path and

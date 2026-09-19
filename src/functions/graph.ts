@@ -1170,7 +1170,22 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-reset", async () => {
+  //
+  // #1239: the enumeration-free path is still the default, but it now
+  // says so in the response (`snapshotOnly: true`, `nodesRetained:
+  // null`) instead of returning a bare `success: true` that operators
+  // read as "the graph is gone". Callers that want the rows actually
+  // deleted pass `confirm: true`; that path enumerates the two scopes
+  // under the same 6s live-enumeration budget the query handler uses,
+  // refuses above GRAPH_RESET_MAX_RECORDS, and deletes in batches that
+  // yield to the event loop so the worker heartbeat survives.
+  const GRAPH_RESET_MAX_RECORDS = 50_000;
+  const GRAPH_RESET_BATCH = 100;
+
+  sdk.registerFunction("mem::graph-reset", async (data?: {
+    confirm?: boolean;
+    maxRecords?: number;
+  }) => {
     const started = Date.now();
     // Stamp resetAt=now on the empty snapshot. Future
     // mem::graph-extract calls compare each name-index lookup's
@@ -1182,12 +1197,107 @@ export function registerGraphFunction(
       ...emptySnapshot(),
       resetAt: new Date().toISOString(),
     };
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+
+    if (data?.confirm !== true) {
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+      const counts: Record<string, number> = {
+        [KV.graphSnapshot]: 1,
+      };
+      const tookMs = Date.now() - started;
+      logger.info("Graph state reset (snapshot only)", { counts, tookMs });
+      return {
+        success: true,
+        snapshotOnly: true,
+        cleared: counts,
+        nodesRetained: null,
+        edgesRetained: null,
+        hint: "Graph rows were not enumerated (legacy corpora cannot list safely). Pass confirm: true to delete nodes and edges.",
+        tookMs,
+      };
+    }
+
+    const requestedMax =
+      typeof data.maxRecords === "number" && Number.isFinite(data.maxRecords)
+        ? Math.floor(data.maxRecords)
+        : GRAPH_RESET_MAX_RECORDS;
+    const ceiling = Math.min(
+      Math.max(requestedMax, 1),
+      GRAPH_RESET_MAX_RECORDS,
+    );
+
+    let nodes: GraphNode[];
+    let edges: GraphEdge[];
+    try {
+      [nodes, edges] = await withTimeout(
+        Promise.all([
+          kv.list<GraphNode>(KV.graphNodes),
+          kv.list<GraphEdge>(KV.graphEdges),
+        ]),
+        LIVE_ENUMERATION_BUDGET_MS,
+        "graph-reset enumeration",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("Graph reset enumeration failed", { message });
+      return {
+        success: false,
+        error: "enumeration_failed",
+        message,
+        hint: "Graph too large to list safely. Stop the daemon and move mem:graph:*.bin aside, or retry with a smaller store.",
+        tookMs: Date.now() - started,
+      };
+    }
+
+    const total = nodes.length + edges.length;
+    if (total > ceiling) {
+      logger.warn("Graph reset refused: corpus above ceiling", {
+        total,
+        ceiling,
+      });
+      return {
+        success: false,
+        error: "graph_too_large",
+        totalRecords: total,
+        ceiling,
+        hint: "Raise maxRecords (capped at 50000) or stop the daemon and move mem:graph:*.bin aside.",
+        tookMs: Date.now() - started,
+      };
+    }
+
     const counts: Record<string, number> = {
+      [KV.graphNodes]: nodes.length,
+      [KV.graphEdges]: edges.length,
       [KV.graphSnapshot]: 1,
     };
+
+    for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
+      const batch = nodes.slice(i, i + GRAPH_RESET_BATCH);
+      await Promise.all(batch.map((node) => kv.delete(KV.graphNodes, node.id)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    for (let i = 0; i < edges.length; i += GRAPH_RESET_BATCH) {
+      const batch = edges.slice(i, i + GRAPH_RESET_BATCH);
+      await Promise.all(batch.map((edge) => kv.delete(KV.graphEdges, edge.id)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
     const tookMs = Date.now() - started;
-    logger.info("Graph state reset", { counts, tookMs });
-    return { success: true, cleared: counts, tookMs };
+    logger.info("Graph state reset (rows deleted)", { counts, tookMs });
+    await recordAudit(kv, "reset", "mem::graph-reset", [
+      KV.graphNodes,
+      KV.graphEdges,
+      KV.graphSnapshot,
+    ], { counts, tookMs }).catch(() => undefined);
+    return {
+      success: true,
+      snapshotOnly: false,
+      cleared: counts,
+      nodesRetained: 0,
+      edgesRetained: 0,
+      sideIndexNote:
+        "Side-index rows (name-index, degree, edge-key) are overwritten on the next extract; they cannot be enumerated for deletion because state::list returns values, not keys.",
+      tookMs,
+    };
   });
 }

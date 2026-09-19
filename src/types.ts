@@ -599,6 +599,7 @@ export interface AuditEntry {
     | "consolidate"
     | "share"
     | "delete"
+    | "reset"
     | "import"
     | "export"
     | "action_create"

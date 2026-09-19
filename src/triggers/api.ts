@@ -1552,9 +1552,15 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       try {
+        const body = (req.body as Record<string, unknown>) || {};
+        const confirm = body.confirm === true;
+        const maxRecords =
+          typeof body.maxRecords === "number" && Number.isFinite(body.maxRecords)
+            ? body.maxRecords
+            : undefined;
         const result = await sdk.trigger({
           function_id: "mem::graph-reset",
-          payload: {},
+          payload: { confirm, ...(maxRecords !== undefined && { maxRecords }) },
         });
         return { status_code: 200, body: result };
       } catch {
