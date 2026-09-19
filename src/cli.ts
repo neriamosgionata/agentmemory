@@ -67,6 +67,7 @@ import {
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import { renderEngineConfig } from "./cli/engine-config.js";
+import { repairStateStore, scanStateStore } from "./state/store-repair.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
@@ -2488,6 +2489,33 @@ function buildDoctorEffects(): DoctorEffects {
     clearEnginePidAndState: () => {
       clearEnginePidfile();
       clearEngineState();
+    },
+    scanStateStore: () =>
+      scanStateStore(join(dataDirResolution.dataDir, "state_store.db")),
+    repairStateStore: async () => {
+      try {
+        const report = repairStateStore(
+          join(dataDirResolution.dataDir, "state_store.db"),
+        );
+        if (report.repaired.length === 0) {
+          return {
+            ok: report.errors.length === 0,
+            message:
+              report.errors.length > 0
+                ? `No files repaired. ${report.errors.join("; ")}`
+                : "No repairable files found (already clean or unparseable).",
+          };
+        }
+        const summary = report.repaired
+          .map((r) => `${r.file} (-${r.removedBytes}B)`)
+          .join(", ");
+        return { ok: true, message: `Truncated ${report.repaired.length} file(s): ${summary}` };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
     },
   };
 }

@@ -16,6 +16,8 @@
 //   agentmemory doctor --all       # apply every available fix without prompting (CI)
 //   agentmemory doctor --dry-run   # show what each fix WOULD do; execute nothing
 
+import type { StoreScanReport } from "../state/store-repair.js";
+
 export type DiagnosticStatus = {
   ok: boolean;
   /** Short status detail (one line). Shown alongside the check name. */
@@ -68,6 +70,7 @@ export const DIAGNOSTIC_IDS = [
   "stale-pidfile",
   "env-placeholder-keys",
   "iii-on-path-not-local-bin",
+  "state-store-corruption",
 ] as const;
 
 export type DiagnosticId = (typeof DIAGNOSTIC_IDS)[number];
@@ -175,6 +178,10 @@ export type DoctorEffects = {
   runStart: () => Promise<DiagnosticFixResult>;
   /** Clear pidfile + engine-state. */
   clearEnginePidAndState: () => void;
+  /** Inspect state_store.db scope files for trailing garbage. */
+  scanStateStore: () => StoreScanReport;
+  /** Truncate trailing garbage from suspicious scope files. */
+  repairStateStore: () => Promise<DiagnosticFixResult>;
 };
 
 export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
@@ -333,6 +340,48 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
             r.message ??
             "Installer wrote to ~/.agentmemory/bin/iii. Your PATH wasn't modified.",
         })),
+    },
+    {
+      id: "state-store-corruption",
+      message:
+        "State store has scope files with trailing garbage after their JSON body.",
+      fixPreview:
+        "Stop the engine, truncate the garbage bytes, restart. No records are deleted.",
+      moreInfo:
+        "The file_based KV adapter can append a few non-JSON bytes after the final " +
+        "token of a scope file (#1364). A strict whole-file parse then fails, so every " +
+        "read of that scope returns 'Invocation stopped' while sibling scopes stay " +
+        "healthy. The fix truncates each file back to its last complete JSON value; " +
+        "the engine is restarted because it serves reads from its in-memory copy.",
+      check: async () => {
+        const scan = effects.scanStateStore();
+        if (scan.errors.length > 0 && scan.scanned === 0) {
+          return { ok: true, detail: `scan skipped: ${scan.errors[0]}` };
+        }
+        return {
+          ok: scan.suspicious.length === 0,
+          detail:
+            scan.suspicious.length === 0
+              ? `${scan.scanned} scope file(s) clean`
+              : `${scan.suspicious.length} suspect: ${scan.suspicious.slice(0, 3).join(", ")}`,
+        };
+      },
+      fix: async () => {
+        const stopped = await effects.runStop();
+        if (!stopped.ok) {
+          return {
+            ok: false,
+            message: `Engine could not be stopped; refusing to truncate live files. ${stopped.message ?? ""}`.trim(),
+          };
+        }
+        const repaired = await effects.repairStateStore();
+        if (!repaired.ok) return repaired;
+        const started = await effects.runStart();
+        return {
+          ok: started.ok,
+          message: `${repaired.message ?? "Repair finished."} ${started.message ?? ""}`.trim(),
+        };
+      },
     },
   ];
 }
