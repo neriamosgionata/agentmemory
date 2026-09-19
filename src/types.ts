@@ -259,6 +259,14 @@ export interface MemorySlot {
 export interface EmbeddingProvider {
   name: string;
   dimensions: number;
+  /**
+   * True when `dimensions` is a guess (model absent from the table and no
+   * explicit override). Providers may correct it from the first response;
+   * the dimension guard reads the live value (#1373).
+   */
+  dimensionsInferred?: boolean;
+  /** Force one embed to resolve an inferred dimension before boot validation. */
+  probeDimensions?(): Promise<number>;
   embed(text: string): Promise<Float32Array>;
   embedBatch(texts: string[]): Promise<Float32Array[]>;
   embedImage?(src: string): Promise<Float32Array>;

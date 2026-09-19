@@ -420,6 +420,20 @@ async function main() {
     // anything and recall degrades without an error. Walk every stored
     // vector instead of trusting the first; refuse to load if anything
     // is off.
+    // #1373: an untabled model starts on a guessed width. Probe once before
+    // comparing against the persisted index, otherwise the mismatch guard
+    // would refuse to start (or discard a perfectly good index) purely
+    // because the guess was wrong.
+    if (embeddingProvider?.dimensionsInferred && embeddingProvider.probeDimensions) {
+      try {
+        const detected = await embeddingProvider.probeDimensions();
+        bootLog(`Detected embedding dimensions: ${detected}`);
+      } catch (err) {
+        console.warn(
+          `[agentmemory] Embedding dimension probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     const activeDim = embeddingProvider?.dimensions ?? 0;
     const { mismatches, seenDimensions } =
       activeDim > 0

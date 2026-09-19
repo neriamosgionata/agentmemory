@@ -28,11 +28,22 @@ function lookupModelDimensions(model: string): number | undefined {
   return MODEL_DIMENSIONS[bare];
 }
 
-export function resolveDimensions(
+export interface DimensionResolution {
+  dimensions: number;
+  /**
+   * True when neither the table nor an override knew the width. The provider
+   * starts on DEFAULT_DIMENSIONS and corrects itself from the first response
+   * (#1373): without this, an unknown self-hosted model (Ollama, vLLM, TEI)
+   * got its every embedding rejected by the dimension guard.
+   */
+  inferred: boolean;
+}
+
+export function resolveDimensionsDetailed(
   model: string,
   override: string | undefined,
   envName: string,
-): number {
+): DimensionResolution {
   if (override !== undefined && override.trim().length > 0) {
     const parsed = parseInt(override, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -40,9 +51,19 @@ export function resolveDimensions(
         `${envName} must be a positive integer, got: ${override}`,
       );
     }
-    return parsed;
+    return { dimensions: parsed, inferred: false };
   }
-  return lookupModelDimensions(model) ?? DEFAULT_DIMENSIONS;
+  const known = lookupModelDimensions(model);
+  if (known !== undefined) return { dimensions: known, inferred: false };
+  return { dimensions: DEFAULT_DIMENSIONS, inferred: true };
+}
+
+export function resolveDimensions(
+  model: string,
+  override: string | undefined,
+  envName: string,
+): number {
+  return resolveDimensionsDetailed(model, override, envName).dimensions;
 }
 
 export { MODEL_DIMENSIONS, DEFAULT_DIMENSIONS };
