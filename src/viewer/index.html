@@ -1346,6 +1346,13 @@
         var fetchOpts = Object.assign({}, opts || {}, { headers: headers });
         var readErrorBody = fetchOpts.readErrorBody;
         delete fetchOpts.readErrorBody;
+        // #1326: the backend's KV budget is 10s, so give each request a
+        // hard 20s ceiling. Without it a stalled endpoint holds one of the
+        // browser's six HTTP/1.1 connections forever and every parallel
+        // dashboard fetch sits on "Loading…".
+        if (!fetchOpts.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+          fetchOpts.signal = AbortSignal.timeout(20000);
+        }
         var res = await fetch(url, fetchOpts);
         if (!res.ok) {
           if (res.status === 401) showViewerAuthPrompt();

@@ -850,7 +850,26 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const sessions = await kv.list<Session>(KV.sessions);
+      let sessions: Session[];
+      try {
+        sessions = await kv.list<Session>(KV.sessions);
+      } catch (err) {
+        // #1326: state::list over the sessions scope can stall in the
+        // engine's file_based adapter. StateKV's 10s budget surfaces it
+        // here; return a typed 503 instead of an opaque 500 so the viewer
+        // and doctor can show an actionable message.
+        const detail = err instanceof Error ? err.message : String(err);
+        logger.warn("sessions list unavailable", { detail });
+        return {
+          status_code: 503,
+          body: {
+            sessions: [],
+            error: "sessions_unavailable",
+            detail,
+            hint: "state::list(mem:sessions) did not return within the KV budget. Restart the daemon, or run `agentmemory doctor` (state-store-corruption check).",
+          },
+        };
+      }
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -865,16 +884,32 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
+      const requestedLimit = parseOptionalPositiveInt(
+        req.query_params?.["limit"],
+      );
+      if (requestedLimit === null) {
+        return {
+          status_code: 400,
+          body: { error: "invalid numeric parameter: limit" },
+        };
+      }
+      const limited =
+        requestedLimit === undefined
+          ? filtered
+          : filtered.slice(0, Math.min(requestedLimit, 500));
       const summariesList = await kv.list<SessionSummary>(KV.summaries).catch(() => []);
       const summaryBySessionId = new Map<string, SessionSummary>();
       for (const sm of summariesList) {
         if (sm?.sessionId) summaryBySessionId.set(sm.sessionId, sm);
       }
-      const withSummary = filtered.map((s) => {
+      const withSummary = limited.map((s) => {
         const sum = summaryBySessionId.get(s.id);
         return sum ? { ...s, summary: sum } : s;
       });
-      return { status_code: 200, body: { sessions: withSummary } };
+      return {
+        status_code: 200,
+        body: { sessions: withSummary, total: filtered.length },
+      };
     },
   );
   sdk.registerTrigger({

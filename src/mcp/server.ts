@@ -258,15 +258,33 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
-            const sessions = await kv.list(KV.sessions);
-            return {
-              status_code: 200,
-              body: {
-                content: [
-                  { type: "text", text: JSON.stringify({ sessions }, null, 2) },
-                ],
-              },
-            };
+            try {
+              const sessions = await kv.list(KV.sessions);
+              return {
+                status_code: 200,
+                body: {
+                  content: [
+                    { type: "text", text: JSON.stringify({ sessions }, null, 2) },
+                  ],
+                },
+              };
+            } catch (err) {
+              // #1326: report the stall instead of hanging or silently
+              // returning [] so callers can fall back to smart-search.
+              const detail = err instanceof Error ? err.message : String(err);
+              return {
+                status_code: 200,
+                body: {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Sessions unavailable: state::list(mem:sessions) did not return within the KV budget (${detail}). Use memory_smart_search for recall, or restart the daemon and run \`agentmemory doctor\`.`,
+                    },
+                  ],
+                  isError: true,
+                },
+              };
+            }
           }
 
           case "memory_smart_search": {
