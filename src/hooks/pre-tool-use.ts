@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveProject, hookCwd } from "./_project.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -24,6 +25,41 @@ const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+
+// #1278: enrich measured 1.9-4.3s on real stores, so the old 2s abort
+// guaranteed the hook gave up before the context arrived. 8s is the default
+// and the op-in nature of the hook (AGENTMEMORY_INJECT_CONTEXT) makes the
+// wait acceptable; override with AGENTMEMORY_INJECT_TIMEOUT_MS.
+const INJECT_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env["AGENTMEMORY_INJECT_TIMEOUT_MS"] || "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8000;
+})();
+
+// Claude Code consumes hookSpecificOutput.additionalContext; raw stdout is
+// documented as plain text but several hosts drop it (the #1278 report).
+// Cursor reads additional_context, and Copilot's camelCase payload is
+// consumed as plain stdout, so keep raw for shapes that aren't Claude/Devin.
+function contextEnvelope(
+  data: Record<string, unknown>,
+  context: string,
+): string {
+  if (typeof data.cursor_version === "string") {
+    return JSON.stringify({ additional_context: context });
+  }
+  const isClaudeShape = typeof data.tool_name === "string";
+  const isDevin =
+    process.env["DEVIN_PROJECT_DIR"] !== undefined ||
+    data.prompt_id !== undefined;
+  if (isClaudeShape || isDevin) {
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext: context,
+      },
+    });
+  }
+  return context;
+}
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -94,10 +130,12 @@ async function main() {
     typeof rawSessionId === "string" && rawSessionId.length > 0
       ? rawSessionId
       : "unknown";
+  // #1278: payload-only project lookup left env-scoped hosts (Claude Code
+  // sets AGENTMEMORY_PROJECT_NAME) sending unscoped enrich calls.
   const project =
     typeof data.project === "string" && data.project.trim().length > 0
       ? data.project.trim()
-      : undefined;
+      : resolveProject(hookCwd(data) || process.cwd());
 
   try {
     const res = await fetch(`${REST_URL}/agentmemory/enrich`, {
@@ -110,13 +148,13 @@ async function main() {
         toolName,
         ...(project !== undefined && { project }),
       }),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(INJECT_TIMEOUT_MS),
     });
 
     if (res.ok) {
       const result = (await res.json()) as { context?: string };
       if (result.context) {
-        process.stdout.write(result.context);
+        process.stdout.write(contextEnvelope(data, result.context));
       }
     }
   } catch {
