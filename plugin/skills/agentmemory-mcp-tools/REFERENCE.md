@@ -23,7 +23,7 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_facet_tag` |  | `targetId`*: string, `targetType`*: string, `dimension`*: string, `value`*: string | Attach a structured tag (dimension:value) to an action, memory, or observation for multi-dimensional categorization. |
 | `memory_file_history` |  | `files`*: string, `sessionId`: string | Get past observations about specific files. |
 | `memory_frontier` |  | `project`: string, `agentId`: string, `limit`: number | Get all unblocked actions ranked by priority and urgency. Returns the frontier of actionable work with no unsatisfied dependencies. |
-| `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string | Delete specific memories with audit trail. |
+| `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string, `sessionId`: string | Delete specific memories with audit trail. Observation ids are resolved to their owning session automatically (or pass sessionId). |
 | `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string | Query the knowledge graph for entities and relationships. |
 | `memory_heal` |  | `categories`: string, `dryRun`: string | Auto-fix all fixable issues found by diagnostics. Unblocks stuck actions, expires stale leases, cleans up orphaned data. |
 | `memory_insight_list` |  | `project`: string, `minConfidence`: number, `limit`: number | List synthesized insights, higher-order observations derived from patterns across memories, lessons, and crystals. |

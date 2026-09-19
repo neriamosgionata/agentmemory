@@ -338,15 +338,20 @@ export const V040_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_governance_delete",
-    description: "Delete specific memories with audit trail.",
+    description: "Delete specific memories with audit trail. Observation ids are resolved to their owning session automatically (or pass sessionId).",
     inputSchema: {
       type: "object",
       properties: {
         memoryIds: {
           type: "string",
-          description: "Comma-separated memory IDs to delete",
+          description: "Comma-separated memory or observation IDs to delete",
         },
         reason: { type: "string", description: "Reason for deletion" },
+        sessionId: {
+          type: "string",
+          description:
+            "Optional session that owns the observation ids; needed for observations not in the BM25 index",
+        },
       },
       required: ["memoryIds"],
     },

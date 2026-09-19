@@ -630,9 +630,14 @@ export function registerMcpEndpoints(
               .map((id) => id.trim())
               .filter(Boolean);
             try {
+              const sessionId =
+                typeof args.sessionId === "string" && args.sessionId.trim()
+                  ? args.sessionId.trim()
+                  : undefined;
               const result = await sdk.trigger({ function_id: "mem::governance-delete", payload: {
                 memoryIds: ids,
                 reason: args.reason as string,
+                ...(sessionId !== undefined && { sessionId }),
               } });
               return {
                 status_code: 200,

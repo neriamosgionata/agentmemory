@@ -1849,7 +1849,7 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::governance-delete", 
     async (
-      req: ApiRequest<{ memoryIds: string[]; reason?: string }>,
+      req: ApiRequest<{ memoryIds: string[]; reason?: string; sessionId?: string }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -1859,7 +1859,27 @@ export function registerApiTriggers(
           body: { error: "memoryIds array is required" },
         };
       }
-      const result = await sdk.trigger({ function_id: "mem::governance-delete", payload: req.body });
+      const memoryIds = req.body.memoryIds
+        .filter((id): id is string => typeof id === "string")
+        .map((id) => id.trim())
+        .filter(Boolean);
+      if (memoryIds.length === 0) {
+        return {
+          status_code: 400,
+          body: { error: "memoryIds must contain at least one string id" },
+        };
+      }
+      const sessionId = asNonEmptyString(req.body.sessionId);
+      const reason =
+        typeof req.body.reason === "string" ? req.body.reason : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::governance-delete",
+        payload: {
+          memoryIds,
+          ...(reason !== undefined && { reason }),
+          ...(sessionId !== undefined && { sessionId }),
+        },
+      });
       return { status_code: 200, body: result };
     },
   );

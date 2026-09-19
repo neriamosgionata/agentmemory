@@ -107,6 +107,7 @@ interface Validated {
   files?: string[];
   project?: string;
   agentId?: string;
+  sessionId?: string;
   query?: string;
   limit?: number;
   format?: string;
@@ -171,6 +172,9 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       if (ids.length === 0) throw new Error("memoryIds is required");
       v.memoryIds = ids;
       v.reason = (args["reason"] as string) || "plugin skill request";
+      if (typeof args["sessionId"] === "string" && args["sessionId"].trim()) {
+        v.sessionId = args["sessionId"].trim();
+      }
       return v;
     }
     case "memory_export":
@@ -236,7 +240,11 @@ async function handleProxy(
     case "memory_governance_delete": {
       const result = await handle.call("/agentmemory/governance/memories", {
         method: "DELETE",
-        body: JSON.stringify({ memoryIds: v.memoryIds, reason: v.reason }),
+        body: JSON.stringify({
+          memoryIds: v.memoryIds,
+          reason: v.reason,
+          ...(v.sessionId !== undefined && { sessionId: v.sessionId }),
+        }),
       });
       return textResponse(result);
     }

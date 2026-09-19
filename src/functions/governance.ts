@@ -1,5 +1,10 @@
 import type { ISdk } from "iii-sdk";
-import type { Memory, GovernanceFilter, AuditEntry } from "../types.js";
+import type {
+  Memory,
+  GovernanceFilter,
+  AuditEntry,
+  CompressedObservation,
+} from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit, safeAudit, queryAudit } from "./audit.js";
@@ -9,7 +14,11 @@ import { logger } from "../logger.js";
 
 export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::governance-delete", 
-    async (data: { memoryIds: string[]; reason?: string }) => {
+    async (data: {
+      memoryIds: string[];
+      reason?: string;
+      sessionId?: string;
+    }) => {
       if (
         !data.memoryIds ||
         !Array.isArray(data.memoryIds) ||
@@ -19,18 +28,45 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       let deleted = 0;
+      let deletedObservations = 0;
+      const notFound: string[] = [];
+      const index = getSearchIndex();
       for (const id of data.memoryIds) {
         const mem = await kv.get<Memory>(KV.memories, id);
         if (mem) {
           await kv.delete(KV.memories, id);
           await deleteAccessLog(kv, id);
-          getSearchIndex().remove(id);
+          index.remove(id);
           vectorIndexRemove(id);
           deleted++;
+          continue;
         }
+
+        // #1273: captured observations live in mem:obs:<sessionId>, so a
+        // governance call with only an observation id used to delete
+        // nothing. Resolve the owning session from an explicit param or the
+        // BM25 entry, then delete the row and both index entries.
+        const sessionId = data.sessionId ?? index.getSessionId(id);
+        if (!sessionId) {
+          notFound.push(id);
+          continue;
+        }
+        const obs = await kv.get<CompressedObservation>(
+          KV.observations(sessionId),
+          id,
+        );
+        if (!obs) {
+          notFound.push(id);
+          continue;
+        }
+        await kv.delete(KV.observations(sessionId), id);
+        await deleteAccessLog(kv, id);
+        index.remove(id);
+        vectorIndexRemove(id);
+        deletedObservations++;
       }
 
-      if (deleted > 0) await flushIndexSave();
+      if (deleted + deletedObservations > 0) await flushIndexSave();
 
       await recordAudit(
         kv,
@@ -40,14 +76,24 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
         {
           reason: data.reason || "manual deletion",
           deleted,
+          deletedObservations,
+          notFound: notFound.length > 0 ? notFound : undefined,
         },
       );
 
       logger.info("Governance delete", {
         requested: data.memoryIds.length,
         deleted,
+        deletedObservations,
+        notFound: notFound.length,
       });
-      return { success: true, deleted, total: data.memoryIds.length };
+      return {
+        success: true,
+        deleted,
+        deletedObservations,
+        total: data.memoryIds.length,
+        notFound: notFound.length > 0 ? notFound : undefined,
+      };
     },
   );
 
