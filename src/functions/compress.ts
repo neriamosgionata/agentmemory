@@ -15,7 +15,7 @@ import {
 } from "../prompts/compression.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
@@ -192,6 +192,7 @@ export function registerCompressFunction(
           compressed.title + " " + (compressed.narrative || ""),
           { kind: "observation", logId: compressed.id },
         );
+        scheduleIndexSave();
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({

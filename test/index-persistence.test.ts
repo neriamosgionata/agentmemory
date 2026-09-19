@@ -2137,3 +2137,56 @@ describe("IndexPersistence vector hash-format change", () => {
     expect(reopened.vector!.size).toBe(20);
   });
 });
+
+describe("IndexPersistence exclusive maintenance slot (#1372)", () => {
+  it("queues a save behind an in-flight rebuild instead of interleaving", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const rebuild = persistence.runExclusive(async () => {
+      order.push("rebuild-start");
+      await gate;
+      order.push("rebuild-end");
+    });
+    const save = persistence.save().then(() => order.push("save"));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The save must not run while the rebuild owns the indexes.
+    expect(order).toEqual(["rebuild-start"]);
+
+    release();
+    await Promise.all([rebuild, save]);
+    expect(order).toEqual(["rebuild-start", "rebuild-end", "save"]);
+  });
+
+  it("lets a pending save finish before the rebuild slot starts", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    const events: string[] = [];
+    const originalSet = kv.set;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      events.push("save-write");
+      return originalSet(scope, key, data);
+    };
+
+    const save = persistence.save();
+    const rebuild = persistence.runExclusive(async () => {
+      events.push("rebuild");
+    });
+
+    await Promise.all([save, rebuild]);
+    expect(events.filter((e) => e === "save-write").length).toBeGreaterThan(0);
+    expect(events.at(-1)).toBe("rebuild");
+  });
+});

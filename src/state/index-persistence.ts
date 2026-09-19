@@ -303,6 +303,22 @@ export class IndexPersistence {
     }, DEBOUNCE_MS);
   }
 
+  /**
+   * Run `fn` with exclusive access to the save queue. `rebuildIndex` clears
+   * both indexes in place and refills them over many awaits; a save landing
+   * mid-rebuild would serialize the partial index and publish it as a
+   * completed generation. Queueing the rebuild behind pending saves and any
+   * later save behind the rebuild keeps every published generation whole.
+   */
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.saveQueue.then(fn, fn);
+    this.saveQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   async save(): Promise<void> {
     // Serialize saves: the debounce timer alone cannot prevent an explicit
     // save() (shutdown flush, delete path) from overlapping a debounce-driven

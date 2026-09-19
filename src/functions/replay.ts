@@ -17,7 +17,7 @@ import { resetLessonIndex } from "./lessons.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { indexRecords } from "./search.js";
+import { indexRecords, scheduleIndexSave } from "./search.js";
 import { logger } from "../logger.js";
 
 export const MAX_FILES_DEFAULT = 200;
@@ -452,6 +452,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         // reachable by semantic search, not just keyword.
         try {
           await indexRecords(compressed, []);
+          scheduleIndexSave();
         } catch (err) {
           logger.warn("Import indexing failed; restart rebuild will recover", {
             error: err instanceof Error ? err.message : String(err),

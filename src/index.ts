@@ -469,8 +469,47 @@ async function main() {
   // the vectors sit on disk unreadable and nothing re-reads them. Rebuilding is
   // the only exit. Kept off `vectorIndex.size === 0`, which is also the ordinary
   // state of a store whose vectors were simply never written.
+  //
+  // #1372 residual: a partial vector loss (some buckets dropped by a torn
+  // save, or a provider switch that only rejected some records) leaves BM25
+  // healthy and the load "successful", so neither old gate fires. Rebuild when
+  // the restored vector coverage is far below BM25 with a provider active. One
+  // attempt per provider identity: the marker stops a store whose provider
+  // rejects every embed from re-embedding the whole corpus on every boot.
+  const VECTOR_REBUILD_MARKER_KEY = "vectors:rebuild-marker";
+  let vectorCoverageRebuild = false;
+  if (
+    loaded?.vector &&
+    vectorIndex !== null &&
+    embeddingProvider &&
+    bm25Index.size > 0 &&
+    loaded.vector.size < bm25Index.size * 0.5
+  ) {
+    const providerKey = `${embeddingProvider.name}:${embeddingProvider.dimensions}`;
+    const marker = await kv
+      .get<{ provider?: string }>(KV.bm25Index, VECTOR_REBUILD_MARKER_KEY)
+      .catch(() => null);
+    if (marker?.provider !== providerKey) {
+      vectorCoverageRebuild = true;
+      await kv
+        .set(KV.bm25Index, VECTOR_REBUILD_MARKER_KEY, {
+          provider: providerKey,
+          bm25: bm25Index.size,
+          vector: loaded.vector.size,
+          attemptedAt: new Date().toISOString(),
+        })
+        .catch(() => undefined);
+      console.warn(
+        `[agentmemory] Vector index covers ${loaded.vector.size} of ${bm25Index.size} ` +
+          `BM25 entries for provider ${providerKey} — rebuilding once.`,
+      );
+    }
+  }
+
   const needsRebuild =
-    bm25Index.size === 0 || (vectorIndex !== null && loaded?.vectorRejected === true);
+    bm25Index.size === 0 ||
+    (vectorIndex !== null && loaded?.vectorRejected === true) ||
+    vectorCoverageRebuild;
 
   if (needsRebuild) {
     // Fire-and-forget. rebuildIndex iterates every observation across

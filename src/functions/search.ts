@@ -78,15 +78,33 @@ export function vectorIndexRemove(id: string): void {
 let indexPersistence: {
   scheduleSave: () => void;
   save: () => Promise<void>;
+  runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
 } | null = null;
 
 export function setIndexPersistence(
-  p: { scheduleSave: () => void; save: () => Promise<void> } | null,
+  p: {
+    scheduleSave: () => void;
+    save: () => Promise<void>;
+    runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
+  } | null,
 ): void {
   indexPersistence = p;
 }
 
+/**
+ * True while a full rebuild is clearing/refilling the indexes. Persistence
+ * triggered from delete paths must not serialize the half-built state, and
+ * must not block the delete for the (potentially hours-long) rebuild.
+ * rebuildIndex schedules a save once it finishes, so nothing is lost.
+ */
+let rebuildInFlight = false;
+
+export function isIndexRebuildInFlight(): boolean {
+  return rebuildInFlight;
+}
+
 export function scheduleIndexSave(): void {
+  if (rebuildInFlight) return;
   indexPersistence?.scheduleSave();
 }
 
@@ -100,6 +118,7 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
+  if (rebuildInFlight) return;
   await indexPersistence?.save();
 }
 
@@ -309,6 +328,23 @@ export async function indexRecords(
 }
 
 export async function rebuildIndex(kv: StateKV): Promise<number> {
+  const run = async (): Promise<number> => {
+    rebuildInFlight = true;
+    try {
+      return await rebuildIndexUnlocked(kv);
+    } finally {
+      rebuildInFlight = false;
+      // Publish the rebuilt index once, after the exclusive slot, instead of
+      // racing a debounce flush against the in-place clear/refill.
+      indexPersistence?.scheduleSave();
+    }
+  };
+  const exclusive = indexPersistence?.runExclusive;
+  if (!exclusive) return run();
+  return exclusive(run);
+}
+
+async function rebuildIndexUnlocked(kv: StateKV): Promise<number> {
   const idx = getSearchIndex()
   idx.clear()
   memoryIndexReady = false
