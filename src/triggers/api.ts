@@ -512,6 +512,34 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/compress-file", http_method: "POST" },
   });
 
+  // #1228: recovery for observations whose compression failed. Bounded per
+  // call; repeat to drain a backlog.
+  sdk.registerFunction("api::recompress",
+    async (req: ApiRequest<{ sessionId?: string; limit?: number }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const sessionId = asNonEmptyString(body.sessionId);
+      const limit =
+        typeof body.limit === "number" && Number.isFinite(body.limit)
+          ? body.limit
+          : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::recompress",
+        payload: {
+          ...(sessionId !== undefined && { sessionId }),
+          ...(limit !== undefined && { limit }),
+        },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::recompress",
+    config: { api_path: "/agentmemory/recompress", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::replay::load",
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);

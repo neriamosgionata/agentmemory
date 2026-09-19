@@ -32,6 +32,7 @@ import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
 import { registerDiskSizeManager } from "./functions/disk-size-manager.js";
 import { registerCompressFunction } from "./functions/compress.js";
+import { registerRecompressFunction } from "./functions/recompress.js";
 import {
   registerSearchFunction,
   rebuildIndex,
@@ -242,6 +243,7 @@ async function main() {
   }
   registerDiskSizeManager(sdk, kv);
   registerCompressFunction(sdk, kv, provider, metricsStore);
+  registerRecompressFunction(sdk, kv);
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
@@ -595,7 +597,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 131 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
