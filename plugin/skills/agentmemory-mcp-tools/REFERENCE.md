@@ -18,13 +18,13 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_consolidate` | yes | `tier`: string | Run the 4-tier memory consolidation pipeline (working -> episodic -> semantic -> procedural). |
 | `memory_crystallize` |  | `actionIds`*: string, `project`: string, `sessionId`: string | Compress completed action chains into compact crystal digests using LLM summarization. Extracts narrative, key outcomes, files affected, and lessons. |
 | `memory_diagnose` | yes | `categories`: string | Run health checks across all subsystems (actions, leases, sentinels, sketches, signals, sessions, memories, mesh, index). Identifies stuck, orphaned, and inconsistent state. |
-| `memory_export` |  | none | Export all memory data as JSON. |
+| `memory_export` |  | `maxSessions`: number, `offset`: number, `collectionLimit`: number, `collectionOffset`: number, `collections`: string | Export memory data as JSON. Past the transport size limit the export is refused, so use the paging arguments on a large store. |
 | `memory_facet_query` |  | `matchAll`: string, `matchAny`: string, `targetType`: string | Query targets by facet tags with AND/OR logic. Find all actions tagged priority:urgent AND team:backend. |
 | `memory_facet_tag` |  | `targetId`*: string, `targetType`*: string, `dimension`*: string, `value`*: string | Attach a structured tag (dimension:value) to an action, memory, or observation for multi-dimensional categorization. |
 | `memory_file_history` |  | `files`*: string, `sessionId`: string | Get past observations about specific files. |
 | `memory_frontier` |  | `project`: string, `agentId`: string, `limit`: number | Get all unblocked actions ranked by priority and urgency. Returns the frontier of actionable work with no unsatisfied dependencies. |
 | `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string, `sessionId`: string | Delete specific memories with audit trail. Observation ids are resolved to their owning session automatically (or pass sessionId). |
-| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string | Query the knowledge graph for entities and relationships. |
+| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string, `limit`: number, `includeSources`: boolean | Query the knowledge graph for entities and relationships. |
 | `memory_heal` |  | `categories`: string, `dryRun`: string | Auto-fix all fixable issues found by diagnostics. Unblocks stuck actions, expires stale leases, cleans up orphaned data. |
 | `memory_insight_list` |  | `project`: string, `minConfidence`: number, `limit`: number | List synthesized insights, higher-order observations derived from patterns across memories, lessons, and crystals. |
 | `memory_lease` |  | `actionId`*: string, `agentId`*: string, `operation`*: string, `result`: string, `ttlMs`: number | Acquire, release, or renew an exclusive lease on an action. Prevents multiple agents from working on the same thing. |
@@ -43,7 +43,7 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_save` | yes | `content`*: string, `type`: string, `concepts`: string, `files`: string, `project`: string, `agentId`: string | Explicitly save an important insight, decision, or pattern to long-term memory. |
 | `memory_sentinel_create` |  | `name`*: string, `type`*: string, `config`: string, `linkedActionIds`: string, `expiresInMs`: number | Create an event-driven sentinel that watches for conditions (webhook, timer, threshold, pattern, approval) and auto-unblocks gated actions when triggered. |
 | `memory_sentinel_trigger` |  | `sentinelId`*: string, `result`: string | Externally fire a sentinel, providing an optional result payload. Unblocks any gated actions. |
-| `memory_sessions` | yes | none | List recent sessions with their status and observation counts. |
+| `memory_sessions` | yes | `limit`: number, `project`: string, `status`: string | List recent sessions with their status and observation counts. Returns the newest sessions first, projected to a summary row. |
 | `memory_signal_read` |  | `agentId`*: string, `unreadOnly`: string, `threadId`: string, `limit`: number | Read messages for an agent. Marks delivered messages as read. |
 | `memory_signal_send` |  | `from`*: string, `to`: string, `content`*: string, `type`: string, `replyTo`: string | Send a message to another agent or broadcast. Supports threading, typed messages, and TTL expiration. |
 | `memory_sketch_create` |  | `title`*: string, `description`: string, `expiresInMs`: number, `project`: string | Create an ephemeral action graph for exploratory work. Auto-expires after TTL. Can be promoted to permanent actions or discarded. |
