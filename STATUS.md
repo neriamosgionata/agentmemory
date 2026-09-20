@@ -1,10 +1,13 @@
 # agentmemory — work status
 
-Last updated: 2026-09-20 · branch `fix/major-bugs` (fork: `neriamosgionata/agentmemory`, pushed)
+Last updated: 2026-09-20 · branch `main` (fork: `neriamosgionata/agentmemory`, pushed)
 
 ## Engine / runtime
 
 - Native engine pin: **iii v0.24.0**, run through the `iii compose` worker model.
+- Runtime: **Bun 1.4.3** for the persistent user service and the compose worker.
+  `process.execPath` propagates Bun to `dist/index.mjs`, so no code changes were
+  needed; the engine stays a native iii binary. Node ≥20 remains supported.
 - Docker path: still **v0.22.1** (legacy `iii-config.docker.yaml`; 0.23+ rejects it).
 - SDK: `iii-sdk@0.24.0` (single import surface `src/iii.ts`).
 - Private binary: `~/.agentmemory/bin/iii` is **0.24.0** (0.11.2 backup: `iii-0.11.2.bak`).
@@ -14,10 +17,12 @@ Last updated: 2026-09-20 · branch `fix/major-bugs` (fork: `neriamosgionata/agen
 
 ```bash
 # native, instance 9 example; foreground supervisor by design
-node dist/cli.mjs --instance 9 --data-dir /tmp/am
+bun dist/cli.mjs --instance 9 --data-dir /tmp/am
 # background + poll from another shell (do not wait on the launcher)
-setsid --fork sh -c 'node dist/cli.mjs --data-dir ~/.agentmemory/data > /tmp/am.log 2>&1 < /dev/null'
+setsid --fork sh -c 'bun dist/cli.mjs --data-dir ~/.agentmemory/data > /tmp/am.log 2>&1 < /dev/null'
 curl -s localhost:3111/agentmemory/livez
+# or via the user service (Bun, instance 0, data dir ~/data)
+systemctl --user start agentmemory.service
 ```
 
 Compose mode is automatic for engine >= 0.23, or force with `AGENTMEMORY_III_COMPOSE=true`.
@@ -28,11 +33,16 @@ Generated per instance: `worker-compose.yaml` + `compose.env` in the data dir.
 - `npm test`: **1998 passed / 1 skipped**.
 - `npm run build`: clean.
 - Live on 0.24.0 compose: livez ~5 s, `remember` + `search` return data, state store lands in the configured data dir.
+- Live under Bun 1.4.3 (isolated instance and the user service): livez ~4 s,
+  compose `state`/`cron`/`http`/`queue` workers up, `remember` + `search`
+  return data, hook scripts exit 0, `@huggingface/transformers` imports.
+  Real store served: 8 memories / 134 sessions, viewer HTTP 200, no
+  errors/warns in the journal.
 - Engine 0.22.1-era bugs verified fixed by the upgrade: CJK/multibyte ingest (#969), REST routes after engine-only restart (#1013), RSS/shutdown (#1312).
 
 ## Fixed in this branch (summary)
 
-Top-8 blockers, plus ~80 issues total across three drain rounds. Highlights:
+Top-8 blockers, plus ~100 issues total across four drain rounds. Highlights:
 
 - Index durability: rebuild/save interlock, vector-coverage rebuild gate, live-write save scheduling, evict index sync (#1372/#1335).
 - Oversized payloads: leaf-walking byte measure, export 413, graph view snapshot ceiling (#1124/#1142/#1334).

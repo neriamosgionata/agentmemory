@@ -8,6 +8,7 @@ agentmemory is a persistent memory system for AI coding agents, built on iii-eng
 - **State**: File-based SQLite via iii-engine's StateModule (`./data/state_store.db`)
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
 - **Test**: vitest (`npm test` excludes integration tests)
+- **Runtime**: Bun 1.4.3 runs the user service (`agentmemory.service`) and, via `process.execPath`, the compose worker. Node ≥20 remains supported for the CLI and hooks; the engine is a native iii binary either way.
 
 ## Consistency Rules
 
