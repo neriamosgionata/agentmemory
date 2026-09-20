@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import { cpus } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import type { HealthSnapshot } from "../types.js";
@@ -22,15 +22,18 @@ export function registerHealthMonitor(
   sdk: ISdk,
   kv: StateKV,
 ): { stop: () => void } {
-  let connectionState = "connected";
   let prevCpuUsage = process.cpuUsage();
   let prevCpuTime = Date.now();
 
-  if (typeof sdk.on === "function") {
-    sdk.on("connection_state", (state?: unknown) => {
-      connectionState = state as string;
-    });
-  }
+  // 0.24's client exposes getConnectionState() instead of an event emitter;
+  // read it at collection time so the snapshot always carries the live state.
+  const currentConnectionState = (): string => {
+    try {
+      return sdk.getConnectionState?.() ?? "connected";
+    } catch {
+      return "unknown";
+    }
+  };
 
   async function collectHealth(): Promise<HealthSnapshot> {
     const mem = process.memoryUsage();
@@ -86,7 +89,7 @@ export function registerHealthMonitor(
     }
 
     const snapshot: HealthSnapshot = {
-      connectionState,
+      connectionState: currentConnectionState(),
       workers,
       memory: {
         heapUsed: mem.heapUsed,

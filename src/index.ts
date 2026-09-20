@@ -1,4 +1,4 @@
-import { registerWorker, TriggerAction } from "iii-sdk";
+import { registerWorker, TriggerAction } from "./iii.js";
 import {
   hydrateProcessEnvFromFile,
   loadConfig,

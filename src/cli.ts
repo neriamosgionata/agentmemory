@@ -67,6 +67,11 @@ import {
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import { renderEngineConfig } from "./cli/engine-config.js";
+import {
+  isComposeEngineVersion,
+  renderComposeEnv,
+  renderWorkerCompose,
+} from "./cli/compose-config.js";
 import { repairStateStore, scanStateStore } from "./state/store-repair.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
@@ -124,6 +129,13 @@ if (args.includes("--version") || args.includes("-V")) {
 // the Compose model point at a newer engine without us cutting a release.
 const IIPINNED_VERSION =
   process.env["AGENTMEMORY_III_VERSION"] || "0.22.1";
+
+// Engine 0.23+ only runs the compose worker model. Auto-enable it for those
+// pins; the explicit env flag lets a 0.22 install test the path early.
+const COMPOSE_MODE =
+  process.env["AGENTMEMORY_III_COMPOSE"] === "true" ||
+  isComposeEngineVersion(IIPINNED_VERSION);
+let engineStartedViaCompose = false;
 
 // Map Node platform/arch → the asset name iii-hq/iii ships under
 // https://github.com/iii-hq/iii/releases/download/iii/v<version>/<asset>
@@ -742,6 +754,8 @@ function engineStateRestPort(state: EngineState): number {
 }
 
 async function startWorkerForEngineState(): Promise<void> {
+  // Compose runs the worker as the app container's scripts.run process.
+  if (engineStartedViaCompose) return;
   const workerPid = readWorkerPidfile();
   if (workerPid && pidAlive(workerPid)) return;
   if (configuredEngineMayStartWorker() && await waitForConfiguredWorker(5000)) {
@@ -1533,6 +1547,45 @@ function prepareEngineLaunch(configPath: string): {
   } catch {
     return { configPath, cwd: process.cwd() };
   }
+  if (COMPOSE_MODE && bundledConfig) {
+    try {
+      const composePath = join(dataDirResolution.dataDir, "worker-compose.yaml");
+      const composeEnvPath = join(dataDirResolution.dataDir, "compose.env");
+      writeFileSync(
+        composeEnvPath,
+        renderComposeEnv({
+          dataDir: dataDirResolution.dataDir,
+          runtimeDir: dataDirResolution.dataDir,
+          ports: {
+            restPort: getRestPort(),
+            streamPort: getStreamPort(),
+            viewerPort: getConfiguredViewerPort(),
+          },
+        }),
+        "utf-8",
+      );
+      writeFileSync(
+        composePath,
+        renderWorkerCompose({
+          dataDir: dataDirResolution.dataDir,
+          nodeBin: process.execPath,
+          workerEntry: join(__dirname, "index.mjs"),
+          envFile: composeEnvPath,
+          ports: {
+            restPort: getRestPort(),
+            streamPort: getStreamPort(),
+            viewerPort: getConfiguredViewerPort(),
+            enginePort: getEnginePort(),
+          },
+        }),
+        "utf-8",
+      );
+      return { configPath: composePath, cwd: dataDirResolution.dataDir };
+    } catch (err) {
+      vlog(`compose config generation failed, using bundled config: ${String(err)}`);
+      return { configPath, cwd };
+    }
+  }
   try {
     const rawConfig = readFileSync(configPath, "utf-8");
     const options = {
@@ -1604,6 +1657,17 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
     configPath: launch.configPath,
     binPath: iiiBin,
   });
+  if (launch.configPath.endsWith("worker-compose.yaml")) {
+    engineStartedViaCompose = true;
+    spawnEngineBackground(
+      iiiBin,
+      ["compose", "--up", "--file", launch.configPath],
+      "iii-compose",
+      launch.cwd,
+    );
+    s.stop(c.ok("iii-compose process started"));
+    return true;
+  }
   spawnEngineBackground(iiiBin, ["--config", launch.configPath], "iii-engine", launch.cwd);
   s.stop(c.ok("iii-engine process started"));
   return true;

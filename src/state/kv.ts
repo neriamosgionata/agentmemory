@@ -1,4 +1,4 @@
-import type { ISdk } from 'iii-sdk'
+import type { ISdk } from "../iii.js"
 import { getEnvVar } from '../config.js'
 import { onGraphDelete, onGraphUpdate, onGraphWrite } from './graph-cache.js'
 

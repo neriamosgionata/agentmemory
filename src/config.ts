@@ -201,8 +201,11 @@ export function loadConfig(): AgentMemoryConfig {
     restPort + 1;
   const viewerPort =
     parseInt(env["III_VIEWER_PORT"] || "", 10) || restPort + 2;
+  // Compose daemons inject III_URL into every container, so it takes
+  // precedence over our derived port when III_ENGINE_URL is not set.
   const engineUrl =
     env["III_ENGINE_URL"] ||
+    env["III_URL"] ||
     `ws://localhost:${
       parseInt(env["III_ENGINE_PORT"] || "", 10) || restPort + 46023
     }`;
