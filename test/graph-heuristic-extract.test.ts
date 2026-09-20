@@ -88,17 +88,18 @@ describe("extractGraphHeuristics", () => {
   });
 });
 
-// The structural pass must run keyless: session end always fires
-// mem::graph-extract, and the function itself gates only the LLM pass
-// on the flag plus a real provider.
-describe("keyless graph extraction wiring", () => {
-  it("event::session::stopped fires graph-extract without the flag gate", () => {
+// #1238: GRAPH_EXTRACTION_ENABLED is the master switch for graph writes.
+// The session-stop fan-out must be gated on it; the heuristic pass inside
+// mem::graph-extract still runs for explicit calls.
+describe("graph extraction wiring", () => {
+  it("event::session::stopped gates graph-extract on the flag (#1238)", () => {
     const events = readFileSync("src/triggers/events.ts", "utf-8");
     const stopped = events.slice(events.indexOf("event::session::stopped"));
     const gate = stopped.indexOf("isGraphExtractionEnabled()");
     const fire = stopped.indexOf('fireVoid("mem::graph-extract"');
     expect(fire).toBeGreaterThan(-1);
-    expect(gate === -1 || gate > fire).toBe(true);
+    expect(gate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(fire);
   });
 
   it("graph functions register unconditionally so the trigger always resolves", () => {

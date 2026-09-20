@@ -2220,7 +2220,11 @@ export function registerApiTriggers(
           body: { error: "queryText, queryImageRef, or queryImageBase64 required" },
         };
       }
-      const topKParsed = parseOptionalPositiveInt(body["topK"]);
+      // `limit` is the name every other search endpoint uses; accept it as
+      // an alias for topK (#1254).
+      const topKParsed = parseOptionalPositiveInt(
+        body["topK"] ?? body["limit"],
+      );
       if (topKParsed === null) {
         return { status_code: 400, body: { error: "topK must be a positive integer" } };
       }
