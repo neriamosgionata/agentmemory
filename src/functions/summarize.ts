@@ -233,7 +233,7 @@ export function registerSummarizeFunction(
   metricsStore?: MetricsStore,
 ): void {
   sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+    async (data: { sessionId: string; force?: boolean } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
@@ -258,6 +258,33 @@ export function registerSummarizeFunction(
           sessionId,
         });
         return { success: false, error: "no_observations" };
+      }
+
+      // #1244: session stop fires on every turn, so the same session was
+      // re-summarised hundreds of times (954x on one reported session) for
+      // no new material. Skip when a summary already covers the current
+      // observation count; `force: true` re-runs on demand.
+      if (data.force !== true) {
+        const existing = await kv
+          .get<SessionSummary>(KV.summaries, sessionId)
+          .catch(() => null);
+        if (
+          existing &&
+          typeof existing.title === "string" &&
+          existing.title.length > 0 &&
+          (existing.observationCount ?? 0) >= compressed.length
+        ) {
+          logger.info("Summarize skipped — summary already covers session", {
+            sessionId,
+            summarizedObservations: existing.observationCount,
+            currentObservations: compressed.length,
+          });
+          return {
+            success: true,
+            skipped: "already_summarized",
+            summary: existing,
+          };
+        }
       }
 
       // createProvider() wraps every base provider ("resilient(noop)"), so

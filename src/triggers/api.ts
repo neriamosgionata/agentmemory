@@ -742,14 +742,18 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::summarize", 
-    async (req: ApiRequest<{ sessionId: string }>): Promise<Response> => {
-      const sessionId = asNonEmptyString((req.body as Record<string, unknown>)?.sessionId);
+    async (req: ApiRequest<{ sessionId: string; force?: boolean }>): Promise<Response> => {
+      const body = (req.body as Record<string, unknown>) ?? {};
+      const sessionId = asNonEmptyString(body.sessionId);
       if (!sessionId) {
         return { status_code: 400, body: { error: "sessionId is required" } };
       }
       const result = await sdk.trigger({
         function_id: "mem::summarize",
-        payload: { sessionId },
+        payload: {
+          sessionId,
+          ...(body.force === true && { force: true }),
+        },
       });
       return { status_code: 200, body: result };
     },
@@ -1719,54 +1723,91 @@ export function registerApiTriggers(
   // Viewer calls this when the graph is empty (#666). Iterates every
   // session, collects observations that have a `title` (compressed only),
   // and feeds them through `mem::graph-extract` in batches.
+  //
+  // #1339: the loop used to walk every session in one request, so a large
+  // store outlived the HTTP invocation (500 "Invocation stopped" after ~3
+  // min) while the server-side loop kept burning LLM calls for hours. Each
+  // call is now bounded by maxSessions AND a wall-clock budget, and reports
+  // nextOffset/hasMore so callers can drain in resumable chunks.
   sdk.registerFunction("api::graph-build",
-    async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
+    async (req: ApiRequest<{ batchSize?: number; maxSessions?: number; offset?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const body = (req.body ?? {}) as { batchSize?: number; maxSessions?: number; offset?: number };
       const batchSize = Math.max(
         1,
-        Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
+        Math.min(100, Number(body.batchSize) || 25),
       );
+      const maxSessions = Math.max(
+        1,
+        Math.min(200, Number(body.maxSessions) || 25),
+      );
+      const offset = Math.max(0, Math.floor(Number(body.offset) || 0));
+      const timeBudgetMs = 60_000;
+      const startedAt = Date.now();
       try {
         const sessions = await kv.list<Session>(KV.sessions);
+        const window = sessions.slice(offset, offset + maxSessions);
         let totalNodes = 0;
         let totalEdges = 0;
         let batchesRun = 0;
-        for (const session of sessions) {
+        let processedSessions = 0;
+        let nextOffset = offset;
+        let budgetExceeded = false;
+        for (const session of window) {
+          if (Date.now() - startedAt > timeBudgetMs) {
+            budgetExceeded = true;
+            break;
+          }
           const sid = session?.id;
-          if (typeof sid !== "string" || sid.length === 0) continue;
+          if (typeof sid !== "string" || sid.length === 0) {
+            nextOffset++;
+            continue;
+          }
           const observations = await kv.list<CompressedObservation>(KV.observations(sid));
           const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
-          if (compressed.length === 0) continue;
-          for (let i = 0; i < compressed.length; i += batchSize) {
-            const batch = compressed.slice(i, i + batchSize);
-            try {
-              const result = (await sdk.trigger({
-                function_id: "mem::graph-extract",
-                payload: { observations: batch },
-              })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
-              if (result?.success) {
-                totalNodes += Number(result.nodesAdded) || 0;
-                totalEdges += Number(result.edgesAdded) || 0;
+          if (compressed.length > 0) {
+            for (let i = 0; i < compressed.length; i += batchSize) {
+              const batch = compressed.slice(i, i + batchSize);
+              try {
+                const result = (await sdk.trigger({
+                  function_id: "mem::graph-extract",
+                  payload: { observations: batch },
+                })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
+                if (result?.success) {
+                  totalNodes += Number(result.nodesAdded) || 0;
+                  totalEdges += Number(result.edgesAdded) || 0;
+                }
+                batchesRun++;
+              } catch (err) {
+                logger.warn("graph-build batch failed", {
+                  sessionId: sid,
+                  batchIndex: Math.floor(i / batchSize),
+                  error: err instanceof Error ? err.message : String(err),
+                });
               }
-              batchesRun++;
-            } catch (err) {
-              logger.warn("graph-build batch failed", {
-                sessionId: sid,
-                batchIndex: Math.floor(i / batchSize),
-                error: err instanceof Error ? err.message : String(err),
-              });
             }
           }
+          processedSessions++;
+          nextOffset++;
         }
+        const hasMore = nextOffset < sessions.length;
         return {
           status_code: 200,
           body: {
             success: true,
             sessions: sessions.length,
+            processedSessions,
+            offset,
+            nextOffset,
+            hasMore,
+            budgetExceeded,
             batches: batchesRun,
             nodes: totalNodes,
             edges: totalEdges,
+            hint: hasMore
+              ? `Call again with offset=${nextOffset} (and the same maxSessions) until hasMore is false.`
+              : undefined,
           },
         };
       } catch {

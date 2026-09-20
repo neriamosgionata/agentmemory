@@ -177,6 +177,62 @@ describe("mem::summarize schema retry (#1240)", () => {
   });
 });
 
+describe("mem::summarize no-op on unchanged sessions (#1244)", () => {
+  it("skips when an existing summary already covers the observation count", async () => {
+    const provider = makeProvider([summaryXml({ title: "Fresh" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_done",
+      obsCount: 5,
+      provider,
+    });
+    await kv.set("summaries", "ses_done", {
+      sessionId: "ses_done",
+      project: "test-project",
+      createdAt: "2026-09-01T00:00:00Z",
+      title: "Already summarized",
+      narrative: "An existing narrative that is long enough.",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 5,
+    });
+
+    const result: any = await handler({ sessionId: "ses_done" });
+
+    expect(result.success).toBe(true);
+    expect(result.skipped).toBe("already_summarized");
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  it("re-runs when new observations arrived or force is set", async () => {
+    const provider = makeProvider([summaryXml({ title: "Refreshed" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_grow",
+      obsCount: 5,
+      provider,
+    });
+    await kv.set("summaries", "ses_grow", {
+      sessionId: "ses_grow",
+      project: "test-project",
+      createdAt: "2026-09-01T00:00:00Z",
+      title: "Stale summary",
+      narrative: "An existing narrative that is long enough.",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 4,
+    });
+
+    const grown: any = await handler({ sessionId: "ses_grow" });
+    expect(grown.success).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+
+    const forced: any = await handler({ sessionId: "ses_grow", force: true });
+    expect(forced.success).toBe(true);
+    expect(provider.calls).toHaveLength(2);
+  });
+});
+
 describe("mem::summarize chunking", () => {
   const ORIGINAL_ENV = { ...process.env };
 
