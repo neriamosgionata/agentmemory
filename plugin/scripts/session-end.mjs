@@ -152,12 +152,13 @@ async function main() {
 		body: JSON.stringify({ sessionId }),
 		signal: AbortSignal.timeout(3e4)
 	}).catch(() => {});
-	if (process.env["CLAUDE_MEMORY_BRIDGE"] === "true") fetch(`${REST_URL}/agentmemory/claude-bridge/sync`, {
+	const bridgeEnabled = process.env["CLAUDE_MEMORY_BRIDGE"] === "true";
+	if (bridgeEnabled) fetch(`${REST_URL}/agentmemory/claude-bridge/sync`, {
 		method: "POST",
 		headers: authHeaders(),
 		signal: AbortSignal.timeout(3e4)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 1500).unref();
+	setTimeout(() => process.exit(0), bridgeEnabled ? 1500 : 500).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

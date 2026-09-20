@@ -11,6 +11,7 @@ import type {
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { isSlotsEnabled } from "../functions/slots.js";
 
 type McpResponse = {
   status_code: number;
@@ -20,6 +21,20 @@ type McpResponse = {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+// Slot tools stay in the advertised surface (docs/manifests count them), but
+// calling one while AGENTMEMORY_SLOTS is off used to surface the engine's
+// opaque "Internal error" 500. Return the same actionable shape REST does. #888
+function slotsDisabledResult(): { status_code: number; body: Record<string, string> } {
+  return {
+    status_code: 400,
+    body: {
+      error: "Memory slots not enabled",
+      flag: "AGENTMEMORY_SLOTS",
+      hint: "Set AGENTMEMORY_SLOTS=true (in ~/.agentmemory/.env or the shell) and restart.",
+    },
+  };
 }
 
 function asNumber(value: unknown, fallback?: number): number | undefined {
@@ -937,7 +952,7 @@ export function registerMcpEndpoints(
             const tags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
               : [];
-            const actionResult = await sdk.trigger({ function_id: "mem::action-create", payload: {
+            const actionPayload: Record<string, unknown> = {
               title: args.title,
               description: args.description,
               priority: args.priority,
@@ -945,7 +960,14 @@ export function registerMcpEndpoints(
               tags,
               parentId: args.parentId,
               edges: edges.length > 0 ? edges : undefined,
-            } });
+            };
+            if (typeof args.createdBy === "string" && args.createdBy.trim()) {
+              actionPayload.createdBy = args.createdBy.trim();
+            }
+            const actionResult = await sdk.trigger({
+              function_id: "mem::action-create",
+              payload: actionPayload,
+            });
             return {
               status_code: 200,
               body: {
@@ -1424,6 +1446,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_list": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const result = await sdk.trigger({ function_id: "mem::slot-list", payload: {} });
             return {
               status_code: 200,
@@ -1432,6 +1455,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_get": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const label = asNonEmptyString(args.label);
             if (!label) return { status_code: 400, body: { error: "label required" } };
             const result = await sdk.trigger({ function_id: "mem::slot-get", payload: { label } });
@@ -1442,6 +1466,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_create": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const label = asNonEmptyString(args.label);
             if (!label) return { status_code: 400, body: { error: "label required" } };
             const payload: Record<string, unknown> = { label };
@@ -1461,6 +1486,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_append": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const label = asNonEmptyString(args.label);
             const text = typeof args.text === "string" ? args.text : null;
             if (!label || !text) return { status_code: 400, body: { error: "label and text required" } };
@@ -1472,6 +1498,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_replace": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const label = asNonEmptyString(args.label);
             if (!label || typeof args.content !== "string") {
               return { status_code: 400, body: { error: "label and content (string) required" } };
@@ -1484,6 +1511,7 @@ export function registerMcpEndpoints(
           }
 
           case "memory_slot_delete": {
+            if (!isSlotsEnabled()) return slotsDisabledResult();
             const label = asNonEmptyString(args.label);
             if (!label) return { status_code: 400, body: { error: "label required" } };
             const result = await sdk.trigger({ function_id: "mem::slot-delete", payload: { label } });

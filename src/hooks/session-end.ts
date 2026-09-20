@@ -102,7 +102,11 @@ async function main() {
     signal: AbortSignal.timeout(30000),
   }).catch(() => {});
 
-  if (process.env["CLAUDE_MEMORY_BRIDGE"] === "true") {
+  // Two requests only when the bridge is on; the second fetch needs the
+  // longer dispatch window. Otherwise 500ms keeps the hook inside the host's
+  // shutdown grace instead of racing it as "Hook cancelled". #991
+  const bridgeEnabled = process.env["CLAUDE_MEMORY_BRIDGE"] === "true";
+  if (bridgeEnabled) {
     fetch(`${REST_URL}/agentmemory/claude-bridge/sync`, {
       method: "POST",
       headers: authHeaders(),
@@ -110,7 +114,7 @@ async function main() {
     }).catch(() => {});
   }
 
-  setTimeout(() => process.exit(0), 1500).unref();
+  setTimeout(() => process.exit(0), bridgeEnabled ? 1500 : 500).unref();
 }
 
 main().catch(() => process.exit(0));

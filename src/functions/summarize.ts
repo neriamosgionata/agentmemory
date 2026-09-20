@@ -105,6 +105,7 @@ async function produceSummaryXml(
   mode: "single" | "chunked";
   chunks: number;
   skipped?: number;
+  partialConcepts?: string[];
 }> {
   const chunkSize = getChunkSize();
   if (compressed.length <= chunkSize) {
@@ -165,6 +166,13 @@ async function produceSummaryXml(
     });
   }
 
+  // #1114: the reduce prompt used to carry each chunk's concepts verbatim, so
+  // duplicates across chunks survived into the merged summary and an LLM that
+  // emitted an empty <concepts> block silently erased them. Dedupe the input
+  // and keep the union as a fallback for the parsed result.
+  const partialConcepts = dedupeConcepts(
+    partials.flatMap((p) => p.concepts ?? []),
+  );
   const reduceInput = partials.map((p) => {
     const originalIdx = partialByIdx.indexOf(p);
     return {
@@ -172,7 +180,7 @@ async function produceSummaryXml(
       narrative: p.narrative,
       keyDecisions: p.keyDecisions,
       filesModified: p.filesModified,
-      concepts: p.concepts,
+      concepts: dedupeConcepts(p.concepts ?? []),
       obsRangeStart: originalIdx * chunkSize + 1,
       obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
     };
@@ -181,7 +189,27 @@ async function produceSummaryXml(
     REDUCE_SYSTEM,
     buildReducePrompt(reduceInput),
   );
-  return { response, mode: "chunked", chunks: chunks.length, skipped };
+  return {
+    response,
+    mode: "chunked",
+    chunks: chunks.length,
+    skipped,
+    partialConcepts,
+  };
+}
+
+function dedupeConcepts(concepts: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const concept of concepts) {
+    const trimmed = concept.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 // #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
@@ -311,6 +339,7 @@ export function registerSummarizeFunction(
         let response = "";
         let mode = "single";
         let chunks = 1;
+        let partialConcepts: string[] = [];
         for (let attempt = 1; attempt <= 2; attempt++) {
           const produced = await produceSummaryXml(
             provider,
@@ -321,6 +350,7 @@ export function registerSummarizeFunction(
           response = produced.response;
           mode = produced.mode;
           chunks = produced.chunks;
+          partialConcepts = produced.partialConcepts ?? [];
           if (!response || !response.trim()) {
             logger.warn("Empty provider response on summarize", {
               sessionId,
@@ -339,6 +369,13 @@ export function registerSummarizeFunction(
             compressed.length,
           );
           if (summary) {
+            // #1114: keep the union of chunk concepts so a reduce pass that
+            // emitted an empty <concepts> block (or dropped some) cannot
+            // erase them, and duplicates never reach the stored summary.
+            summary.concepts = dedupeConcepts([
+              ...summary.concepts,
+              ...partialConcepts,
+            ]);
             // #1240: a schema failure (e.g. narrative under the length floor)
             // used to end the call after one attempt, so the retry loop never
             // saw it. Validate inside the loop and let attempt 2 fix it.

@@ -284,6 +284,16 @@ export function detectEmbeddingProvider(
   return null;
 }
 
+// Claude Code relocates its whole config surface when CLAUDE_CONFIG_DIR is
+// set (XDG setups). Every call site that used to hardcode ~/.claude must go
+// through here, or it writes/reads files Claude Code never touches. #1067/#1103
+export function claudeConfigDir(): string {
+  const raw = getMergedEnv()["CLAUDE_CONFIG_DIR"];
+  return typeof raw === "string" && raw.trim()
+    ? raw.trim()
+    : join(homedir(), ".claude");
+}
+
 export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
   const env = getMergedEnv();
   const enabled = env["CLAUDE_MEMORY_BRIDGE"] === "true";
@@ -300,8 +310,7 @@ export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
     // per-topic `.md` file per memory (verified against Claude Code 2.x).
     const safePath = projectPath.replace(/[/\\]/g, "-");
     memoryFilePath = join(
-      homedir(),
-      ".claude",
+      claudeConfigDir(),
       "projects",
       safePath,
       "memory",

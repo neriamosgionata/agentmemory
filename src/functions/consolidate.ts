@@ -114,9 +114,13 @@ export function registerConsolidateFunction(
 
       let consolidated = 0;
       const existingMemories = await kv.list<Memory>(KV.memories);
-      const existingTitles = new Set(
-        existingMemories.map((m) => m.title.toLowerCase()),
-      );
+      // Live title map, updated as this run writes. The old code only read the
+      // pre-run snapshot, so two concepts that produced the same title inside
+      // one consolidation run both missed it and wrote duplicate memories. #747
+      const titleToMemory = new Map<string, Memory>();
+      for (const m of existingMemories) {
+        titleToMemory.set(m.title.toLowerCase(), m);
+      }
 
       const MAX_LLM_CALLS = 10;
       let llmCallCount = 0;
@@ -168,11 +172,14 @@ export function registerConsolidateFunction(
           // exact class of cross-project corruption this fix is designed to
           // prevent. An unscoped run (no data.project, background cron path)
           // preserves the pre-existing behavior and may evolve any memory.
-          const existingMatch = existingMemories.find(
-            (m) =>
-              m.title.toLowerCase() === parsed.title.toLowerCase() &&
-              (!scopedProject || !m.project || m.project === scopedProject),
-          );
+          const titleMatch = titleToMemory.get(parsed.title.toLowerCase());
+          const existingMatch =
+            titleMatch &&
+            (!scopedProject ||
+              !titleMatch.project ||
+              titleMatch.project === scopedProject)
+              ? titleMatch
+              : undefined;
 
           if (existingMatch) {
             existingMatch.isLatest = false;
@@ -222,7 +229,7 @@ export function registerConsolidateFunction(
               evolved.title + " " + evolved.content,
               { kind: "memory", logId: evolved.id },
             );
-            existingTitles.add(evolved.title.toLowerCase());
+            titleToMemory.set(evolved.title.toLowerCase(), evolved);
             consolidated++;
           } else {
             const memory: Memory = {
@@ -257,7 +264,7 @@ export function registerConsolidateFunction(
               memory.title + " " + memory.content,
               { kind: "memory", logId: memory.id },
             );
-            existingTitles.add(memory.title.toLowerCase());
+            titleToMemory.set(memory.title.toLowerCase(), memory);
             consolidated++;
           }
         } catch (err) {

@@ -60,6 +60,20 @@ export async function rerank(
     }
   }
 
+  // A text-classification pipeline over a single-logit cross-encoder scores
+  // every pair ~1.0. Overwriting combinedScore with that constant reordered
+  // results by noise. A flat distribution means "no rerank signal" — keep the
+  // pre-rerank order and scores. #724
+  if (scores.length > 1) {
+    const first = scores[0]!.rerankScore;
+    const flat = scores.every(
+      (s) =>
+        !Number.isFinite(s.rerankScore) ||
+        Math.abs(s.rerankScore - first) < 1e-6,
+    );
+    if (flat) return results.slice(0, candidates.length);
+  }
+
   scores.sort((a, b) => b.rerankScore - a.rerankScore);
 
   return scores.map((s, i) => ({

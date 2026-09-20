@@ -2140,6 +2140,11 @@ export function registerApiTriggers(
         normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
       const includeOrphans =
         req.query_params?.["includeOrphans"] === "true";
+      const projectParam = req.query_params?.["project"];
+      const project =
+        typeof projectParam === "string" && projectParam.trim()
+          ? projectParam.trim()
+          : undefined;
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? (isAgentScopeIsolated() ? getAgentId() : undefined);
@@ -2150,6 +2155,19 @@ export function registerApiTriggers(
             m.agentId === filterAgentId ||
             (includeOrphans && m.agentId === undefined),
         );
+      }
+      if (project) {
+        filtered = filtered.filter((m) => m.project === project);
+      }
+      if (latest) {
+        // kv.list is insertion-ordered, so slicing before sorting returned
+        // the OLDEST latest-version rows on a corpus larger than the limit —
+        // the viewer showed stale memories. Newest first. #990
+        filtered = filtered.slice().sort((a, b) => {
+          const at = a.updatedAt || a.createdAt || "";
+          const bt = b.updatedAt || b.createdAt || "";
+          return bt.localeCompare(at);
+        });
       }
 
       // viewer + `agentmemory status` were hitting this endpoint to

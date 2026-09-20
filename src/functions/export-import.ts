@@ -31,7 +31,13 @@ import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
-import { indexRecords } from "./search.js";
+import {
+  flushIndexSave,
+  getSearchIndex,
+  getVectorIndex,
+  indexRecords,
+} from "./search.js";
+import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
 import { logger } from "../logger.js";
 
@@ -499,6 +505,13 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           await kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
           (a) => kv.delete(KV.accessLog, a.memoryId),
         );
+        // The KV wipe above leaves the in-process indexes untouched: without
+        // clearing them, replaced-away observations and memories stay
+        // searchable until a restart rebuild. Clear both here; the imported
+        // rows are re-indexed below through indexRecords. #938
+        getSearchIndex().clear();
+        getVectorIndex()?.clear();
+        invalidateGraphCache(kv as unknown as object);
       }
 
       // Records actually written this run, accumulated for search
@@ -770,6 +783,13 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         logger.warn("Import indexing failed; restart rebuild will recover", {
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+
+      if (strategy === "replace") {
+        // Persist the cleared-and-refilled index once. The debounced save
+        // would otherwise leave a window where a hard exit resurrects the
+        // replaced-away entries from the persisted index on next boot. #938
+        await flushIndexSave();
       }
 
       logger.info("Import complete", { strategy, ...stats });

@@ -23,6 +23,26 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
 }
 
+// Pinned slots are operator-authored context and outrank every other block,
+// so an over-budget pinned block is truncated to the remaining budget instead
+// of being dropped whole. Below this floor a truncated block would be a
+// useless stub; drop it and say so in the logs. #1333
+const MIN_PINNED_TOKENS = 40;
+const TRUNCATION_MARKER =
+  "\n\n[truncated: block exceeded the remaining context budget]";
+
+function truncateToBudget(text: string, remainingTokens: number): string {
+  if (remainingTokens < MIN_PINNED_TOKENS) return "";
+  const markerTokens = estimateTokens(TRUNCATION_MARKER);
+  let keepChars = Math.max(0, (remainingTokens - markerTokens) * 3);
+  let candidate = text.slice(0, keepChars) + TRUNCATION_MARKER;
+  while (keepChars > 0 && estimateTokens(candidate) > remainingTokens) {
+    keepChars -= 3;
+    candidate = text.slice(0, Math.max(0, keepChars)) + TRUNCATION_MARKER;
+  }
+  return candidate;
+}
+
 function escapeXmlAttr(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -87,6 +107,7 @@ export function registerContextFunction(
           content: slotContent,
           tokens: estimateTokens(slotContent),
           recency: Date.now(),
+          pinned: true,
         });
       }
       if (profile) {
@@ -238,17 +259,46 @@ export function registerContextFunction(
       let usedTokens = 0;
       const selected: string[] = [];
       const accessedIds: string[] = [];
+      let droppedBlocks = 0;
+      let truncatedBlocks = 0;
       const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
       const footer = `</agentmemory-context>`;
       usedTokens += estimateTokens(header) + estimateTokens(footer);
 
       for (const block of blocks) {
-        if (usedTokens + block.tokens > budget) continue;
-        selected.push(block.content);
-        usedTokens += block.tokens;
-        if (block.sourceIds && block.sourceIds.length > 0) {
-          accessedIds.push(...block.sourceIds);
+        const remaining = budget - usedTokens;
+        if (block.tokens <= remaining) {
+          selected.push(block.content);
+          usedTokens += block.tokens;
+          if (block.sourceIds && block.sourceIds.length > 0) {
+            accessedIds.push(...block.sourceIds);
+          }
+          continue;
         }
+        if (block.pinned) {
+          const truncated = truncateToBudget(block.content, remaining);
+          if (truncated) {
+            selected.push(truncated);
+            usedTokens += estimateTokens(truncated);
+            truncatedBlocks++;
+            continue;
+          }
+        }
+        droppedBlocks++;
+      }
+
+      if (truncatedBlocks > 0) {
+        logger.info("Context blocks truncated to fit token budget", {
+          blocks: truncatedBlocks,
+          budget,
+        });
+      }
+      if (droppedBlocks > 0) {
+        logger.warn("Context blocks dropped over token budget", {
+          blocks: droppedBlocks,
+          budget,
+          usedTokens,
+        });
       }
 
       if (accessedIds.length > 0) {

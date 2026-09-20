@@ -3532,6 +3532,16 @@
       renderActions();
     }
 
+    // Legacy actions can carry tags as a CSV string (written before the
+    // write-boundary normalization). Never call .join/.map on a string. #906
+    function actionTags(a) {
+      if (Array.isArray(a && a.tags)) return a.tags;
+      if (typeof (a && a.tags) === 'string' && a.tags.trim()) {
+        return a.tags.split(',').map(function(t){ return t.trim(); }).filter(Boolean);
+      }
+      return [];
+    }
+
     function renderActions() {
       var el = document.getElementById('view-actions');
       var items = state.actions.items;
@@ -3545,7 +3555,7 @@
 
       if (search) {
         items = items.filter(function(a) {
-          return (a.title + ' ' + (a.description || '') + ' ' + (a.tags || []).join(' ')).toLowerCase().indexOf(search) >= 0;
+          return (a.title + ' ' + (a.description || '') + ' ' + actionTags(a).join(' ')).toLowerCase().indexOf(search) >= 0;
         });
       }
       if (statusFilter) {
@@ -3585,7 +3595,7 @@
           html += '</td>';
           html += '<td><span class="badge ' + statusClass + '">' + esc(a.status) + '</span></td>';
           html += '<td style="text-align:center;font-weight:600;">' + (a.priority || '-') + '</td>';
-          html += '<td style="font-size:11px;color:var(--ink-muted);">' + (a.tags || []).map(esc).join(', ') + '</td>';
+          html += '<td style="font-size:11px;color:var(--ink-muted);">' + actionTags(a).map(esc).join(', ') + '</td>';
           html += '<td style="text-align:center;">' + (isFrontier ? '&#9889;' : '') + '</td>';
           html += '<td style="font-size:12px;color:var(--ink-muted);">' + shortTime(a.updatedAt) + '</td>';
           html += '</tr>';
@@ -4060,15 +4070,28 @@
           routeWsMessage({ observation: observation });
         }
       } else if (evt.type === 'sync') {
-        var items = Array.isArray(evt.data) ? evt.data : [];
-        items.forEach(function(item) {
-          var payload = item.data || item;
-          observation = payload.observation || payload;
+        processSyncBacklog(Array.isArray(evt.data) ? evt.data : []);
+      }
+    }
+
+    // A large mem-live sync backlog processed in one synchronous forEach
+    // froze Chrome (multi-GB growth). Process in bounded chunks, yielding
+    // between them so paint and GC can run. #609
+    var SYNC_CHUNK_SIZE = 200;
+    function processSyncBacklog(items) {
+      var i = 0;
+      function step() {
+        var end = Math.min(i + SYNC_CHUNK_SIZE, items.length);
+        for (; i < end; i++) {
+          var payload = items[i].data || items[i];
+          var observation = payload.observation || payload;
           if (looksLikeObservation(observation)) {
             routeWsMessage({ observation: observation });
           }
-        });
+        }
+        if (i < items.length) setTimeout(step, 0);
       }
+      step();
     }
 
     function routeWsMessage(msg) {

@@ -35,6 +35,17 @@ describe("memories + export pagination (#544)", () => {
     );
   });
 
+  it("api::memories honors the project query param (#918)", () => {
+    expect(api).toMatch(/query_params\?\.\["project"\]/);
+    expect(api).toMatch(/m\.project === project/);
+  });
+
+  it("api::memories returns newest-first when latest=true (#990)", () => {
+    // The slice must happen after a descending timestamp sort, not before.
+    expect(api).toMatch(/filtered\.slice\(\)\.sort/);
+    expect(api).toMatch(/bt\.localeCompare\(at\)/);
+  });
+
   it("viewer dashboard caps memories?latest fetch with limit", () => {
     const viewer = readFileSync("src/viewer/index.html", "utf-8");
     expect(viewer).toMatch(/memories\?latest=true&limit=500/);

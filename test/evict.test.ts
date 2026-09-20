@@ -373,4 +373,52 @@ describe("mem::evict index sync (#1372)", () => {
     expect(getVectorIndex()?.size).toBe(0);
     setVectorIndex(null);
   });
+
+  it("syncs session counters and graph provenance on eviction (#1157)", async () => {
+    const sessionId = "ses_lifecycle";
+    const session = {
+      ...makeSession(sessionId),
+      startedAt: daysAgo(1),
+      observationCount: 1,
+    };
+    const observation = {
+      ...makeObservation(sessionId),
+      timestamp: daysAgo(120),
+      importance: 1,
+    };
+    const node = {
+      id: "gn_prov",
+      type: "file",
+      name: "src/state/kv.ts",
+      properties: {},
+      sourceObservationIds: [observation.id],
+      createdAt: daysAgo(120),
+    };
+    const store: Store = new Map([
+      [KV.sessions, new Map([[session.id, session]])],
+      [KV.summaries, new Map()],
+      [KV.observations(sessionId), new Map([[observation.id, observation]])],
+      [KV.graphNodes, new Map([[node.id, node]])],
+      [KV.graphEdges, new Map()],
+      [KV.config, new Map()],
+      [KV.audit, new Map()],
+    ]);
+    const kv = mockKV(store);
+    const { sdk } = mockSdk();
+    registerEvictFunction(sdk as never, kv as never);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::evict",
+      payload: {},
+    })) as { lowImportanceObs: number };
+
+    expect(result.lowImportanceObs).toBe(1);
+    const updatedSession = await kv.get<Session>(KV.sessions, sessionId);
+    expect(updatedSession?.observationCount).toBe(0);
+    const updatedNode = await kv.get<{ sourceObservationIds: string[] }>(
+      KV.graphNodes,
+      node.id,
+    );
+    expect(updatedNode?.sourceObservationIds).toEqual([]);
+  });
 });

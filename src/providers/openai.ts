@@ -12,6 +12,18 @@ import {
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+// Reasoning families reject `max_tokens` and require `max_completion_tokens`.
+// The default model (gpt-5.6-luna) is one of them, so every compress /
+// summarize call used to 400 on a stock install. #1219
+const REASONING_MODEL_RE = /^(o[1-9](?:$|[-.]|mini)|gpt-5)/i;
+
+function usesMaxCompletionTokens(model: string): boolean {
+  const override = getEnvVar("OPENAI_MAX_TOKENS_PARAM")?.trim();
+  if (override === "max_tokens") return false;
+  if (override === "max_completion_tokens") return true;
+  return REASONING_MODEL_RE.test(model.trim());
+}
+
 /**
  * OpenAI-compatible LLM provider.
  *
@@ -43,6 +55,10 @@ const DEFAULT_TIMEOUT_MS = 60_000;
  *                              thinking models). Set to "none" to ensure
  *                              message.content is populated instead of only
  *                              message.reasoning.
+ *   OPENAI_MAX_TOKENS_PARAM  — "max_tokens" | "max_completion_tokens".
+ *                              Overrides the auto-detection that sends
+ *                              max_completion_tokens for o-series/gpt-5 models
+ *                              and max_tokens for everything else.
  */
 export class OpenAIProvider implements MemoryProvider {
   name = "openai";
@@ -79,7 +95,9 @@ export class OpenAIProvider implements MemoryProvider {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const body: Record<string, unknown> = {
       model: this.model,
-      max_tokens: this.maxTokens,
+      [usesMaxCompletionTokens(this.model)
+        ? "max_completion_tokens"
+        : "max_tokens"]: this.maxTokens,
       // OpenAI API spec defines `stream` as defaulting to false, so omitting
       // it should yield a JSON response. Some OpenAI-compatible proxies
       // (notably 9Router < 0.4.56 — see decolua/9router#1260) default to

@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { extractGraphHeuristics } from "../src/functions/graph.js";
+import {
+  canonicalizeFilePath,
+  extractGraphHeuristics,
+} from "../src/functions/graph.js";
 import type { CompressedObservation } from "../src/types.js";
 
 function obs(
@@ -31,6 +34,43 @@ describe("extractGraphHeuristics", () => {
     expect(byType.has("file:src/auth.ts")).toBe(true);
     expect(byType.has("concept:authentication")).toBe(true);
     expect(byType.has("concept:jwt")).toBe(true);
+  });
+
+  it("canonicalizes file paths against the session root (#1221)", () => {
+    expect(canonicalizeFilePath("/repo/src/auth.ts", "/repo")).toBe(
+      "src/auth.ts",
+    );
+    expect(canonicalizeFilePath("/repo/src/auth.ts", "/repo/")).toBe(
+      "src/auth.ts",
+    );
+    expect(canonicalizeFilePath("./src/auth.ts", "/repo")).toBe("src/auth.ts");
+    // Outside the root: keep the absolute form so unrelated files cannot
+    // collide on basename.
+    expect(canonicalizeFilePath("/elsewhere/auth.ts", "/repo")).toBe(
+      "/elsewhere/auth.ts",
+    );
+    expect(canonicalizeFilePath("src/auth.ts", "/repo")).toBe("src/auth.ts");
+    expect(canonicalizeFilePath("C:\\repo\\src\\auth.ts", "C:\\repo")).toBe(
+      "src\\auth.ts",
+    );
+  });
+
+  it("uses session roots so worktrees produce the same file node", () => {
+    const roots = new Map([
+      ["ses_a", "/repo"],
+      ["ses_b", "/repo-worktree"],
+    ]);
+    const { nodes } = extractGraphHeuristics(
+      [
+        { ...obs("o1", ["/repo/src/auth.ts"], []), sessionId: "ses_a" },
+        { ...obs("o2", ["/repo-worktree/src/auth.ts"], []), sessionId: "ses_b" },
+      ],
+      roots,
+    );
+    const fileNodes = nodes.filter((n) => n.type === "file");
+    expect(fileNodes).toHaveLength(1);
+    expect(fileNodes[0].name).toBe("src/auth.ts");
+    expect(fileNodes[0].sourceObservationIds.sort()).toEqual(["o1", "o2"]);
   });
 
   it("links concepts to files and consecutive siblings as related_to", () => {
@@ -112,7 +152,9 @@ describe("graph extraction wiring", () => {
 
   it("mem::graph-extract gates the LLM pass, not the heuristic pass", () => {
     const graph = readFileSync("src/functions/graph.ts", "utf-8");
-    expect(graph).toMatch(/extractGraphHeuristics\(data\.observations\)/);
+    expect(graph).toMatch(
+      /extractGraphHeuristics\(\s*data\.observations,\s*rootBySession,\s*\)/,
+    );
     expect(graph).toMatch(
       /isGraphExtractionEnabled\(\) && !provider\.name\.includes\("noop"\)/,
     );

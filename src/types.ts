@@ -205,6 +205,7 @@ export interface ContextBlock {
   tokens: number;
   recency: number;
   sourceIds?: string[];
+  pinned?: boolean;
 }
 
 export interface EvalResult {

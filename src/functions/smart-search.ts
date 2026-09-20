@@ -10,6 +10,7 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { findObservationOrMemory } from "../state/observation-lookup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import {
@@ -159,7 +160,7 @@ export function registerSmartSearchFunction(
 
         const results = await Promise.all(
           items.map(({ obsId, sessionId }) =>
-            findObservation(kv, obsId, sessionId).then((obs) =>
+            findObservationOrMemory(kv, obsId, sessionId).then((obs) =>
               obs ? { obsId, sessionId: obs.sessionId, observation: obs } : null,
             ),
           ),
@@ -445,28 +446,4 @@ async function detectFollowup(
   });
 }
 
-async function findObservation(
-  kv: StateKV,
-  obsId: string,
-  sessionIdHint?: string,
-): Promise<CompressedObservation | null> {
-  if (sessionIdHint) {
-    const obs = await kv
-      .get<CompressedObservation>(KV.observations(sessionIdHint), obsId)
-      .catch(() => null);
-    if (obs) return obs;
-  }
 
-  const sessions = await kv.list<{ id: string }>(KV.sessions);
-  for (let i = 0; i < sessions.length; i += 5) {
-    const batch = sessions.slice(i, i + 5);
-    const results = await Promise.all(
-      batch.map((s) =>
-        kv.get<CompressedObservation>(KV.observations(s.id), obsId).catch(() => null),
-      ),
-    );
-    const found = results.find((r) => r !== null);
-    if (found) return found;
-  }
-  return null;
-}

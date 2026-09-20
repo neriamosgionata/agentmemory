@@ -1,6 +1,9 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { handleToolCall } from "../src/mcp/standalone.js";
-import { resetHandleForTests } from "../src/mcp/rest-proxy.js";
+import {
+  callTimeoutMs,
+  resetHandleForTests,
+} from "../src/mcp/rest-proxy.js";
 import { InMemoryKV } from "../src/mcp/in-memory-kv.js";
 
 type FetchMock = ReturnType<typeof vi.fn>;
@@ -51,6 +54,27 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(body.sessions).toHaveLength(1);
     expect(body.sessions[0].id).toBe("sess-1");
     expect(calls.find((c) => c.url.includes("/sessions"))).toBeDefined();
+  });
+
+  it("forwards expandIds on memory_smart_search (#889)", async () => {
+    let captured: Record<string, unknown> = {};
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/smart-search")) {
+        captured = JSON.parse((init?.body as string) || "{}");
+        return new Response(JSON.stringify({ mode: "expanded", results: [] }), {
+          status: 200,
+        });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    await handleToolCall("memory_smart_search", {
+      query: "auth bug",
+      expandIds: "obs_1, obs_2",
+    });
+
+    expect(captured["expandIds"]).toEqual(["obs_1", "obs_2"]);
   });
 
   it("proxies memory_smart_search to POST /agentmemory/smart-search", async () => {
@@ -506,5 +530,29 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     } finally {
       delete process.env["AGENTMEMORY_PROBE_TIMEOUT_MS"];
     }
+  });
+});
+
+describe("MCP proxy call timeout (#866)", () => {
+  const original = process.env["AGENTMEMORY_CALL_TIMEOUT_MS"];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env["AGENTMEMORY_CALL_TIMEOUT_MS"];
+    else process.env["AGENTMEMORY_CALL_TIMEOUT_MS"] = original;
+  });
+
+  it("defaults to 15s", () => {
+    delete process.env["AGENTMEMORY_CALL_TIMEOUT_MS"];
+    expect(callTimeoutMs()).toBe(15_000);
+  });
+
+  it("honors AGENTMEMORY_CALL_TIMEOUT_MS for long consolidate/reflect calls", () => {
+    process.env["AGENTMEMORY_CALL_TIMEOUT_MS"] = "120000";
+    expect(callTimeoutMs()).toBe(120_000);
+  });
+
+  it("falls back to the default on malformed values", () => {
+    process.env["AGENTMEMORY_CALL_TIMEOUT_MS"] = "30s";
+    expect(callTimeoutMs()).toBe(15_000);
   });
 });

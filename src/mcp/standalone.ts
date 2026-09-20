@@ -115,6 +115,20 @@ interface Validated {
   tokenBudget?: number;
   memoryIds?: string[];
   reason?: string;
+  expandIds?: string[];
+}
+
+function parseExpandIds(raw: unknown): string[] | undefined {
+  const list: string[] = Array.isArray(raw)
+    ? raw.filter((x): x is string => typeof x === "string")
+    : typeof raw === "string"
+      ? raw.split(",")
+      : [];
+  const cleaned = list
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function validate(toolName: string, args: Record<string, unknown>): Validated {
@@ -166,6 +180,9 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       if (typeof project === "string" && project.trim()) {
         v.project = project.trim();
       }
+      // #889: expandIds was never extracted, so compact-to-expanded recall
+      // silently returned the compact page through the stdio shim.
+      v.expandIds = parseExpandIds(args["expandIds"]);
       return v;
     }
     case "memory_sessions": {
@@ -238,6 +255,7 @@ async function handleProxy(
       if (v.format != null) body["format"] = v.format;
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
       if (v.project != null) body["project"] = v.project;
+      if (v.expandIds != null) body["expandIds"] = v.expandIds;
       const result = await handle.call("/agentmemory/smart-search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -333,6 +351,30 @@ async function handleLocal(
           return query.split(/\s+/).every((word) => text.includes(word));
         })
         .slice(0, limit);
+      if (v.expandIds && v.expandIds.length > 0) {
+        // Local fallback has no observation store: expandIds can only name
+        // durable memories here, so merge those rows in front of the page.
+        const seen = new Set(
+          results.map((r) => (typeof r["id"] === "string" ? r["id"] : "")),
+        );
+        const expanded: Array<Record<string, unknown>> = [];
+        for (const id of v.expandIds) {
+          if (seen.has(id)) continue;
+          const mem = await kvInstance
+            .get<Record<string, unknown>>("mem:memories", id)
+            .catch(() => null);
+          if (mem && (v.project == null || mem["project"] === v.project)) {
+            seen.add(id);
+            expanded.push(mem);
+          }
+        }
+        if (expanded.length > 0) {
+          return textResponse(
+            { mode: "expanded", results: [...expanded, ...results] },
+            true,
+          );
+        }
+      }
       return textResponse({ mode: "compact", results }, true);
     }
 

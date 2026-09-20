@@ -6,6 +6,7 @@ import type {
   GraphSnapshot,
   CompressedObservation,
   MemoryProvider,
+  Session,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -417,12 +418,14 @@ function parseAttrs(raw: string): Record<string, string> {
 function parseGraphXml(
   xml: string,
   observationIds: string[],
+  canonicalizeName?: (name: string, observationIds: string[]) => string,
 ): {
   nodes: GraphNode[];
   edges: GraphEdge[];
 } {
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
+  const nameRemap = new Map<string, string>();
   const now = new Date().toISOString();
 
   // Two passes because <entity> can be self-closing or have a body
@@ -436,8 +439,13 @@ function parseGraphXml(
   const addEntity = (rawAttrs: string, propsBlock = ""): void => {
     const attrs = parseAttrs(rawAttrs);
     const type = attrs["type"] as GraphNode["type"] | undefined;
-    const name = attrs["name"];
-    if (!type || !name) return;
+    const rawName = attrs["name"];
+    if (!type || !rawName) return;
+    const name =
+      type === "file" && canonicalizeName
+        ? canonicalizeName(rawName, observationIds)
+        : rawName;
+    if (name !== rawName) nameRemap.set(rawName, name);
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -466,8 +474,14 @@ function parseGraphXml(
   while ((match = relRegex.exec(xml)) !== null) {
     const attrs = parseAttrs(match[1]);
     const type = attrs["type"] as GraphEdge["type"] | undefined;
-    const sourceName = attrs["source"];
-    const targetName = attrs["target"];
+    const rawSource = attrs["source"];
+    const rawTarget = attrs["target"];
+    const sourceName = rawSource
+      ? (nameRemap.get(rawSource) ?? rawSource)
+      : rawSource;
+    const targetName = rawTarget
+      ? (nameRemap.get(rawTarget) ?? rawTarget)
+      : rawTarget;
     if (!type || !sourceName || !targetName) continue;
     const parsedWeight = parseFloat(attrs["weight"] ?? "");
     const weight = Number.isFinite(parsedWeight) ? parsedWeight : 0.5;
@@ -492,8 +506,33 @@ function parseGraphXml(
 const HEURISTIC_EDGE_WEIGHT = 0.4;
 const MAX_HEURISTIC_EDGES_PER_OBS = 12;
 
+// File-node identity must be stable across worktrees and scratch checkouts:
+// keying on the absolute path made the same file a different node per
+// checkout. Relativize to the session root (cwd, else project) when the file
+// lives under it; paths outside the root keep their absolute form so they
+// cannot collide with unrelated same-named files. #1221
+export function canonicalizeFilePath(file: string, root?: string): string {
+  let p = file.trim();
+  if (!p) return p;
+  if (root) {
+    const normalizedRoot = root.trim().replace(/[\\/]+$/, "");
+    if (normalizedRoot) {
+      for (const sep of ["/", "\\"]) {
+        const prefix = normalizedRoot + sep;
+        if (p.startsWith(prefix)) {
+          p = p.slice(prefix.length);
+          break;
+        }
+      }
+    }
+  }
+  if (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
+
 export function extractGraphHeuristics(
   observations: CompressedObservation[],
+  rootBySession?: Map<string, string>,
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const now = new Date().toISOString();
   const nodes: GraphNode[] = [];
@@ -560,8 +599,9 @@ export function extractGraphHeuristics(
       edges.push(edge);
     };
 
+    const sessionRoot = rootBySession?.get(obs.sessionId);
     const fileNodes = (obs.files ?? []).map((f) =>
-      nodeFor("file", f, obs.id),
+      nodeFor("file", canonicalizeFilePath(f, sessionRoot), obs.id),
     );
     const conceptNodes = (obs.concepts ?? []).map((c) =>
       nodeFor("concept", c, obs.id),
@@ -736,10 +776,42 @@ export function registerGraphFunction(
 
       const obsIds = data.observations.map((o) => o.id);
 
+      // Session roots for file-node canonicalization (#1221). A failed
+      // sessions read degrades to absolute names, never to an error.
+      const rootBySession = new Map<string, string>();
+      const obsRootById = new Map<string, string>();
+      try {
+        const sessions = await kv.list<Session>(KV.sessions);
+        for (const session of sessions) {
+          const root = session.cwd?.trim() || session.project?.trim();
+          if (root) rootBySession.set(session.id, root);
+        }
+        for (const obs of data.observations) {
+          const root = rootBySession.get(obs.sessionId);
+          if (root) obsRootById.set(obs.id, root);
+        }
+      } catch (err) {
+        logger.warn("graph-extract session roots unavailable", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      const canonicalizeName = (
+        name: string,
+        observationIds: string[],
+      ): string => {
+        const root = observationIds
+          .map((id) => obsRootById.get(id))
+          .find((r): r is string => Boolean(r));
+        return canonicalizeFilePath(name, root);
+      };
+
       let nodes: GraphNode[] = [];
       let edges: GraphEdge[] = [];
       try {
-        const heuristic = extractGraphHeuristics(data.observations);
+        const heuristic = extractGraphHeuristics(
+          data.observations,
+          rootBySession,
+        );
         nodes = heuristic.nodes;
         edges = heuristic.edges;
       } catch (err) {
@@ -766,7 +838,7 @@ export function registerGraphFunction(
             GRAPH_EXTRACTION_SYSTEM,
             prompt,
           );
-          const parsed = parseGraphXml(response, obsIds);
+          const parsed = parseGraphXml(response, obsIds, canonicalizeName);
           nodes = nodes.concat(parsed.nodes);
           edges = edges.concat(parsed.edges);
         } catch (err) {

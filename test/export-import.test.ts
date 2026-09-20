@@ -266,6 +266,16 @@ describe("Export/Import Functions", () => {
       summaries: [],
     };
 
+    // A stale BM25 entry surviving the wipe would keep the replaced-away
+    // row searchable until a restart rebuild. #938
+    getSearchIndex().add({
+      ...testObs,
+      id: "obs_replaced_away",
+      title: "stale-replaced-entry",
+      narrative: "must not survive a replace import",
+    });
+    expect(getSearchIndex().has("obs_replaced_away")).toBe(true);
+
     const result = (await sdk.trigger("mem::import", {
       exportData,
       strategy: "replace",
@@ -276,6 +286,7 @@ describe("Export/Import Functions", () => {
 
     const oldSession = await kv.get("mem:sessions", "ses_1");
     expect(oldSession).toBeNull();
+    expect(getSearchIndex().has("obs_replaced_away")).toBe(false);
   });
 
   it("export then import round-trip preserves data", async () => {

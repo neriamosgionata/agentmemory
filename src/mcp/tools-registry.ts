@@ -458,6 +458,10 @@ export const V050_TOOLS: McpToolDef[] = [
           description: "Priority 1-10 (10 highest)",
         },
         project: { type: "string", description: "Project path" },
+        createdBy: {
+          type: "string",
+          description: "Agent or user that created the action (default: unknown)",
+        },
         tags: {
           type: "string",
           description: "Comma-separated tags",

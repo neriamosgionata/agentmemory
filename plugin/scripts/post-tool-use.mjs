@@ -72,6 +72,19 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/hooks/self-capture.ts
+const SELF_TOOL_PREFIXES = [
+	"mcp__agentmemory",
+	"agentmemory_",
+	"memory_"
+];
+function isSelfCaptureTool(toolName) {
+	if (typeof toolName !== "string") return false;
+	const name = toolName.trim().toLowerCase();
+	if (!name) return false;
+	return SELF_TOOL_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+//#endregion
 //#region src/hooks/post-tool-use.ts
 hydrateHookEnv();
 function isSdkChildContext(payload) {
@@ -100,6 +113,7 @@ async function main() {
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const toolName = data.tool_name ?? data.toolName;
 	const toolInput = data.tool_input ?? data.toolArgs;
+	if (isSelfCaptureTool(toolName)) return;
 	const { imageData, cleanOutput } = extractImageData(toolOutput(data));
 	const cwd = hookCwd(data) || process.cwd();
 	fetch(`${REST_URL}/agentmemory/observe`, {

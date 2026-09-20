@@ -8,6 +8,7 @@ import type {
   QueryExpansion,
 } from "../types.js";
 import { memoryToObservation } from "./memory-utils.js";
+import { findObservationSession } from "./observation-lookup.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
 import {
@@ -138,6 +139,19 @@ export class HybridSearch {
       } catch {
         // expansion is best-effort
       }
+    }
+
+    // Graph traversal results carry a bare observation id. Without resolving
+    // the owning session, the enrichment pass below queries
+    // KV.observations("") and silently drops every graph-only hit. #925
+    const unresolvedGraph = graphResults.filter((r) => !r.sessionId);
+    if (unresolvedGraph.length > 0) {
+      await Promise.all(
+        unresolvedGraph.map(async (r) => {
+          const sessionId = await findObservationSession(this.kv, r.obsId);
+          if (sessionId) r.sessionId = sessionId;
+        }),
+      );
     }
 
     const scores = new Map<

@@ -309,6 +309,27 @@ describe("mem::summarize chunking", () => {
     expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
   });
 
+  it("merges chunk concepts: dedupes and survives an empty reduce concepts block (#1114)", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1", concepts: ["auth", "jwt"] }),
+      summaryXml({ title: "Chunk 2", concepts: ["JWT", "tokens"] }),
+      summaryXml({ title: "Merged", concepts: [] }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_concepts",
+      obsCount: 250,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_concepts" });
+
+    expect(result.success).toBe(true);
+    const stored: any = await kv.get("summaries", "ses_concepts");
+    expect(stored?.concepts).toEqual(["auth", "jwt", "tokens"]);
+  });
+
   it("SUMMARIZE_CHUNK_SIZE env override is respected", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "50";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";

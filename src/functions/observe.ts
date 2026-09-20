@@ -18,6 +18,10 @@ import {
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import {
+  reconcileObservationDeletions,
+  type ObservationDeletion,
+} from "./observation-lifecycle.js";
 
 /** Importance assumed for an observation that has not been compressed yet. */
 const DEFAULT_EVICTION_IMPORTANCE = 3;
@@ -174,10 +178,15 @@ export function registerObserveFunction(
               .slice(0, existing.length - maxObservationsPerSession + 1);
 
             let evicted = 0;
+            const deletedObs: ObservationDeletion[] = [];
             for (const victim of victims) {
               try {
                 await kv.delete(KV.observations(payload.sessionId), victim.id);
                 evicted++;
+                deletedObs.push({
+                  sessionId: payload.sessionId,
+                  obsId: victim.id,
+                });
                 getSearchIndex().remove(victim.id);
                 vectorIndexRemove(victim.id);
               } catch {
@@ -185,6 +194,7 @@ export function registerObserveFunction(
                 // the next observation retries the eviction.
               }
             }
+            await reconcileObservationDeletions(kv, deletedObs);
 
             logger.warn(
               "Session observation cap reached — evicted lowest-value observations",

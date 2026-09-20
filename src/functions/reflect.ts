@@ -263,12 +263,16 @@ export function registerReflectFunctions(
           const insightRegex =
             /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
           let match;
-          let clusterCount = 0;
+          const parsed: Array<{
+            title: string;
+            content: string;
+            confidence: number;
+          }> = [];
 
           while (
             (match = insightRegex.exec(response)) !== null &&
-            clusterCount < maxInsightsPerCluster &&
-            totalInsights < maxTotal
+            parsed.length < maxInsightsPerCluster &&
+            totalInsights + parsed.length < maxTotal
           ) {
             const parsedConf = parseFloat(match[1]);
             const confidence = Number.isNaN(parsedConf)
@@ -279,20 +283,35 @@ export function registerReflectFunctions(
 
             if (!content) continue;
 
-            const fp = fingerprintId("ins", content.trim().toLowerCase());
-            const existing = await kv.get<Insight>(KV.insights, fp);
+            parsed.push({ title, content, confidence });
+          }
 
-            if (existing && !existing.deleted) {
-              reinforceInsight(existing);
-              await kv.set(KV.insights, existing.id, existing);
+          // One get per insight in parallel, then one batched write pass:
+          // the old sequential get+set per insight is what pushed reflect
+          // past the MCP call timeout on multi-insight clusters. #655
+          const prepared = await Promise.all(
+            parsed.map(async (p) => {
+              const fp = fingerprintId("ins", p.content.toLowerCase());
+              const existing = await kv
+                .get<Insight>(KV.insights, fp)
+                .catch(() => null);
+              return { ...p, fp, existing };
+            }),
+          );
+
+          const writes: Insight[] = [];
+          for (const p of prepared) {
+            if (p.existing && !p.existing.deleted) {
+              reinforceInsight(p.existing);
+              writes.push(p.existing);
               reinforced++;
             } else {
               const now = new Date().toISOString();
-              const insight: Insight = {
-                id: fp,
-                title,
-                content,
-                confidence,
+              writes.push({
+                id: p.fp,
+                title: p.title,
+                content: p.content,
+                confidence: p.confidence,
                 reinforcements: 0,
                 sourceConceptCluster: conceptNames,
                 sourceMemoryIds: (cluster.factIds || []).slice(-INSIGHT_MAX_SOURCE_IDS),
@@ -303,13 +322,18 @@ export function registerReflectFunctions(
                 createdAt: now,
                 updatedAt: now,
                 decayRate: 0.05,
-              };
-              await kv.set(KV.insights, insight.id, insight);
+              });
               newInsights++;
             }
-
-            clusterCount++;
             totalInsights++;
+          }
+
+          for (let i = 0; i < writes.length; i += 10) {
+            await Promise.all(
+              writes
+                .slice(i, i + 10)
+                .map((insight) => kv.set(KV.insights, insight.id, insight)),
+            );
           }
         } catch {
           continue;

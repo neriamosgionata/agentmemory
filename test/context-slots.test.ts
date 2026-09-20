@@ -155,6 +155,23 @@ describe("mem::context — pinned slot injection", () => {
       expect(result.context).toContain("project-value");
       expect(result.context).not.toContain("global-value");
     });
+
+    it("truncates an over-budget pinned slot instead of dropping it whole (#1333)", async () => {
+      const oversized = "alpha ".repeat(600) + "tail-should-not-appear";
+      await seedPinnedSlot(kv, "tool_guidelines", oversized, "global");
+
+      const result = await handler({
+        sessionId: "ses_budget",
+        project: "/tmp/proj",
+        budget: 150,
+      });
+
+      expect(result.context).toContain("tool_guidelines");
+      expect(result.context).toContain("alpha");
+      expect(result.context).toContain("[truncated");
+      expect(result.context).not.toContain("tail-should-not-appear");
+      expect(result.tokens).toBeLessThanOrEqual(150);
+    });
   });
 
   describe("when AGENTMEMORY_SLOTS is off", () => {

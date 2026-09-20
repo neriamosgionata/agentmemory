@@ -16,6 +16,10 @@ import {
   getSearchIndex,
   vectorIndexRemove,
 } from "./search.js";
+import {
+  reconcileObservationDeletions,
+  type ObservationDeletion,
+} from "./observation-lifecycle.js";
 import { logger } from "../logger.js";
 
 interface EvictionConfig {
@@ -224,6 +228,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       const projectObs = new Map<string, CompressedObservation[]>();
+      const deletedObs: ObservationDeletion[] = [];
       for (const session of sessions) {
         const obs = await kv
           .list<CompressedObservation>(KV.observations(session.id))
@@ -243,6 +248,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             } else {
               try {
                 await kv.delete(KV.observations(session.id), o.id);
+                deletedObs.push({ sessionId: session.id, obsId: o.id });
                 stats.lowImportanceObs++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
@@ -289,6 +295,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             for (const o of toEvict) {
               try {
                 await kv.delete(KV.observations(o.sessionId), o.id);
+                deletedObs.push({ sessionId: o.sessionId, obsId: o.id });
                 stats.capEvictions++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
@@ -314,6 +321,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           }
         }
       }
+
+      await reconcileObservationDeletions(kv, deletedObs);
 
       const memories = await kv.list<Memory>(KV.memories).catch(() => []);
       const evictedMemIds = new Set<string>();

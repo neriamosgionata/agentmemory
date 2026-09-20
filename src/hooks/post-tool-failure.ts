@@ -3,6 +3,7 @@ import { hydrateHookEnv } from "./_env.js";
 hydrateHookEnv();
 
 import { resolveProject, hookCwd } from "./_project.js";
+import { isSelfCaptureTool } from "./self-capture.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -40,6 +41,8 @@ async function main() {
   const toolName = data.tool_name ?? data.toolName;
   const toolInput = data.tool_input ?? data.toolArgs;
   const error = data.error ?? data.errorMessage;
+
+  if (isSelfCaptureTool(toolName)) return;
 
   const cwd = hookCwd(data) || process.cwd();
 

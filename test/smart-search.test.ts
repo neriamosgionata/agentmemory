@@ -114,6 +114,37 @@ describe("Smart Search Function", () => {
     registerSmartSearchFunction(sdk as never, kv as never, searchFn);
   });
 
+  it("expands durable memory ids through KV.memories (#1080)", async () => {
+    const memory = {
+      id: "mem_durable",
+      createdAt: "2026-02-01T00:00:00Z",
+      updatedAt: "2026-02-01T00:00:00Z",
+      type: "fact",
+      title: "Durable fact",
+      content: "Remember this across sessions",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 7,
+      version: 1,
+      isLatest: true,
+      project: "my-project",
+    };
+    await kv.set("mem:memories", memory.id, memory);
+
+    const result = (await sdk.trigger("mem::smart-search", {
+      expandIds: ["mem_durable"],
+    })) as {
+      mode: string;
+      results: Array<{ observation: CompressedObservation }>;
+    };
+
+    expect(result.mode).toBe("expanded");
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].observation.id).toBe("mem_durable");
+    expect(result.results[0].observation.title).toBe("Durable fact");
+  });
+
   it("compact mode returns CompactSearchResult array", async () => {
     const result = (await sdk.trigger("mem::smart-search", {
       query: "auth",

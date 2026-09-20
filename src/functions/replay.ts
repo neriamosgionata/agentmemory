@@ -10,6 +10,7 @@ import type {
   Session,
 } from "../types.js";
 import { importOrigin } from "../types.js";
+import { claudeConfigDir } from "../config.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { parseJsonlText } from "../replay/jsonl-parser.js";
@@ -305,7 +306,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         }
       | { success: false; error: string }
     > => {
-      const defaultRoot = join(homedir(), ".claude", "projects");
+      const defaultRoot = join(claudeConfigDir(), "projects");
       const rawPath = data.path || defaultRoot;
       if (typeof rawPath !== "string" || rawPath.length === 0) {
         return { success: false, error: "path must be a non-empty string" };
@@ -354,16 +355,17 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       }
 
       if (files.length === 0) {
+        // A directory with zero .jsonl files is not a successful import: on
+        // Claude Code installs it usually means `cleanupPeriodDays` already
+        // deleted the transcripts, and reporting success:true with 0 imported
+        // hid the data gap. Fail with an actionable hint instead. #924
         return {
-          success: true,
-          imported: 0,
-          sessionIds: [],
-          observations: 0,
-          discovered,
-          truncated,
-          traversalCapped,
-          maxFiles,
-          maxFilesUpperBound: MAX_FILES_UPPER_BOUND,
+          success: false,
+          error:
+            `No .jsonl transcripts found under ${abs}. If Claude Code runs ` +
+            `with a small cleanupPeriodDays, its transcripts may already be ` +
+            `deleted — raise cleanupPeriodDays in settings.json, or point ` +
+            `import-jsonl at a directory that still holds them.`,
         };
       }
 

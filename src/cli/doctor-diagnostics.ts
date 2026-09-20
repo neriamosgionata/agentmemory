@@ -230,12 +230,31 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         "use a different worker model. Running a mismatched binary surfaces as EPIPE " +
         "reconnect loops and empty search results.",
       check: async (ctx) => {
+        // The runtime prefers the private pinned binary over PATH, so a PATH
+        // binary with the wrong version is not a failure when the private pin
+        // exists — the old check failed forever after its own fix. #874/#875
+        const localBin = effects.localBinIiiPath();
+        const localVersion = localBin
+          ? effects.iiiBinaryVersion(localBin)
+          : null;
+        const localPinned = localVersion === ctx.pinnedVersion;
         const bin = effects.findIiiBinary();
-        if (!bin) return { ok: false, detail: "iii not on PATH" };
+        if (!bin) {
+          return localPinned
+            ? { ok: true, detail: `using private pin ${localVersion}` }
+            : { ok: false, detail: "iii not on PATH" };
+        }
         const v = effects.iiiBinaryVersion(bin);
+        if (v === ctx.pinnedVersion) return { ok: true, detail: v };
+        if (localPinned) {
+          return {
+            ok: true,
+            detail: `PATH has ${v ?? "unknown"}; runtime uses private pin ${localVersion}`,
+          };
+        }
         if (!v) return { ok: false, detail: "iii on PATH but --version failed" };
         return {
-          ok: v === ctx.pinnedVersion,
+          ok: false,
           detail: `${v} (pinned ${ctx.pinnedVersion})`,
         };
       },
@@ -323,15 +342,22 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         "user-managed iii on PATH (homebrew, cargo, manual install) stays untouched. " +
         "When agentmemory needs the pin and PATH doesn't have it, it falls back to the " +
         "private install. If neither exists, run the installer.",
-      manualOnly: true,
       check: async () => {
         const bin = effects.findIiiBinary();
         if (!bin) return { ok: true, detail: "iii not on PATH (handled elsewhere)" };
         const localBin = effects.localBinIiiPath();
-        return {
-          ok: bin === localBin,
-          detail: bin === localBin ? undefined : `iii at: ${bin}`,
-        };
+        if (bin === localBin) return { ok: true };
+        // A different PATH binary is fine as long as the private pin exists:
+        // the runtime uses the pin, and this check exists to confirm the
+        // engine is covered — not to force PATH to match. #874
+        const hasPrivatePin =
+          localBin != null && effects.iiiBinaryVersion(localBin) !== null;
+        return hasPrivatePin
+          ? {
+              ok: true,
+              detail: "private pin present; PATH iii left untouched",
+            }
+          : { ok: false, detail: `iii at: ${bin}` };
       },
       fix: async () =>
         effects.runIiiInstaller().then((r) => ({

@@ -171,17 +171,48 @@ describe("doctor v2 diagnostic catalog", () => {
     expect(status.detail).toContain("ANTHROPIC_API_KEY");
   });
 
-  it("iii-on-path-not-local-bin warns when iii lives in another location", async () => {
+  it("engine-version-mismatch passes when PATH differs but the private pin is current (#875)", async () => {
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        findIiiBinary: () => "/usr/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: (bin: string) =>
+          bin === "/usr/bin/iii" ? "0.23.0" : "0.11.2",
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "engine-version-mismatch")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(true);
+    expect(status.detail).toContain("private pin");
+  });
+
+  it("iii-on-path-not-local-bin passes when the private pin covers the engine (#874)", async () => {
     const diagnostics = buildDiagnostics(
       stubEffects({
         findIiiBinary: () => "/opt/homebrew/bin/iii",
-        localBinIiiPath: () => "/Users/test/.local/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: () => "0.11.2",
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "iii-on-path-not-local-bin")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(true);
+    expect(check.manualOnly).toBeUndefined();
+  });
+
+  it("iii-on-path-not-local-bin fails when neither PATH nor a private pin exists (#874)", async () => {
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        findIiiBinary: () => "/opt/homebrew/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: (bin: string) =>
+          bin === "/opt/homebrew/bin/iii" ? "0.11.2" : null,
       }),
     );
     const check = diagnostics.find((d) => d.id === "iii-on-path-not-local-bin")!;
     const status = await check.check(stubCtx());
     expect(status.ok).toBe(false);
-    expect(check.manualOnly).toBe(true);
+    expect(status.detail).toContain("/opt/homebrew/bin/iii");
   });
 
   it("dryRunPlan lists each failing diagnostic with the fix preview", () => {
