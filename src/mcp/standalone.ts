@@ -3,7 +3,7 @@
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
 import { getAllTools } from "./tools-registry.js";
-import { getStandalonePersistPath } from "../config.js";
+import { getStandalonePersistPath, hydrateProcessEnvFromFile } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
 import {
@@ -35,6 +35,7 @@ const SERVER_INFO = {
   version: VERSION,
 };
 
+hydrateProcessEnvFromFile();
 const kv = new InMemoryKV(getStandalonePersistPath());
 let modeAnnounced = false;
 
@@ -114,7 +115,6 @@ interface Validated {
   tokenBudget?: number;
   memoryIds?: string[];
   reason?: string;
-  project?: string;
 }
 
 function validate(toolName: string, args: Record<string, unknown>): Validated {

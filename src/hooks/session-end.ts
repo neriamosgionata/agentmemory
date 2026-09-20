@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { hydrateHookEnv } from "./_env.js";
+hydrateHookEnv();
+
 import { readFileSync } from "node:fs";
 import { resolveProject, hookCwd } from "./_project.js";
 

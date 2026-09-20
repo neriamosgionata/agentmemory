@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { hydrateHookEnv } from "./_env.js";
+hydrateHookEnv();
+
 import { resolveProject, hookCwd } from "./_project.js";
 
 function isSdkChildContext(payload: unknown): boolean {
