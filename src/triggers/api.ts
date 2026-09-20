@@ -1154,10 +1154,27 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::patterns", 
-    async (req: ApiRequest<{ project?: string }>): Promise<Response> => {
+    async (req: ApiRequest<{ project?: string; maxSessions?: number; sinceDays?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const result = await sdk.trigger({ function_id: "mem::patterns", payload: req.body });
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const project = asNonEmptyString(body.project);
+      const maxSessions =
+        typeof body.maxSessions === "number" && Number.isFinite(body.maxSessions)
+          ? body.maxSessions
+          : undefined;
+      const sinceDays =
+        typeof body.sinceDays === "number" && Number.isFinite(body.sinceDays)
+          ? body.sinceDays
+          : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::patterns",
+        payload: {
+          ...(project !== undefined && { project }),
+          ...(maxSessions !== undefined && { maxSessions }),
+          ...(sinceDays !== undefined && { sinceDays }),
+        },
+      });
       return { status_code: 200, body: result };
     },
   );

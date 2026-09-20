@@ -120,6 +120,14 @@ export const CORE_TOOLS: McpToolDef[] = [
       type: "object",
       properties: {
         project: { type: "string", description: "Project path to analyze" },
+        maxSessions: {
+          type: "number",
+          description: "Most recent sessions to scan (default 100, max 500)",
+        },
+        sinceDays: {
+          type: "number",
+          description: "Only scan sessions started within the last N days",
+        },
       },
     },
   },

@@ -95,7 +95,12 @@ export class HybridSearch {
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = this.vector.search(queryEmbedding, limit * 2);
+        // Prefer the yielding scan on large indexes (#195); fall back to the
+        // synchronous one for stubs/tests that only implement search().
+        vectorResults =
+          typeof this.vector.searchAsync === "function"
+            ? await this.vector.searchAsync(queryEmbedding, limit * 2)
+            : this.vector.search(queryEmbedding, limit * 2);
       } catch {
         // fall through to BM25-only
       }

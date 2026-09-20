@@ -5,6 +5,8 @@
 // pool. Same risk on the encode side if the input Float32Array is itself
 // a sliced view. Reported as a phantom "2048 dimensions on disk" crash
 // in #455 / #469 / #584 / #587.
+const VECTOR_SCAN_CHUNK = 8192;
+
 function float32ToBase64(arr: Float32Array): string {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString(
     "base64",
@@ -77,22 +79,80 @@ export class VectorIndex {
     let minScore = -Infinity;
 
     for (const [obsId, entry] of this.vectors) {
-      const score = cosineSimilarity(query, entry.embedding);
-      if (results.length < limit) {
-        results.push({ obsId, sessionId: entry.sessionId, score });
-        if (results.length === limit) {
-          results.sort((a, b) => a.score - b.score);
-          minScore = results[0].score;
-        }
-      } else if (score > minScore) {
-        results[0] = { obsId, sessionId: entry.sessionId, score };
-        results.sort((a, b) => a.score - b.score);
-        minScore = results[0].score;
+      minScore = this.scoreInto(
+        results,
+        minScore,
+        obsId,
+        entry.sessionId,
+        cosineSimilarity(query, entry.embedding),
+        limit,
+      );
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results;
+  }
+
+  /**
+   * Same ranking as search(), but yields to the event loop every
+   * VECTOR_SCAN_CHUNK vectors. The brute-force scan is synchronous CPU
+   * work on the worker's only thread (#195): at ~100k vectors a search
+   * blocks heartbeats and every concurrent invocation for seconds. The
+   * sync search() stays for cheap/small paths and tests.
+   */
+  async searchAsync(
+    query: Float32Array,
+    limit = 20,
+  ): Promise<Array<{ obsId: string; sessionId: string; score: number }>> {
+    const results: Array<{
+      obsId: string;
+      sessionId: string;
+      score: number;
+    }> = [];
+    let minScore = -Infinity;
+    let processed = 0;
+
+    for (const [obsId, entry] of this.vectors) {
+      minScore = this.scoreInto(
+        results,
+        minScore,
+        obsId,
+        entry.sessionId,
+        cosineSimilarity(query, entry.embedding),
+        limit,
+      );
+      processed++;
+      if (processed % VECTOR_SCAN_CHUNK === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
 
     results.sort((a, b) => b.score - a.score);
     return results;
+  }
+
+  private scoreInto(
+    results: Array<{ obsId: string; sessionId: string; score: number }>,
+    minScore: number,
+    obsId: string,
+    sessionId: string,
+    score: number,
+    limit: number,
+  ): number {
+    if (results.length < limit) {
+      results.push({ obsId, sessionId, score });
+      if (results.length === limit) {
+        results.sort((a, b) => a.score - b.score);
+        return results[0].score;
+      }
+      return minScore;
+    }
+    if (score > minScore) {
+      results[0] = { obsId, sessionId, score };
+      results.sort((a, b) => a.score - b.score);
+      return results[0].score;
+    }
+    return minScore;
   }
 
   get size(): number {
