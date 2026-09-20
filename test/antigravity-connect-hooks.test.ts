@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -371,5 +371,30 @@ describe("antigravity bridge event routing", () => {
 
   it("ignores PostInvocation to avoid double-capturing a turn", () => {
     expect(targetsFor("PostInvocation", {})).toEqual([]);
+  });
+});
+
+describe("AGENTMEMORY_HOOK_RUNTIME override (antigravity)", () => {
+  const original = process.env["AGENTMEMORY_HOOK_RUNTIME"];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env["AGENTMEMORY_HOOK_RUNTIME"];
+    else process.env["AGENTMEMORY_HOOK_RUNTIME"] = original;
+  });
+
+  it("defaults to node and switches to bun on request", () => {
+    delete process.env["AGENTMEMORY_HOOK_RUNTIME"];
+    for (const bundle of Object.values(build())) {
+      for (const command of allCommands(bundle)) {
+        expect(command.startsWith("node ")).toBe(true);
+      }
+    }
+
+    process.env["AGENTMEMORY_HOOK_RUNTIME"] = "bun";
+    for (const bundle of Object.values(build())) {
+      for (const command of allCommands(bundle)) {
+        expect(command.startsWith("bun ")).toBe(true);
+      }
+    }
   });
 });

@@ -22,6 +22,19 @@ import * as p from "@clack/prompts";
 // tools). One wired entry now serves local AND remote (Kubernetes /
 // reverse-proxied) deployments without doctor-warning duplicates (#375)
 // AND fresh installs that haven't exported envs (#510).
+// Hook commands are executed by the HOST agent, not by the agentmemory
+// daemon, so their runtime is whatever binary the host finds on PATH. The
+// default stays `node`; AGENTMEMORY_HOOK_RUNTIME=bun rewrites the leading
+// runtime token when connect materializes hook manifests. Only the known
+// value is accepted, so a stray env value cannot inject arbitrary shell
+// into the host's config. Static plugin/hooks/*.json manifests are shipped
+// as-is and are not affected.
+export function applyHookRuntime(command: string): string {
+  const runtime = process.env["AGENTMEMORY_HOOK_RUNTIME"]?.trim().toLowerCase();
+  if (runtime !== "bun") return command;
+  return command.replace(/^\s*node(?=\s|$)/, "bun");
+}
+
 export const AGENTMEMORY_MCP_BLOCK = {
   command: "npx",
   args: ["-y", "@agentmemory/mcp"],

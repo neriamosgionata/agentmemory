@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,8 +7,52 @@ import {
   findPluginRoot,
   type HookManifest,
 } from "../src/cli/connect/codex-hooks.js";
+import { applyHookRuntime } from "../src/cli/connect/util.js";
 
 const PLUGIN_ROOT = resolve(__dirname, "..", "plugin");
+
+function allCommands(manifest: HookManifest): string[] {
+  return Object.values(manifest.hooks).flatMap((entries) =>
+    entries.flatMap((entry) => entry.hooks.map((h) => h.command)),
+  );
+}
+
+describe("AGENTMEMORY_HOOK_RUNTIME override", () => {
+  const original = process.env["AGENTMEMORY_HOOK_RUNTIME"];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env["AGENTMEMORY_HOOK_RUNTIME"];
+    else process.env["AGENTMEMORY_HOOK_RUNTIME"] = original;
+  });
+
+  it("defaults to node", () => {
+    delete process.env["AGENTMEMORY_HOOK_RUNTIME"];
+    const commands = allCommands(buildMergedHooks(null, PLUGIN_ROOT));
+    expect(commands.length).toBeGreaterThan(0);
+    for (const command of commands) expect(command.startsWith("node ")).toBe(true);
+  });
+
+  it("rewrites the runtime to bun when set to bun", () => {
+    process.env["AGENTMEMORY_HOOK_RUNTIME"] = "bun";
+    const commands = allCommands(buildMergedHooks(null, PLUGIN_ROOT));
+    expect(commands.length).toBeGreaterThan(0);
+    for (const command of commands) expect(command.startsWith("bun ")).toBe(true);
+  });
+
+  it("ignores unknown values so env cannot inject arbitrary shell", () => {
+    process.env["AGENTMEMORY_HOOK_RUNTIME"] = "sh -c evil";
+    expect(applyHookRuntime('node "x.mjs"')).toBe('node "x.mjs"');
+    const commands = allCommands(buildMergedHooks(null, PLUGIN_ROOT));
+    for (const command of commands) expect(command.startsWith("node ")).toBe(true);
+  });
+
+  it("still detects agentmemory entries when the runtime is rewritten", () => {
+    process.env["AGENTMEMORY_HOOK_RUNTIME"] = "bun";
+    const first = buildMergedHooks(null, PLUGIN_ROOT);
+    const second = buildMergedHooks(first, PLUGIN_ROOT);
+    expect(allCommands(second).length).toBe(allCommands(first).length);
+  });
+});
 
 describe("findPluginRoot", () => {
   it("locates the bundled plugin/ directory from src/cli/connect/", () => {

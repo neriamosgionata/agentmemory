@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { applyHookRuntime } from "./util.js";
 
 /**
  * Merge engine for Antigravity CLI's `hooks.json`.
@@ -150,9 +151,8 @@ function resolveHandler(
     // Replacer function, not a string: a plugin path containing `$$`, `$&`,
     // "$`" or `$'` would otherwise be read as a replacement pattern and
     // silently mangle the installed command.
-    command: handler.command.replace(
-      /\$\{CLAUDE_PLUGIN_ROOT\}/g,
-      () => pluginRoot,
+    command: applyHookRuntime(
+      handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginRoot),
     ),
     ...(handler.timeout !== undefined && { timeout: handler.timeout }),
   };

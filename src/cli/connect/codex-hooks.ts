@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyHookRuntime } from "./util.js";
 
 /**
  * Shared merge engine for writing agentmemory's bundled hook scripts into
@@ -94,7 +95,9 @@ export function buildMergedHooks(
       const next: HookEntry = {
         hooks: entry.hooks.map((handler) => ({
           type: handler.type,
-          command: handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
+          command: applyHookRuntime(
+            handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
+          ),
         })),
       };
       if (entry.matcher !== undefined) next.matcher = entry.matcher;

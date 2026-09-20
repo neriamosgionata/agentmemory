@@ -209,12 +209,15 @@ function runNativeRemoveWithWorkerFailure() {
   writeFileSync(privateBin, "owned binary");
   writeFileSync(enginePidfile, "424243\n");
   writeFileSync(workerPidfile, "424242\n");
+  // Non-canonical port: the stop path probes the configured REST port for
+  // live holders and aborts on foreign processes. Hardcoding 3111 made this
+  // test fail on any machine running a real daemon.
   writeFileSync(
     engineState,
     JSON.stringify({
       kind: "native",
       configPath: join(root, "iii-config.runtime.yaml"),
-      restPort: 3111,
+      restPort: 3999,
     }),
   );
   writeFileSync(
@@ -245,6 +248,8 @@ process.kill = (pid, signal) => {
       "remove",
       "--force",
       "--keep-data",
+      "--port",
+      "3999",
     ],
     {
       cwd: process.cwd(),
