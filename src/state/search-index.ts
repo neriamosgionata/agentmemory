@@ -51,6 +51,15 @@ export class SearchIndex {
     return this.entries.has(id);
   }
 
+  /**
+   * Session that owns an indexed record. Used by governance delete to locate
+   * observation rows, which live in per-session scopes and are not otherwise
+   * addressable from an id alone (#1273).
+   */
+  getSessionId(id: string): string | null {
+    return this.entries.get(id)?.sessionId ?? null;
+  }
+
   remove(id: string): void {
     const entry = this.entries.get(id);
     if (!entry) return;

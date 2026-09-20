@@ -19,6 +19,16 @@ describe("Actions Functions", () => {
   });
 
   describe("mem::action-create", () => {
+    it("coerces CSV-string tags into an array (#906)", async () => {
+      const result = (await sdk.trigger("mem::action-create", {
+        title: "Analyze NVDA",
+        tags: "analysis,run",
+      })) as { success: boolean; action: Action };
+
+      expect(result.success).toBe(true);
+      expect(result.action.tags).toEqual(["analysis", "run"]);
+    });
+
     it("creates an action with valid data", async () => {
       const result = (await sdk.trigger("mem::action-create", {
         title: "Fix login bug",
@@ -177,6 +187,20 @@ describe("Actions Functions", () => {
       expect(updateResult.action.status).toBe("active");
       expect(updateResult.action.assignedTo).toBe("agent-2");
       expect(updateResult.action.tags).toEqual(["updated"]);
+    });
+
+    it("coerces CSV-string tags on update too (#906)", async () => {
+      const createResult = (await sdk.trigger("mem::action-create", {
+        title: "Tag me",
+      })) as { success: boolean; action: Action };
+
+      const updateResult = (await sdk.trigger("mem::action-update", {
+        actionId: createResult.action.id,
+        tags: "alpha, beta",
+      })) as { success: boolean; action: Action };
+
+      expect(updateResult.success).toBe(true);
+      expect(updateResult.action.tags).toEqual(["alpha", "beta"]);
     });
 
     it("returns error when actionId is missing", async () => {

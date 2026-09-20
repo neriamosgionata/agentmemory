@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { hydrateHookEnv } from "./_env.js";
+hydrateHookEnv();
+
 
 // Inlined — see src/hooks/sdk-guard.ts for canonical version. Kept local
 // per-hook so tsdown does not emit a shared hashed chunk that would churn
@@ -48,7 +51,10 @@ async function main() {
     signal: AbortSignal.timeout(5000),
   }).catch(() => {});
 
-  setTimeout(() => process.exit(0), 1500).unref();
+  // Single fire-and-forget request: the unref'd timer only has to cover
+  // dispatch, not a response. 1.5s used to outlive the host's shutdown grace
+  // and surface as "Hook cancelled". #991
+  setTimeout(() => process.exit(0), 500).unref();
 }
 
 main().catch(() => process.exit(0));

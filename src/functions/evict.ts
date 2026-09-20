@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type {
   Session,
   CompressedObservation,
@@ -11,6 +11,15 @@ import { StateKV } from "../state/kv.js";
 import { isConsolidationEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
+import {
+  flushIndexSave,
+  getSearchIndex,
+  vectorIndexRemove,
+} from "./search.js";
+import {
+  reconcileObservationDeletions,
+  type ObservationDeletion,
+} from "./observation-lifecycle.js";
 import { logger } from "../logger.js";
 
 interface EvictionConfig {
@@ -125,6 +134,10 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         nonLatestMemories: 0,
         dryRun,
       };
+      // #1372: every KV delete below must also drop the row from both
+      // indexes, and one flush must publish the batch. Otherwise the next
+      // save/rebuild preserves entries whose rows are gone.
+      let indexMutations = 0;
 
       let recoveredStaleSessions = 0;
       const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
@@ -180,6 +193,25 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               });
               continue;
             }
+            // #1372: the session row alone is not the whole session. Leaving
+            // observations behind makes them unreachable for rebuildIndex
+            // (which iterates sessions) while still holding index slots.
+            for (const o of observations) {
+              try {
+                await kv.delete(KV.observations(session.id), o.id);
+              } catch (err) {
+                logger.warn("Eviction delete failed", {
+                  resource: "observation",
+                  id: o.id,
+                  sessionId: session.id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+                continue;
+              }
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
+              indexMutations++;
+            }
             await recordAudit(kv, "delete", "mem::evict", [session.id], {
               resource: "session",
               reason: recovered
@@ -196,6 +228,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       const projectObs = new Map<string, CompressedObservation[]>();
+      const deletedObs: ObservationDeletion[] = [];
       for (const session of sessions) {
         const obs = await kv
           .list<CompressedObservation>(KV.observations(session.id))
@@ -215,6 +248,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             } else {
               try {
                 await kv.delete(KV.observations(session.id), o.id);
+                deletedObs.push({ sessionId: session.id, obsId: o.id });
                 stats.lowImportanceObs++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
@@ -225,6 +259,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
+              indexMutations++;
               if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
               if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
               await recordAudit(kv, "delete", "mem::evict", [o.id], {
@@ -258,6 +295,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             for (const o of toEvict) {
               try {
                 await kv.delete(KV.observations(o.sessionId), o.id);
+                deletedObs.push({ sessionId: o.sessionId, obsId: o.id });
                 stats.capEvictions++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
@@ -268,6 +306,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
+              indexMutations++;
               if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
               if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
               await recordAudit(kv, "delete", "mem::evict", [o.id], {
@@ -280,6 +321,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           }
         }
       }
+
+      await reconcileObservationDeletions(kv, deletedObs);
 
       const memories = await kv.list<Memory>(KV.memories).catch(() => []);
       const evictedMemIds = new Set<string>();
@@ -304,6 +347,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
+              indexMutations++;
               if (mem.imageRef) {
                 await decrementImageRef(kv, sdk, mem.imageRef);
               }
@@ -339,6 +385,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
+              indexMutations++;
               if (mem.imageRef) {
                 await decrementImageRef(kv, sdk, mem.imageRef);
               }
@@ -353,7 +402,10 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
-      logger.info("Eviction complete", { stats });
+      if (!dryRun && indexMutations > 0) {
+        await flushIndexSave();
+      }
+      logger.info("Eviction complete", { stats, indexMutations });
       return stats;
     },
   );

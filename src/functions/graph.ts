@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type {
   GraphNode,
   GraphEdge,
@@ -6,6 +6,7 @@ import type {
   GraphSnapshot,
   CompressedObservation,
   MemoryProvider,
+  Session,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -13,7 +14,10 @@ import {
   GRAPH_EXTRACTION_SYSTEM,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
-import { isGraphExtractionEnabled } from "../config.js";
+import {
+  isGraphExtractionEnabled,
+  getGraphMaxSourceIds,
+} from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 
@@ -22,6 +26,37 @@ import { logger } from "../logger.js";
 // reported 11k-node / 28k-edge corpus, and 5,000 is the upper bound a
 // caller can request explicitly. Tuned conservatively because edges
 // fan out faster than nodes.
+// How many provenance ids a projected graph-query response keeps as a
+// sample. The full array is available with `includeSources: true`.
+const GRAPH_QUERY_SOURCE_SAMPLE = 3;
+
+/** Bound a provenance array, keeping the most recent ids. */
+function capSourceIds(ids: string[]): string[] {
+  const max = getGraphMaxSourceIds();
+  return ids.length <= max ? ids : ids.slice(-max);
+}
+
+/**
+ * Strip the provenance array down to a count plus a small sample.
+ * graph-query used to return node objects verbatim, so every consumer
+ * paid for accumulated provenance on every call — for an agent that
+ * cost is context window (upstream #1171).
+ */
+function projectSources<T extends { sourceObservationIds?: string[] }>(
+  row: T,
+  includeSources: boolean,
+): T & { sourceObservationCount?: number } {
+  const ids = row.sourceObservationIds ?? [];
+  if (includeSources || ids.length <= GRAPH_QUERY_SOURCE_SAMPLE) {
+    return { ...row, sourceObservationCount: ids.length };
+  }
+  return {
+    ...row,
+    sourceObservationIds: ids.slice(-GRAPH_QUERY_SOURCE_SAMPLE),
+    sourceObservationCount: ids.length,
+  };
+}
+
 const DEFAULT_GRAPH_QUERY_LIMIT = 500;
 const MAX_GRAPH_QUERY_LIMIT = 5000;
 
@@ -146,6 +181,7 @@ function paginateFromSnapshot(
   filterType: string | undefined,
   limit: number,
   offset: number,
+  includeSources = false,
 ): GraphQueryResult {
   const filteredNodes = filterType
     ? snap.topNodes.filter((n) => n.type === filterType)
@@ -159,8 +195,8 @@ function paginateFromSnapshot(
     (e) => pageIds.has(e.sourceNodeId) && pageIds.has(e.targetNodeId),
   );
   return {
-    nodes: pageNodes,
-    edges: pageEdges,
+    nodes: pageNodes.map((n) => projectSources(n, includeSources)),
+    edges: pageEdges.map((e) => projectSources(e, includeSources)),
     depth: 0,
     totalNodes: total,
     totalEdges: snap.stats.totalEdges,
@@ -280,13 +316,15 @@ function mergeNode(
 ): GraphNode {
   return {
     ...existing,
-    sourceObservationIds: [
+    // Newest ids sort last through the Set, so the cap keeps the most
+    // recent provenance and drops the oldest (upstream #1171).
+    sourceObservationIds: capSourceIds([
       ...new Set([
         ...existing.sourceObservationIds,
         ...incoming.sourceObservationIds,
         ...obsIds,
       ]),
-    ],
+    ]),
     properties: { ...existing.properties, ...incoming.properties },
     updatedAt: capturedAt,
   };
@@ -298,9 +336,9 @@ function mergeEdge(
 ): GraphEdge {
   return {
     ...existing,
-    sourceObservationIds: [
+    sourceObservationIds: capSourceIds([
       ...new Set([...existing.sourceObservationIds, ...obsIds]),
-    ],
+    ]),
   };
 }
 
@@ -327,6 +365,7 @@ function paginate(
   depth: number,
   limit: number,
   offset: number,
+  includeSources = false,
 ): GraphQueryResult {
   const totalNodes = nodes.length;
   const pageNodes = nodes.slice(offset, offset + limit);
@@ -349,8 +388,8 @@ function paginate(
     0,
   );
   return {
-    nodes: pageNodes,
-    edges: pageEdges,
+    nodes: pageNodes.map((n) => projectSources(n, includeSources)),
+    edges: pageEdges.map((e) => projectSources(e, includeSources)),
     depth,
     totalNodes,
     totalEdges,
@@ -379,12 +418,14 @@ function parseAttrs(raw: string): Record<string, string> {
 function parseGraphXml(
   xml: string,
   observationIds: string[],
+  canonicalizeName?: (name: string, observationIds: string[]) => string,
 ): {
   nodes: GraphNode[];
   edges: GraphEdge[];
 } {
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
+  const nameRemap = new Map<string, string>();
   const now = new Date().toISOString();
 
   // Two passes because <entity> can be self-closing or have a body
@@ -398,8 +439,13 @@ function parseGraphXml(
   const addEntity = (rawAttrs: string, propsBlock = ""): void => {
     const attrs = parseAttrs(rawAttrs);
     const type = attrs["type"] as GraphNode["type"] | undefined;
-    const name = attrs["name"];
-    if (!type || !name) return;
+    const rawName = attrs["name"];
+    if (!type || !rawName) return;
+    const name =
+      type === "file" && canonicalizeName
+        ? canonicalizeName(rawName, observationIds)
+        : rawName;
+    if (name !== rawName) nameRemap.set(rawName, name);
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -411,7 +457,7 @@ function parseGraphXml(
       type,
       name,
       properties,
-      sourceObservationIds: observationIds,
+      sourceObservationIds: capSourceIds(observationIds),
       createdAt: now,
     });
   };
@@ -428,8 +474,14 @@ function parseGraphXml(
   while ((match = relRegex.exec(xml)) !== null) {
     const attrs = parseAttrs(match[1]);
     const type = attrs["type"] as GraphEdge["type"] | undefined;
-    const sourceName = attrs["source"];
-    const targetName = attrs["target"];
+    const rawSource = attrs["source"];
+    const rawTarget = attrs["target"];
+    const sourceName = rawSource
+      ? (nameRemap.get(rawSource) ?? rawSource)
+      : rawSource;
+    const targetName = rawTarget
+      ? (nameRemap.get(rawTarget) ?? rawTarget)
+      : rawTarget;
     if (!type || !sourceName || !targetName) continue;
     const parsedWeight = parseFloat(attrs["weight"] ?? "");
     const weight = Number.isFinite(parsedWeight) ? parsedWeight : 0.5;
@@ -443,7 +495,7 @@ function parseGraphXml(
       sourceNodeId: sourceNode.id,
       targetNodeId: targetNode.id,
       weight: Math.max(0, Math.min(1, weight)),
-      sourceObservationIds: observationIds,
+      sourceObservationIds: capSourceIds(observationIds),
       createdAt: now,
     });
   }
@@ -454,8 +506,33 @@ function parseGraphXml(
 const HEURISTIC_EDGE_WEIGHT = 0.4;
 const MAX_HEURISTIC_EDGES_PER_OBS = 12;
 
+// File-node identity must be stable across worktrees and scratch checkouts:
+// keying on the absolute path made the same file a different node per
+// checkout. Relativize to the session root (cwd, else project) when the file
+// lives under it; paths outside the root keep their absolute form so they
+// cannot collide with unrelated same-named files. #1221
+export function canonicalizeFilePath(file: string, root?: string): string {
+  let p = file.trim();
+  if (!p) return p;
+  if (root) {
+    const normalizedRoot = root.trim().replace(/[\\/]+$/, "");
+    if (normalizedRoot) {
+      for (const sep of ["/", "\\"]) {
+        const prefix = normalizedRoot + sep;
+        if (p.startsWith(prefix)) {
+          p = p.slice(prefix.length);
+          break;
+        }
+      }
+    }
+  }
+  if (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
+
 export function extractGraphHeuristics(
   observations: CompressedObservation[],
+  rootBySession?: Map<string, string>,
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const now = new Date().toISOString();
   const nodes: GraphNode[] = [];
@@ -470,7 +547,7 @@ export function extractGraphHeuristics(
   ): GraphNode | null => {
     const trimmed = name.trim();
     if (!trimmed) return null;
-    const key = `${type} ${trimmed.toLowerCase()}`;
+    const key = `${type}\0${trimmed.toLowerCase()}`;
     let node = nodeByKey.get(key);
     if (!node) {
       node = {
@@ -484,7 +561,10 @@ export function extractGraphHeuristics(
       nodeByKey.set(key, node);
       nodes.push(node);
     } else if (!node.sourceObservationIds.includes(obsId)) {
-      node.sourceObservationIds.push(obsId);
+      node.sourceObservationIds = capSourceIds([
+        ...node.sourceObservationIds,
+        obsId,
+      ]);
     }
     return node;
   };
@@ -497,7 +577,10 @@ export function extractGraphHeuristics(
       const existing = edgeByPair.get(pair);
       if (existing) {
         if (!existing.sourceObservationIds.includes(obs.id)) {
-          existing.sourceObservationIds.push(obs.id);
+          existing.sourceObservationIds = capSourceIds([
+            ...existing.sourceObservationIds,
+            obs.id,
+          ]);
         }
         return;
       }
@@ -516,8 +599,9 @@ export function extractGraphHeuristics(
       edges.push(edge);
     };
 
+    const sessionRoot = rootBySession?.get(obs.sessionId);
     const fileNodes = (obs.files ?? []).map((f) =>
-      nodeFor("file", f, obs.id),
+      nodeFor("file", canonicalizeFilePath(f, sessionRoot), obs.id),
     );
     const conceptNodes = (obs.concepts ?? []).map((c) =>
       nodeFor("concept", c, obs.id),
@@ -692,10 +776,42 @@ export function registerGraphFunction(
 
       const obsIds = data.observations.map((o) => o.id);
 
+      // Session roots for file-node canonicalization (#1221). A failed
+      // sessions read degrades to absolute names, never to an error.
+      const rootBySession = new Map<string, string>();
+      const obsRootById = new Map<string, string>();
+      try {
+        const sessions = await kv.list<Session>(KV.sessions);
+        for (const session of sessions) {
+          const root = session.cwd?.trim() || session.project?.trim();
+          if (root) rootBySession.set(session.id, root);
+        }
+        for (const obs of data.observations) {
+          const root = rootBySession.get(obs.sessionId);
+          if (root) obsRootById.set(obs.id, root);
+        }
+      } catch (err) {
+        logger.warn("graph-extract session roots unavailable", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      const canonicalizeName = (
+        name: string,
+        observationIds: string[],
+      ): string => {
+        const root = observationIds
+          .map((id) => obsRootById.get(id))
+          .find((r): r is string => Boolean(r));
+        return canonicalizeFilePath(name, root);
+      };
+
       let nodes: GraphNode[] = [];
       let edges: GraphEdge[] = [];
       try {
-        const heuristic = extractGraphHeuristics(data.observations);
+        const heuristic = extractGraphHeuristics(
+          data.observations,
+          rootBySession,
+        );
         nodes = heuristic.nodes;
         edges = heuristic.edges;
       } catch (err) {
@@ -722,7 +838,7 @@ export function registerGraphFunction(
             GRAPH_EXTRACTION_SYSTEM,
             prompt,
           );
-          const parsed = parseGraphXml(response, obsIds);
+          const parsed = parseGraphXml(response, obsIds, canonicalizeName);
           nodes = nodes.concat(parsed.nodes);
           edges = edges.concat(parsed.edges);
         } catch (err) {
@@ -784,9 +900,13 @@ export function registerGraphFunction(
       query?: string;
       limit?: number;
       offset?: number;
+      includeSources?: boolean;
     }): Promise<GraphQueryResult> => {
       const maxDepth = Math.min(data.maxDepth || 3, 5);
       const { limit, offset } = resolvePagination(data.limit, data.offset);
+      // Off by default: the full provenance array is ~99% of the bytes
+      // and almost never what the caller wanted (upstream #1171).
+      const includeSources = data.includeSources === true;
 
       // #814 v2: the empty-body / nodeType-only path NEVER enumerates.
       // It reads the snapshot exclusively. The snapshot is updated
@@ -799,7 +919,7 @@ export function registerGraphFunction(
       if (noWalk) {
         const snap = await readSnapshot(kv);
         if (snap && snap.stats.totalNodes > 0) {
-          return paginateFromSnapshot(snap, data.nodeType, limit, offset);
+          return paginateFromSnapshot(snap, data.nodeType, limit, offset, includeSources);
         }
         return {
           nodes: [],
@@ -875,7 +995,7 @@ export function registerGraphFunction(
               (v) => typeof v === "string" && v.toLowerCase().includes(lower),
             ),
         );
-        return paginate(matchingNodes, allEdges, 0, limit, offset);
+        return paginate(matchingNodes, allEdges, 0, limit, offset, includeSources);
       }
 
       if (data.startNodeId) {
@@ -917,11 +1037,11 @@ export function registerGraphFunction(
           }
         }
 
-        return paginate(resultNodes, resultEdges, maxDepth, limit, offset);
+        return paginate(resultNodes, resultEdges, maxDepth, limit, offset, includeSources);
       }
 
       // Unreachable — noWalk branch handles the rest.
-      return paginate([], [], 0, limit, offset);
+      return paginate([], [], 0, limit, offset, includeSources);
     },
   );
 
@@ -1122,7 +1242,22 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-reset", async () => {
+  //
+  // #1239: the enumeration-free path is still the default, but it now
+  // says so in the response (`snapshotOnly: true`, `nodesRetained:
+  // null`) instead of returning a bare `success: true` that operators
+  // read as "the graph is gone". Callers that want the rows actually
+  // deleted pass `confirm: true`; that path enumerates the two scopes
+  // under the same 6s live-enumeration budget the query handler uses,
+  // refuses above GRAPH_RESET_MAX_RECORDS, and deletes in batches that
+  // yield to the event loop so the worker heartbeat survives.
+  const GRAPH_RESET_MAX_RECORDS = 50_000;
+  const GRAPH_RESET_BATCH = 100;
+
+  sdk.registerFunction("mem::graph-reset", async (data?: {
+    confirm?: boolean;
+    maxRecords?: number;
+  }) => {
     const started = Date.now();
     // Stamp resetAt=now on the empty snapshot. Future
     // mem::graph-extract calls compare each name-index lookup's
@@ -1134,12 +1269,107 @@ export function registerGraphFunction(
       ...emptySnapshot(),
       resetAt: new Date().toISOString(),
     };
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+
+    if (data?.confirm !== true) {
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+      const counts: Record<string, number> = {
+        [KV.graphSnapshot]: 1,
+      };
+      const tookMs = Date.now() - started;
+      logger.info("Graph state reset (snapshot only)", { counts, tookMs });
+      return {
+        success: true,
+        snapshotOnly: true,
+        cleared: counts,
+        nodesRetained: null,
+        edgesRetained: null,
+        hint: "Graph rows were not enumerated (legacy corpora cannot list safely). Pass confirm: true to delete nodes and edges.",
+        tookMs,
+      };
+    }
+
+    const requestedMax =
+      typeof data.maxRecords === "number" && Number.isFinite(data.maxRecords)
+        ? Math.floor(data.maxRecords)
+        : GRAPH_RESET_MAX_RECORDS;
+    const ceiling = Math.min(
+      Math.max(requestedMax, 1),
+      GRAPH_RESET_MAX_RECORDS,
+    );
+
+    let nodes: GraphNode[];
+    let edges: GraphEdge[];
+    try {
+      [nodes, edges] = await withTimeout(
+        Promise.all([
+          kv.list<GraphNode>(KV.graphNodes),
+          kv.list<GraphEdge>(KV.graphEdges),
+        ]),
+        LIVE_ENUMERATION_BUDGET_MS,
+        "graph-reset enumeration",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("Graph reset enumeration failed", { message });
+      return {
+        success: false,
+        error: "enumeration_failed",
+        message,
+        hint: "Graph too large to list safely. Stop the daemon and move mem:graph:*.bin aside, or retry with a smaller store.",
+        tookMs: Date.now() - started,
+      };
+    }
+
+    const total = nodes.length + edges.length;
+    if (total > ceiling) {
+      logger.warn("Graph reset refused: corpus above ceiling", {
+        total,
+        ceiling,
+      });
+      return {
+        success: false,
+        error: "graph_too_large",
+        totalRecords: total,
+        ceiling,
+        hint: "Raise maxRecords (capped at 50000) or stop the daemon and move mem:graph:*.bin aside.",
+        tookMs: Date.now() - started,
+      };
+    }
+
     const counts: Record<string, number> = {
+      [KV.graphNodes]: nodes.length,
+      [KV.graphEdges]: edges.length,
       [KV.graphSnapshot]: 1,
     };
+
+    for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
+      const batch = nodes.slice(i, i + GRAPH_RESET_BATCH);
+      await Promise.all(batch.map((node) => kv.delete(KV.graphNodes, node.id)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    for (let i = 0; i < edges.length; i += GRAPH_RESET_BATCH) {
+      const batch = edges.slice(i, i + GRAPH_RESET_BATCH);
+      await Promise.all(batch.map((edge) => kv.delete(KV.graphEdges, edge.id)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
     const tookMs = Date.now() - started;
-    logger.info("Graph state reset", { counts, tookMs });
-    return { success: true, cleared: counts, tookMs };
+    logger.info("Graph state reset (rows deleted)", { counts, tookMs });
+    await recordAudit(kv, "reset", "mem::graph-reset", [
+      KV.graphNodes,
+      KV.graphEdges,
+      KV.graphSnapshot,
+    ], { counts, tookMs }).catch(() => undefined);
+    return {
+      success: true,
+      snapshotOnly: false,
+      cleared: counts,
+      nodesRetained: 0,
+      edgesRetained: 0,
+      sideIndexNote:
+        "Side-index rows (name-index, degree, edge-key) are overwritten on the next extract; they cannot be enumerated for deletion because state::list returns values, not keys.",
+      tookMs,
+    };
   });
 }

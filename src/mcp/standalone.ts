@@ -3,7 +3,7 @@
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
 import { getAllTools } from "./tools-registry.js";
-import { getStandalonePersistPath } from "../config.js";
+import { getStandalonePersistPath, hydrateProcessEnvFromFile } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
 import {
@@ -35,6 +35,7 @@ const SERVER_INFO = {
   version: VERSION,
 };
 
+hydrateProcessEnvFromFile();
 const kv = new InMemoryKV(getStandalonePersistPath());
 let modeAnnounced = false;
 
@@ -107,12 +108,27 @@ interface Validated {
   files?: string[];
   project?: string;
   agentId?: string;
+  sessionId?: string;
   query?: string;
   limit?: number;
   format?: string;
   tokenBudget?: number;
   memoryIds?: string[];
   reason?: string;
+  expandIds?: string[];
+}
+
+function parseExpandIds(raw: unknown): string[] | undefined {
+  const list: string[] = Array.isArray(raw)
+    ? raw.filter((x): x is string => typeof x === "string")
+    : typeof raw === "string"
+      ? raw.split(",")
+      : [];
+  const cleaned = list
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function validate(toolName: string, args: Record<string, unknown>): Validated {
@@ -160,6 +176,13 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
         const n = Number(budget);
         if (Number.isFinite(n) && n > 0) v.tokenBudget = Math.floor(n);
       }
+      const project = args["project"];
+      if (typeof project === "string" && project.trim()) {
+        v.project = project.trim();
+      }
+      // #889: expandIds was never extracted, so compact-to-expanded recall
+      // silently returned the compact page through the stdio shim.
+      v.expandIds = parseExpandIds(args["expandIds"]);
       return v;
     }
     case "memory_sessions": {
@@ -171,6 +194,9 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       if (ids.length === 0) throw new Error("memoryIds is required");
       v.memoryIds = ids;
       v.reason = (args["reason"] as string) || "plugin skill request";
+      if (typeof args["sessionId"] === "string" && args["sessionId"].trim()) {
+        v.sessionId = args["sessionId"].trim();
+      }
       return v;
     }
     case "memory_export":
@@ -190,6 +216,13 @@ async function handleProxy(
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
   switch (v.tool) {
     case "memory_save": {
+      const body: Record<string, unknown> = {
+        content: v.content,
+        type: v.type,
+        concepts: v.concepts,
+        files: v.files,
+      };
+      if (v.project != null) body["project"] = v.project;
       const result = await handle.call("/agentmemory/remember", {
         method: "POST",
         body: JSON.stringify({
@@ -210,6 +243,7 @@ async function handleProxy(
         format: v.format ?? "full",
       };
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project != null) body["project"] = v.project;
       const result = await handle.call("/agentmemory/search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -220,6 +254,8 @@ async function handleProxy(
       const body: Record<string, unknown> = { query: v.query, limit: v.limit };
       if (v.format != null) body["format"] = v.format;
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project != null) body["project"] = v.project;
+      if (v.expandIds != null) body["expandIds"] = v.expandIds;
       const result = await handle.call("/agentmemory/smart-search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -236,7 +272,11 @@ async function handleProxy(
     case "memory_governance_delete": {
       const result = await handle.call("/agentmemory/governance/memories", {
         method: "DELETE",
-        body: JSON.stringify({ memoryIds: v.memoryIds, reason: v.reason }),
+        body: JSON.stringify({
+          memoryIds: v.memoryIds,
+          reason: v.reason,
+          ...(v.sessionId !== undefined && { sessionId: v.sessionId }),
+        }),
       });
       return textResponse(result);
     }
@@ -271,6 +311,7 @@ async function handleLocal(
         content: v.content,
         concepts: v.concepts,
         files: v.files,
+        project: v.project,
         createdAt: isoNow,
         updatedAt: isoNow,
         strength: 7,
@@ -289,6 +330,13 @@ async function handleLocal(
       const all =
         await kvInstance.list<Record<string, unknown>>("mem:memories");
       const results = all
+        // #926/#787 follow-up: the local KV fallback used to ignore
+        // project entirely, so a scoped search during a server outage
+        // could return memories from every project. Filter strictly —
+        // unlike the server's session-resolution fallback, this KV has
+        // no session store to fall back on, so an unscoped record is
+        // excluded rather than passed through when a filter is active.
+        .filter((m) => v.project == null || m["project"] === v.project)
         .filter((m) => {
           const text = [
             typeof m["title"] === "string" ? m["title"] : "",
@@ -303,6 +351,30 @@ async function handleLocal(
           return query.split(/\s+/).every((word) => text.includes(word));
         })
         .slice(0, limit);
+      if (v.expandIds && v.expandIds.length > 0) {
+        // Local fallback has no observation store: expandIds can only name
+        // durable memories here, so merge those rows in front of the page.
+        const seen = new Set(
+          results.map((r) => (typeof r["id"] === "string" ? r["id"] : "")),
+        );
+        const expanded: Array<Record<string, unknown>> = [];
+        for (const id of v.expandIds) {
+          if (seen.has(id)) continue;
+          const mem = await kvInstance
+            .get<Record<string, unknown>>("mem:memories", id)
+            .catch(() => null);
+          if (mem && (v.project == null || mem["project"] === v.project)) {
+            seen.add(id);
+            expanded.push(mem);
+          }
+        }
+        if (expanded.length > 0) {
+          return textResponse(
+            { mode: "expanded", results: [...expanded, ...results] },
+            true,
+          );
+        }
+      }
       return textResponse({ mode: "compact", results }, true);
     }
 

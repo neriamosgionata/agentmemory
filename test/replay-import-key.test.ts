@@ -101,6 +101,20 @@ describe("import-jsonl re-key on parsed.sessionId (#775)", () => {
     writeFileSync(join(dir, `${sessionId}.jsonl`), lines.join("\n") + "\n");
   }
 
+  it("fails loudly when the directory holds no .jsonl transcripts (#924)", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk(kv);
+    registerReplayFunctions(sdk, kv as never);
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: tmpRoot,
+    })) as { success: boolean; error?: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No \.jsonl transcripts/);
+    expect(result.error).toMatch(/cleanupPeriodDays/);
+  });
+
   it("re-imports a session whose stored row is missing the `id` field without aborting the batch", async () => {
     writeFixture("sess-no-id");
     const kv = mockKV();

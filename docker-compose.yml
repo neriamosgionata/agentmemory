@@ -18,16 +18,16 @@ services:
     restart: "no"
 
   iii-engine:
-    # Pinned to v0.11.2 — the last engine that runs agentmemory's current
-    # direct-registration worker cleanly. v0.11.6 introduces a new sandbox-everything-
-    # via-`iii worker add` model that agentmemory hasn't been refactored
-    # for yet; the architectural mismatch surfaces as EPIPE reconnect
-    # loops and empty search after save. Bump only after agentmemory is
-    # refactored to register as a sandboxed worker.
+    # Legacy Docker path: 0.23+ rejects the list-shaped config this compose
+    # file feeds, so the image stays on the last legacy-compatible engine.
+    # Pinned to v0.22.1 — the newest engine that runs agentmemory's current
+    # direct-registration worker cleanly. 0.23.0 switches to the `iii
+    # compose` worker-compose.yaml lifecycle that agentmemory has not been
+    # refactored onto yet. Bump only after that migration.
     #
     # Override per-shell or via .env file:
-    #   AGENTMEMORY_III_VERSION=0.11.7 docker compose up
-    image: iiidev/iii:${AGENTMEMORY_III_VERSION:-0.11.2}
+    #   AGENTMEMORY_III_VERSION=0.22.1 docker compose up
+    image: iiidev/iii:${AGENTMEMORY_III_VERSION:-0.22.1}
     user: "${AGENTMEMORY_DOCKER_UID:-65532}:${AGENTMEMORY_DOCKER_GID:-65532}"
     depends_on:
       iii-init:

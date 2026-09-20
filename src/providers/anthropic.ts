@@ -1,5 +1,19 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { MemoryProvider } from '../types.js'
+import { getEnvVar } from '../config.js'
+
+// The SDK default (60s) hard-failed complex summarization prompts against
+// alternative base URLs (DeepSeek et al) with no retry. ANTHROPIC_TIMEOUT_MS
+// wins, then the shared AGENTMEMORY_LLM_TIMEOUT_MS. #655
+export function resolveAnthropicTimeout(): number | undefined {
+  for (const key of ['ANTHROPIC_TIMEOUT_MS', 'AGENTMEMORY_LLM_TIMEOUT_MS']) {
+    const raw = getEnvVar(key)
+    if (!raw) continue
+    const n = Number(raw.trim())
+    if (Number.isFinite(n) && n > 0) return Math.floor(n)
+  }
+  return undefined
+}
 
 export class AnthropicProvider implements MemoryProvider {
   name = 'anthropic'
@@ -8,7 +22,12 @@ export class AnthropicProvider implements MemoryProvider {
   private maxTokens: number
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
-    this.client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) })
+    const timeout = resolveAnthropicTimeout()
+    this.client = new Anthropic({
+      apiKey,
+      ...(baseURL ? { baseURL } : {}),
+      ...(timeout !== undefined ? { timeout } : {}),
+    })
     this.model = model
     this.maxTokens = maxTokens
   }

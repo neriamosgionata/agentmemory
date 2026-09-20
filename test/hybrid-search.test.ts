@@ -66,6 +66,30 @@ describe("HybridSearch", () => {
     expect(results[0].bm25Score).toBeGreaterThan(0);
   });
 
+  it("resolves the owning session for graph-only hits (#925)", async () => {
+    const obs = makeObs({
+      id: "obs_graph",
+      sessionId: "ses_g",
+      title: "Graph only",
+      narrative: "reached through graph traversal",
+    });
+    await kv.set("mem:obs:ses_g", "obs_graph", obs);
+    await kv.set("mem:sessions", "ses_g", { id: "ses_g" });
+    await kv.set("mem:graph:nodes", "gn_1", {
+      id: "gn_1",
+      type: "entity",
+      name: "AuthService",
+      properties: {},
+      sourceObservationIds: ["obs_graph"],
+      createdAt: new Date().toISOString(),
+    });
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("AuthService");
+
+    expect(results.map((r) => r.observation.id)).toContain("obs_graph");
+  });
+
   it("returns empty results for no-match query", async () => {
     const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
     bm25.add(obs);

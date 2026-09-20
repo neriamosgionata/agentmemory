@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type { EmbeddingProvider } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -74,15 +74,22 @@ export function registerVisionSearchFunctions(
       queryText?: string;
       queryImageRef?: string;
       queryImageBase64?: string;
+      /** Max results. `limit` is accepted as an alias: every other search
+       *  function uses `limit`, so callers pass it here too (#1254). */
       topK?: number;
+      limit?: number;
       sessionId?: string;
     }) => {
       if (!imageProvider?.embedImage) {
         return { success: false, error: "image embeddings disabled (set AGENTMEMORY_IMAGE_EMBEDDINGS=true)" };
       }
-      const requestedTopK =
+      const requested =
         typeof data?.topK === "number" && Number.isFinite(data.topK)
-          ? Math.trunc(data.topK)
+          ? data.topK
+          : data?.limit;
+      const requestedTopK =
+        typeof requested === "number" && Number.isFinite(requested)
+          ? Math.trunc(requested)
           : 10;
       const topK = Math.min(50, Math.max(1, requestedTopK));
 

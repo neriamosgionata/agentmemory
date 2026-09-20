@@ -8,6 +8,7 @@ import type {
   QueryExpansion,
 } from "../types.js";
 import { memoryToObservation } from "./memory-utils.js";
+import { findObservationSession } from "./observation-lookup.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
 import {
@@ -95,18 +96,29 @@ export class HybridSearch {
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = this.vector.search(queryEmbedding, limit * 2);
+        // Prefer the yielding scan on large indexes (#195); fall back to the
+        // synchronous one for stubs/tests that only implement search().
+        vectorResults =
+          typeof this.vector.searchAsync === "function"
+            ? await this.vector.searchAsync(queryEmbedding, limit * 2)
+            : this.vector.search(queryEmbedding, limit * 2);
       } catch {
         // fall through to BM25-only
       }
     }
+
+    // AGENTMEMORY_GRAPH_WEIGHT=0 used to zero only the graph term in the
+    // score while both traversals still ran at full cost. Treat zero as
+    // "skip the stream" so the knob is a real kill switch when graph
+    // retrieval has to come out of the hot path.
+    const graphEnabled = this.graphWeight > 0;
 
     const entities =
       entityHints && entityHints.length > 0
         ? entityHints
         : extractEntitiesFromQuery(query);
     let graphResults: GraphRetrievalResult[] = [];
-    if (entities.length > 0) {
+    if (graphEnabled && entities.length > 0) {
       try {
         graphResults = await this.graphRetrieval.searchByEntities(
           entities,
@@ -119,7 +131,7 @@ export class HybridSearch {
     }
 
     const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
-    if (topVectorObs.length > 0) {
+    if (graphEnabled && topVectorObs.length > 0) {
       try {
         const expansionResults =
           await this.graphRetrieval.expandFromChunks(topVectorObs, 1, 5);
@@ -127,6 +139,19 @@ export class HybridSearch {
       } catch {
         // expansion is best-effort
       }
+    }
+
+    // Graph traversal results carry a bare observation id. Without resolving
+    // the owning session, the enrichment pass below queries
+    // KV.observations("") and silently drops every graph-only hit. #925
+    const unresolvedGraph = graphResults.filter((r) => !r.sessionId);
+    if (unresolvedGraph.length > 0) {
+      await Promise.all(
+        unresolvedGraph.map(async (r) => {
+          const sessionId = await findObservationSession(this.kv, r.obsId);
+          if (sessionId) r.sessionId = sessionId;
+        }),
+      );
     }
 
     const scores = new Map<

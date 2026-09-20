@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { extractGraphHeuristics } from "../src/functions/graph.js";
+import {
+  canonicalizeFilePath,
+  extractGraphHeuristics,
+} from "../src/functions/graph.js";
 import type { CompressedObservation } from "../src/types.js";
 
 function obs(
@@ -31,6 +34,43 @@ describe("extractGraphHeuristics", () => {
     expect(byType.has("file:src/auth.ts")).toBe(true);
     expect(byType.has("concept:authentication")).toBe(true);
     expect(byType.has("concept:jwt")).toBe(true);
+  });
+
+  it("canonicalizes file paths against the session root (#1221)", () => {
+    expect(canonicalizeFilePath("/repo/src/auth.ts", "/repo")).toBe(
+      "src/auth.ts",
+    );
+    expect(canonicalizeFilePath("/repo/src/auth.ts", "/repo/")).toBe(
+      "src/auth.ts",
+    );
+    expect(canonicalizeFilePath("./src/auth.ts", "/repo")).toBe("src/auth.ts");
+    // Outside the root: keep the absolute form so unrelated files cannot
+    // collide on basename.
+    expect(canonicalizeFilePath("/elsewhere/auth.ts", "/repo")).toBe(
+      "/elsewhere/auth.ts",
+    );
+    expect(canonicalizeFilePath("src/auth.ts", "/repo")).toBe("src/auth.ts");
+    expect(canonicalizeFilePath("C:\\repo\\src\\auth.ts", "C:\\repo")).toBe(
+      "src\\auth.ts",
+    );
+  });
+
+  it("uses session roots so worktrees produce the same file node", () => {
+    const roots = new Map([
+      ["ses_a", "/repo"],
+      ["ses_b", "/repo-worktree"],
+    ]);
+    const { nodes } = extractGraphHeuristics(
+      [
+        { ...obs("o1", ["/repo/src/auth.ts"], []), sessionId: "ses_a" },
+        { ...obs("o2", ["/repo-worktree/src/auth.ts"], []), sessionId: "ses_b" },
+      ],
+      roots,
+    );
+    const fileNodes = nodes.filter((n) => n.type === "file");
+    expect(fileNodes).toHaveLength(1);
+    expect(fileNodes[0].name).toBe("src/auth.ts");
+    expect(fileNodes[0].sourceObservationIds.sort()).toEqual(["o1", "o2"]);
   });
 
   it("links concepts to files and consecutive siblings as related_to", () => {
@@ -88,17 +128,18 @@ describe("extractGraphHeuristics", () => {
   });
 });
 
-// The structural pass must run keyless: session end always fires
-// mem::graph-extract, and the function itself gates only the LLM pass
-// on the flag plus a real provider.
-describe("keyless graph extraction wiring", () => {
-  it("event::session::stopped fires graph-extract without the flag gate", () => {
+// #1238: GRAPH_EXTRACTION_ENABLED is the master switch for graph writes.
+// The session-stop fan-out must be gated on it; the heuristic pass inside
+// mem::graph-extract still runs for explicit calls.
+describe("graph extraction wiring", () => {
+  it("event::session::stopped gates graph-extract on the flag (#1238)", () => {
     const events = readFileSync("src/triggers/events.ts", "utf-8");
     const stopped = events.slice(events.indexOf("event::session::stopped"));
     const gate = stopped.indexOf("isGraphExtractionEnabled()");
     const fire = stopped.indexOf('fireVoid("mem::graph-extract"');
     expect(fire).toBeGreaterThan(-1);
-    expect(gate === -1 || gate > fire).toBe(true);
+    expect(gate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(fire);
   });
 
   it("graph functions register unconditionally so the trigger always resolves", () => {
@@ -111,7 +152,9 @@ describe("keyless graph extraction wiring", () => {
 
   it("mem::graph-extract gates the LLM pass, not the heuristic pass", () => {
     const graph = readFileSync("src/functions/graph.ts", "utf-8");
-    expect(graph).toMatch(/extractGraphHeuristics\(data\.observations\)/);
+    expect(graph).toMatch(
+      /extractGraphHeuristics\(\s*data\.observations,\s*rootBySession,\s*\)/,
+    );
     expect(graph).toMatch(
       /isGraphExtractionEnabled\(\) && !provider\.name\.includes\("noop"\)/,
     );

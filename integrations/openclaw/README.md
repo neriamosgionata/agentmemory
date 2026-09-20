@@ -126,8 +126,10 @@ Then enable it in `~/.openclaw/openclaw.json`:
 What the plugin does:
 
 - claims the `plugins.slots.memory = "agentmemory"` slot via `api.registerMemoryCapability({ promptBuilder })` so OpenClaw recognises it as the active memory plugin
-- recalls relevant long-term memory before the agent starts (via the `before_agent_start` hook)
+- recalls relevant long-term memory before each prompt (via the `before_prompt_build` typed hook)
 - captures completed conversation turns after the agent finishes (via the `agent_end` hook)
+
+> OpenClaw requires `plugins.entries.agentmemory.hooks.allowConversationAccess: true` for `agent_end` to receive the conversation.
 
 OpenClaw blocks conversation-reading hooks from non-bundled plugins by default. Allow it once in `openclaw.json` so turn capture works:
 

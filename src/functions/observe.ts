@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type ISdk } from "../iii.js";
 import type { RawObservation, HookPayload, Origin } from "../types.js";
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
@@ -9,10 +9,22 @@ import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import {
+  getSearchIndex,
+  scheduleIndexSave,
+  vectorIndexAddGuarded,
+  vectorIndexRemove,
+} from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import {
+  reconcileObservationDeletions,
+  type ObservationDeletion,
+} from "./observation-lifecycle.js";
+
+/** Importance assumed for an observation that has not been compressed yet. */
+const DEFAULT_EVICTION_IMPORTANCE = 3;
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -145,27 +157,72 @@ export function registerObserveFunction(
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          const existing = await kv.list(KV.observations(payload.sessionId));
+          const existing = await kv.list<RawObservation & { importance?: number }>(
+            KV.observations(payload.sessionId),
+          );
           if (existing.length >= maxObservationsPerSession) {
-            return {
-              success: false,
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
+            // Refusing the write silently drops the NEWEST observations of the
+            // longest sessions — exactly the part worth keeping. Evict the
+            // lowest-value rows instead so capture keeps working inside the
+            // same bound. Least valuable first: lowest importance, then oldest.
+            const victims = [...existing]
+              .sort((a, b) => {
+                const ia = a.importance ?? DEFAULT_EVICTION_IMPORTANCE;
+                const ib = b.importance ?? DEFAULT_EVICTION_IMPORTANCE;
+                if (ia !== ib) return ia - ib;
+                return (
+                  new Date(a.timestamp ?? 0).getTime() -
+                  new Date(b.timestamp ?? 0).getTime()
+                );
+              })
+              .slice(0, existing.length - maxObservationsPerSession + 1);
+
+            let evicted = 0;
+            const deletedObs: ObservationDeletion[] = [];
+            for (const victim of victims) {
+              try {
+                await kv.delete(KV.observations(payload.sessionId), victim.id);
+                evicted++;
+                deletedObs.push({
+                  sessionId: payload.sessionId,
+                  obsId: victim.id,
+                });
+                getSearchIndex().remove(victim.id);
+                vectorIndexRemove(victim.id);
+              } catch {
+                // A failed delete just leaves the cap tight for this write;
+                // the next observation retries the eviction.
+              }
+            }
+            await reconcileObservationDeletions(kv, deletedObs);
+
+            logger.warn(
+              "Session observation cap reached — evicted lowest-value observations",
+              {
+                sessionId: payload.sessionId,
+                cap: maxObservationsPerSession,
+                evicted,
+              },
+            );
           }
         }
 
-        // Existing session is the source of truth for agentId (even
-        // undefined). Env AGENT_ID only fires when no session row
-        // exists yet — otherwise an unscoped session would get
-        // retroactively scoped by a later AGENT_ID export.
         const existingSession = await kv.get<{
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
         }>(KV.sessions, payload.sessionId);
-        const inheritedAgentId = existingSession
-          ? existingSession.agentId
-          : getAgentId();
+        // Explicit per-call identity wins; otherwise an existing session's
+        // agentId, then the worker env. Env AGENT_ID only fires when no
+        // session row exists yet — otherwise an unscoped session would get
+        // retroactively scoped by a later AGENT_ID export.
+        const explicitAgentId =
+          typeof payload.agentId === "string" && payload.agentId.trim().length > 0
+            ? payload.agentId.trim()
+            : undefined;
+        const inheritedAgentId =
+          explicitAgentId ??
+          (existingSession ? existingSession.agentId : getAgentId());
         if (inheritedAgentId) {
           raw.agentId = inheritedAgentId;
         }
@@ -327,6 +384,7 @@ export function registerObserveFunction(
             synthetic.title + " " + (synthetic.narrative || ""),
             { kind: "synthetic", logId: synthetic.id },
           );
+          scheduleIndexSave();
           await sdk.trigger({
             function_id: "stream::set",
             payload: {

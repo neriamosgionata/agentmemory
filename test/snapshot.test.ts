@@ -32,6 +32,7 @@ vi.mock("node:fs", () => ({
     .mockReturnValue('{"version":"0.4.0","sessions":[],"memories":[]}'),
 }));
 
+import { readFileSync } from "node:fs";
 import { registerSnapshotFunction } from "../src/functions/snapshot.js";
 import type { Session, Memory, SnapshotMeta } from "../src/types.js";
 
@@ -162,6 +163,42 @@ describe("Snapshot Functions", () => {
 
     const audits = await kv.list("mem:audit");
     expect(audits.length).toBe(1);
+  });
+
+  it("restore replaces scopes and carries durable stores (#1190)", async () => {
+    await kv.set("mem:memories", "mem_extra", {
+      id: "mem_extra",
+      title: "written after snapshot",
+    });
+    await kv.set("mem:lessons", "les_extra", {
+      id: "les_extra",
+      content: "written after snapshot",
+    });
+
+    const snapshotState = {
+      version: "0.9.29",
+      sessions: [],
+      memories: [],
+      graphNodes: [],
+      observations: {},
+      accessLogs: [],
+      lessons: [{ id: "les_snap", content: "from-snapshot" }],
+    };
+    vi.mocked(readFileSync).mockReturnValueOnce(JSON.stringify(snapshotState));
+
+    const result = (await sdk.trigger("mem::snapshot-restore", {
+      commitHash: "abc1234",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    // Replace, not merge: rows written after the snapshot are gone.
+    expect(await kv.get("mem:memories", "mem_extra")).toBeNull();
+    expect(await kv.get("mem:sessions", "ses_1")).toBeNull();
+    // Durable stores are part of the snapshot and are restored.
+    expect(await kv.get("mem:lessons", "les_extra")).toBeNull();
+    expect(await kv.get("mem:lessons", "les_snap")).toMatchObject({
+      content: "from-snapshot",
+    });
   });
 });
 

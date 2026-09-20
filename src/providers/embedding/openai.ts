@@ -8,7 +8,8 @@ import {
   detectAzure,
   normalizeBaseUrl,
 } from "../_openai-shared.js";
-import { resolveDimensions } from "./_dimensions.js";
+import { resolveDimensionsDetailed } from "./_dimensions.js";
+import { logger } from "../../logger.js";
 
 const DEFAULT_MODEL = "text-embedding-3-small";
 
@@ -50,7 +51,9 @@ const DEFAULT_MODEL = "text-embedding-3-small";
  */
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly name = "openai";
-  readonly dimensions: number;
+  /** Mutable while `dimensionsInferred` is true (self-corrects on first embed). */
+  dimensions: number;
+  dimensionsInferred: boolean;
   private apiKey: string;
   private baseUrl: string;
   private model: string;
@@ -79,11 +82,13 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       getEnvVar("OPENAI_EMBEDDING_BASE_URL") || getEnvVar("OPENAI_BASE_URL"),
     );
     this.model = getEnvVar("OPENAI_EMBEDDING_MODEL") || DEFAULT_MODEL;
-    this.dimensions = resolveDimensions(
+    const resolution = resolveDimensionsDetailed(
       this.model,
       getEnvVar("OPENAI_EMBEDDING_DIMENSIONS"),
       "OPENAI_EMBEDDING_DIMENSIONS",
     );
+    this.dimensions = resolution.dimensions;
+    this.dimensionsInferred = resolution.inferred;
     this.isAzure = detectAzure(this.baseUrl);
     this.azureApiVersion =
       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
@@ -118,6 +123,34 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       data: Array<{ embedding: number[] }>;
     };
 
-    return data.data.map((d) => new Float32Array(d.embedding));
+    const vectors = data.data.map((d) => new Float32Array(d.embedding));
+    this.adoptDetectedDimensions(vectors);
+    return vectors;
+  }
+
+  /** Learn the real width from the first response for untabled models (#1373). */
+  private adoptDetectedDimensions(vectors: Float32Array[]): void {
+    const detected = vectors[0]?.length;
+    if (
+      this.dimensionsInferred &&
+      typeof detected === "number" &&
+      detected > 0 &&
+      detected !== this.dimensions
+    ) {
+      logger.info("Embedding dimensions detected", {
+        provider: this.name,
+        model: this.model,
+        previous: this.dimensions,
+        detected,
+      });
+      this.dimensions = detected;
+      this.dimensionsInferred = false;
+    }
+  }
+
+  /** One throwaway embed so boot validation sees the real width. */
+  async probeDimensions(): Promise<number> {
+    await this.embed("dimension probe");
+    return this.dimensions;
   }
 }

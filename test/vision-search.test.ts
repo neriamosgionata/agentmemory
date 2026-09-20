@@ -146,6 +146,20 @@ describe("vision-search", () => {
     expect(res.results.length).toBe(1);
   });
 
+  it("accepts limit as an alias for topK (#1254)", async () => {
+    for (const r of [LOGIN_REF, DASH_REF, OTHER_REF]) await seedRef(r);
+    await visionEmbed({ imageRef: LOGIN_REF });
+    await visionEmbed({ imageRef: DASH_REF });
+    await visionEmbed({ imageRef: OTHER_REF });
+
+    const res = (await visionSearch({ queryText: "the login form", limit: 2 })) as {
+      success: boolean;
+      results: unknown[];
+    };
+    expect(res.success).toBe(true);
+    expect(res.results.length).toBe(2);
+  });
+
   it("clamps NaN/fractional topK to a valid integer", async () => {
     await seedRef(LOGIN_REF);
     await visionEmbed({ imageRef: LOGIN_REF });

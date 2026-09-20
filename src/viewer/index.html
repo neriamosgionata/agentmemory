@@ -1262,6 +1262,61 @@
       var name = sessionDisplayName(s);
       return id ? name + ' (' + id + ')' : name + ' (missing id)';
     }
+    // GET /agentmemory/sessions merges each session's SessionSummary object
+    // into `summary` (api::sessions), so the field is either a plain string
+    // (legacy title slice from session/start) or an object with title,
+    // narrative, and list fields. Interpolating the object form directly
+    // rendered "[object Object]" (#1229); serialize both shapes to text.
+    function sessionSummaryText(s) {
+      try {
+        var sum = s && s.summary;
+        if (!sum) return '';
+        if (typeof sum === 'string') {
+          // Trim so a whitespace-only legacy summary yields '' and the
+          // render paths' truthiness guards fall through cleanly.
+          return hasVisibleText(sum) ? sum.trim() : '';
+        }
+        if (typeof sum !== 'object') return '';
+        var parts = [];
+        var title = hasVisibleText(sum.title) ? sum.title.trim() : '';
+        var narrative = hasVisibleText(sum.narrative) ? sum.narrative.trim() : '';
+        // Push the trimmed forms so object summaries render like the
+        // string path (which returns trimmed text) instead of leaking
+        // hand-edited padding into the preview.
+        if (title) parts.push(title);
+        // Trim before comparing so a whitespace-variant duplicate does not
+        // render the same text twice.
+        if (narrative && narrative !== title) parts.push(narrative);
+        var keyDecisions = summaryList(sum.keyDecisions);
+        if (keyDecisions) parts.push('Key decisions: ' + keyDecisions);
+        var files = summaryList(sum.filesModified);
+        if (files) parts.push('Files: ' + files);
+        var concepts = summaryList(sum.concepts);
+        if (concepts) parts.push('Concepts: ' + concepts);
+        return parts.join(' — ');
+      } catch (_) {
+        // A hostile property getter must not take down the render pass.
+        return '';
+      }
+    }
+    // Summary list fields are typed string[] but arrive unvalidated from
+    // stored summaries (the import path accepts hand-edited dumps), so a
+    // non-string entry stringified into "[object Object]" and re-created
+    // the defect sessionSummaryText exists to prevent. Keep visible scalar
+    // strings only (trim alone does not catch zero-width characters);
+    // skip everything else.
+    var INVISIBLE_CHARS = /[\s\u200b-\u200f\u2060\uFEFF]/g;
+    function hasVisibleText(value) {
+      return typeof value === 'string' && !!value.replace(INVISIBLE_CHARS, '');
+    }
+    function summaryList(values) {
+      if (typeof values === 'string') values = [values];
+      if (!Array.isArray(values)) return '';
+      return values
+        .filter(hasVisibleText)
+        .map(function (value) { return value.trim(); })
+        .join(', ');
+    }
     function debounce(fn, ms) {
       var t;
       return function() {
@@ -1346,6 +1401,13 @@
         var fetchOpts = Object.assign({}, opts || {}, { headers: headers });
         var readErrorBody = fetchOpts.readErrorBody;
         delete fetchOpts.readErrorBody;
+        // #1326: the backend's KV budget is 10s, so give each request a
+        // hard 20s ceiling. Without it a stalled endpoint holds one of the
+        // browser's six HTTP/1.1 connections forever and every parallel
+        // dashboard fetch sits on "Loading…".
+        if (!fetchOpts.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+          fetchOpts.signal = AbortSignal.timeout(20000);
+        }
         var res = await fetch(url, fetchOpts);
         if (!res.ok) {
           if (res.status === 401) showViewerAuthPrompt();
@@ -1449,7 +1511,7 @@
       }
       tabFetchedAt[tab] = now;
       switch(tab) {
-        case 'dashboard': await loadDashboard(); break;
+        case 'dashboard': requestDashboardReload(); break;
         case 'graph': await loadGraph(); break;
         case 'memories': await loadMemories(); break;
         case 'timeline': await loadTimeline(); break;
@@ -1477,22 +1539,37 @@
           apiGet('memories?latest=true&limit=500'),
           apiGet('graph/stats'),
           apiGet('audit?limit=5'),
-          apiGet('semantic'),
-          apiGet('procedural'),
-          apiGet('relations'),
-          apiGet('lessons'),
-          apiGet('crystals')
+          apiGet('semantic?limit=50'),
+          apiGet('procedural?limit=50'),
+          apiGet('relations?limit=50'),
+          apiGet('lessons?limit=50'),
+          apiGet('crystals?limit=50')
         ]);
-        state.dashboard.health = results[0];
-        state.dashboard.sessions = (results[1] && results[1].sessions) || [];
-        state.dashboard.memories = (results[2] && results[2].memories) || [];
-        state.dashboard.graphStats = results[3];
-        state.dashboard.recentAudit = (results[4] && results[4].entries) || [];
-        state.dashboard.semantic = (results[5] && results[5].facts) || (results[5] && results[5].semantic) || [];
-        state.dashboard.procedural = (results[6] && results[6].procedures) || (results[6] && results[6].procedural) || [];
-        state.dashboard.lessons = (results[8] && results[8].lessons) || [];
-        state.dashboard.crystals = (results[9] && results[9].crystals) || [];
-        state.dashboard.relations = (results[7] && results[7].relations) || [];
+        // A failed fetch resolves to null (api() swallows errors), never
+        // throws. Apply only the requests that succeeded so a failed batch
+        // keeps the last-good data instead of wiping the panel to empty —
+        // an empty sessions array rendered the first-run hero while
+        // sessions existed (the stats <-> new install flip loop).
+        var sessionsOk = !!(results[1] && Array.isArray(results[1].sessions));
+        state.dashboard.sessionsFailed = !sessionsOk;
+        if (results[0]) state.dashboard.health = results[0];
+        if (sessionsOk) {
+          state.dashboard.sessions = results[1].sessions;
+          state.dashboard.lastGoodAt = Date.now();
+        }
+        if (results[2]) {
+          state.dashboard.memories = results[2].memories || [];
+          state.dashboard.memoriesTotal = typeof results[2].total === 'number'
+            ? results[2].total
+            : state.dashboard.memories.length;
+        }
+        if (results[3]) state.dashboard.graphStats = results[3];
+        if (results[4]) state.dashboard.recentAudit = results[4].entries || [];
+        if (results[5]) state.dashboard.semantic = results[5].facts || results[5].semantic || [];
+        if (results[6]) state.dashboard.procedural = results[6].procedures || results[6].procedural || [];
+        if (results[7]) state.dashboard.relations = results[7].relations || [];
+        if (results[8]) state.dashboard.lessons = results[8].lessons || [];
+        if (results[9]) state.dashboard.crystals = results[9].crystals || [];
         state.dashboard.loaded = true;
         renderDashboard();
       } catch (err) {
@@ -1505,6 +1582,10 @@
         // Surface the error in the panel + log full detail to console.
         var msg = (err && err.message) ? err.message : String(err);
         console.error('[viewer] loadDashboard failed:', err);
+        // Only replace the panel when nothing good was ever rendered; if
+        // last-good data is on screen, keep it visible (the failed batch
+        // already left it untouched) instead of blanking to an error wall.
+        if (state.dashboard.loaded) return;
         el.innerHTML =
           '<div class="loading" style="color:var(--accent);">' +
           'Dashboard failed to load: ' + msg +
@@ -1532,8 +1613,24 @@
       var workers = snap.workers || [];
 
       var html = '';
-      // First-run hero: empty dashboard = guided next step
-      if (d.sessions.length === 0) {
+      // Stale-data notice: the last refresh failed (api() resolves null on
+      // failure), so the panel is showing data from an earlier fetch. This
+      // must never look like a brand-new install — that is what the hero
+      // below is for, and it is gated on a *successful* empty sessions
+      // response.
+      if (d.sessionsFailed) {
+        var lastGood = d.lastGoodAt ? new Date(d.lastGoodAt).toLocaleTimeString() : null;
+        html += '<div class="card" style="margin-bottom:14px;padding:14px 18px;background:var(--bg-subtle);border-left:3px solid var(--red);">' +
+          '<div style="font-size:12px;color:var(--ink);line-height:1.5;">' +
+          (lastGood
+            ? '<strong>Dashboard refresh failed</strong> — showing data from ' + esc(lastGood) + '. Retrying automatically&hellip;'
+            : '<strong>Dashboard refresh failed</strong> — check that the agentmemory server is reachable. Retrying automatically&hellip;') +
+          '</div></div>';
+      }
+      // First-run hero: empty dashboard = guided next step. Only render it
+      // when the sessions fetch *succeeded* with zero sessions — a failed
+      // fetch must not present as a brand-new install.
+      if (!d.sessionsFailed && d.sessions.length === 0) {
         html += '<div class="card" style="margin-bottom:14px;padding:24px 28px;background:var(--bg-subtle);border-left:3px solid var(--accent);">' +
           '<div style="font-family:var(--font-ui);font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">First run &rarr; magical moment in 10 seconds</div>' +
           '<div style="font-family:var(--font-display,Lora,Georgia,serif);font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Seed sample data + prove semantic recall works</div>' +
@@ -1544,7 +1641,7 @@
       }
       html += '<div class="stats-grid">';
       html += '<div class="stat-card" data-action="goto-tab" data-tab="sessions" role="link" tabindex="0"><div class="label">Sessions</div><div class="value">' + d.sessions.length + '</div><div class="sub">' + activeSessions + ' active</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="memories" role="link" tabindex="0"><div class="label">Memories</div><div class="value">' + d.memories.length + '</div><div class="sub">latest versions</div></div>';
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="memories" role="link" tabindex="0"><div class="label">Memories</div><div class="value">' + d.memoriesTotal + '</div><div class="sub">latest versions</div></div>';
       var lessonCount = (d.lessons || []).length;
       var crystalCount = (d.crystals || []).length;
       html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
@@ -1780,9 +1877,24 @@
     }
 
     var dashboardTimer = null;
+    // Dashboard reloads are coalesced: WS observation events, the 30s
+    // timer, the polling fallback and tab re-entry can all fire in bursts,
+    // and each full reload fans out ~10 parallel fetches. Running them
+    // concurrently exhausted the browser's per-origin connection budget
+    // (net::ERR_INSUFFICIENT_RESOURCES); the guard serializes reloads and
+    // collapses bursts into a single trailing reload.
+    var dashBusy = false, dashQueued = false;
+    function requestDashboardReload() {
+      if (dashBusy) { dashQueued = true; return; }
+      dashBusy = true;
+      var settle = function() {
+        dashBusy = false;
+        if (dashQueued) { dashQueued = false; requestDashboardReload(); }
+      };
+      loadDashboard().then(settle, settle);
+    }
     function refreshDashboard() {
-      state.dashboard.loaded = false;
-      loadDashboard();
+      requestDashboardReload();
     }
     function startDashboardAutoRefresh() {
       if (dashboardTimer) clearInterval(dashboardTimer);
@@ -3170,7 +3282,12 @@
           html += '<div class="session-item' + (selected ? ' selected' : '') + '"' + (id ? ' data-action="select-session" data-session-id="' + esc(id) + '" role="button" tabindex="0" aria-expanded="' + (selected ? 'true' : 'false') + '"' : '') + '>';
           html += '<div class="session-top"><span class="session-project">' + esc(sessionDisplayName(s)) + '</span>';
           html += '<span class="badge ' + statusBadge + '">' + esc(s.status) + '</span></div>';
-          var preview = s.firstPrompt || s.summary || '';
+          // String-type-and-visible test on every chain term: a non-string
+          // firstPrompt (unvalidated import) or an invisible-char-only one
+          // would otherwise win the truthy chain and render "[object
+          // Object]" or blank out the preview.
+          var preview = hasVisibleText(s.firstPrompt) ? s.firstPrompt.trim() : '';
+          if (!preview) preview = sessionSummaryText(s);
           if (preview) {
             html += '<div class="session-preview" style="font-size:13px;color:var(--ink);margin:4px 0;line-height:1.4;">' + esc(truncate(preview, 140)) + '</div>';
           }
@@ -3226,15 +3343,19 @@
         var tool = o.title || o.toolName;
         if (tool && t !== 'conversation') toolCounts[tool] = (toolCounts[tool] || 0) + 1;
         (o.files || []).forEach(function(f) { fileSet.add(f); });
-        if (!firstPromptFromObs && (o.userPrompt || (o.type === 'conversation' && o.narrative))) {
-          firstPromptFromObs = o.userPrompt || o.narrative || '';
+        if (!firstPromptFromObs && (hasVisibleText(o.userPrompt) || (o.type === 'conversation' && hasVisibleText(o.narrative)))) {
+          firstPromptFromObs = hasVisibleText(o.userPrompt) ? o.userPrompt : o.narrative;
         }
       });
 
       var durationMs = s.endedAt ? new Date(s.endedAt).getTime() - new Date(s.startedAt).getTime() : 0;
       var durationLabel = durationMs > 0 ? (durationMs < 60000 ? (durationMs / 1000).toFixed(1) + 's' : (durationMs / 60000).toFixed(1) + 'm') : '-';
 
-      var preview = s.firstPrompt || s.summary || firstPromptFromObs || '';
+      // Same visible-string guard as the list preview: non-string or
+      // invisible-char chain terms must fall through, not render garbage.
+      var preview = hasVisibleText(s.firstPrompt) ? s.firstPrompt.trim() : '';
+      if (!preview) preview = sessionSummaryText(s);
+      if (!preview) preview = hasVisibleText(firstPromptFromObs) ? firstPromptFromObs.trim() : '';
 
       var html = '<div class="detail-panel">';
       html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">';
@@ -3411,6 +3532,16 @@
       renderActions();
     }
 
+    // Legacy actions can carry tags as a CSV string (written before the
+    // write-boundary normalization). Never call .join/.map on a string. #906
+    function actionTags(a) {
+      if (Array.isArray(a && a.tags)) return a.tags;
+      if (typeof (a && a.tags) === 'string' && a.tags.trim()) {
+        return a.tags.split(',').map(function(t){ return t.trim(); }).filter(Boolean);
+      }
+      return [];
+    }
+
     function renderActions() {
       var el = document.getElementById('view-actions');
       var items = state.actions.items;
@@ -3424,7 +3555,7 @@
 
       if (search) {
         items = items.filter(function(a) {
-          return (a.title + ' ' + (a.description || '') + ' ' + (a.tags || []).join(' ')).toLowerCase().indexOf(search) >= 0;
+          return (a.title + ' ' + (a.description || '') + ' ' + actionTags(a).join(' ')).toLowerCase().indexOf(search) >= 0;
         });
       }
       if (statusFilter) {
@@ -3464,7 +3595,7 @@
           html += '</td>';
           html += '<td><span class="badge ' + statusClass + '">' + esc(a.status) + '</span></td>';
           html += '<td style="text-align:center;font-weight:600;">' + (a.priority || '-') + '</td>';
-          html += '<td style="font-size:11px;color:var(--ink-muted);">' + (a.tags || []).map(esc).join(', ') + '</td>';
+          html += '<td style="font-size:11px;color:var(--ink-muted);">' + actionTags(a).map(esc).join(', ') + '</td>';
           html += '<td style="text-align:center;">' + (isFrontier ? '&#9889;' : '') + '</td>';
           html += '<td style="font-size:12px;color:var(--ink-muted);">' + shortTime(a.updatedAt) + '</td>';
           html += '</tr>';
@@ -3799,8 +3930,7 @@
       pollTimer = setInterval(function() {
         tick++;
         if (state.activeTab === 'dashboard') {
-          state.dashboard.loaded = false;
-          loadDashboard();
+          requestDashboardReload();
         } else if (state.activeTab === 'memories') {
           state.memories.loaded = false;
           loadMemories();
@@ -3940,15 +4070,28 @@
           routeWsMessage({ observation: observation });
         }
       } else if (evt.type === 'sync') {
-        var items = Array.isArray(evt.data) ? evt.data : [];
-        items.forEach(function(item) {
-          var payload = item.data || item;
-          observation = payload.observation || payload;
+        processSyncBacklog(Array.isArray(evt.data) ? evt.data : []);
+      }
+    }
+
+    // A large mem-live sync backlog processed in one synchronous forEach
+    // froze Chrome (multi-GB growth). Process in bounded chunks, yielding
+    // between them so paint and GC can run. #609
+    var SYNC_CHUNK_SIZE = 200;
+    function processSyncBacklog(items) {
+      var i = 0;
+      function step() {
+        var end = Math.min(i + SYNC_CHUNK_SIZE, items.length);
+        for (; i < end; i++) {
+          var payload = items[i].data || items[i];
+          var observation = payload.observation || payload;
           if (looksLikeObservation(observation)) {
             routeWsMessage({ observation: observation });
           }
-        });
+        }
+        if (i < items.length) setTimeout(step, 0);
       }
+      step();
     }
 
     function routeWsMessage(msg) {
@@ -3964,8 +4107,14 @@
         }
       }
       if (state.activeTab === 'dashboard') {
-        state.dashboard.loaded = false;
-        loadDashboard();
+        // Observation bursts arrive far faster than a 10-request fan-out
+        // can complete; coalesce through requestDashboardReload and drop
+        // events closer than 1s apart (the 30s timer is the backstop).
+        var now = Date.now();
+        if (now - (state.dashboard.lastWsReloadAt || 0) >= 1000) {
+          state.dashboard.lastWsReloadAt = now;
+          requestDashboardReload();
+        }
       }
       if (state.activeTab === 'activity' && msg.observation) {
         state.activity.observations.unshift(msg.observation);

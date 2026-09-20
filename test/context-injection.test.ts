@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const HOOKS_DIR = join(import.meta.dirname, "..", "plugin", "scripts");
 
@@ -124,5 +126,76 @@ describe("session-start hook — context injection gate (#143)", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
+  });
+});
+
+describe("pre-tool-use hook — envelope + project (#1278)", () => {
+  it("wraps injected context in the PreToolUse hook envelope", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ context: "MEMORY: auth uses refresh tokens" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    try {
+      const payload = JSON.stringify({
+        session_id: "ses_test",
+        cwd: "/tmp/proj",
+        tool_name: "Read",
+        tool_input: { file_path: "src/foo.ts" },
+      });
+      const result = await runHook("pre-tool-use.mjs", payload, {
+        AGENTMEMORY_INJECT_CONTEXT: "true",
+        AGENTMEMORY_URL: `http://127.0.0.1:${port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.hookSpecificOutput).toEqual({
+        hookEventName: "PreToolUse",
+        additionalContext: "MEMORY: auth uses refresh tokens",
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+
+describe("pre-tool-use hook — ~/.agentmemory/.env (#1331)", () => {
+  it("reads URL and INJECT_CONTEXT from the env file when not exported", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ context: "FROM ENV FILE" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    const home = mkdtempSync(join(tmpdir(), "am-hook-home-"));
+    mkdirSync(join(home, ".agentmemory"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentmemory", ".env"),
+      `AGENTMEMORY_INJECT_CONTEXT=true\nAGENTMEMORY_URL=http://127.0.0.1:${port}\n`,
+    );
+
+    try {
+      const payload = JSON.stringify({
+        session_id: "ses_env",
+        tool_name: "Read",
+        tool_input: { file_path: "src/foo.ts" },
+      });
+      const result = await runHook("pre-tool-use.mjs", payload, { HOME: home });
+      expect(result.exitCode).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toBe("FROM ENV FILE");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

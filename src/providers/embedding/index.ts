@@ -54,11 +54,12 @@ export function createEmbeddingProvider(): EmbeddingProvider | null {
 // so a bad vector is stored, never matches anything, and the memory
 // becomes invisible without an error. Catch it at the boundary.
 export function withDimensionGuard(provider: EmbeddingProvider): EmbeddingProvider {
-  const expected = provider.dimensions;
+  // Read the live value, not a snapshot: an inferred dimension self-corrects
+  // from the first response (#1373) and the guard must follow.
   const check = (v: Float32Array, where: string): Float32Array => {
-    if (v.length !== expected) {
+    if (v.length !== provider.dimensions) {
       throw new Error(
-        `Embedding dimension mismatch in ${provider.name}.${where}: expected ${expected}, got ${v.length}`,
+        `Embedding dimension mismatch in ${provider.name}.${where}: expected ${provider.dimensions}, got ${v.length}`,
       );
     }
     return v;

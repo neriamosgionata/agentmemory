@@ -17,14 +17,14 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_compress_file` |  | `filePath`*: string | Compress a markdown file to reduce token usage while preserving headings, URLs, and code blocks. Creates a .original.md backup before writing. |
 | `memory_consolidate` | yes | `tier`: string | Run the 4-tier memory consolidation pipeline (working -> episodic -> semantic -> procedural). |
 | `memory_crystallize` |  | `actionIds`*: string, `project`: string, `sessionId`: string | Compress completed action chains into compact crystal digests using LLM summarization. Extracts narrative, key outcomes, files affected, and lessons. |
-| `memory_diagnose` | yes | `categories`: string | Run health checks across all subsystems (actions, leases, sentinels, sketches, signals, sessions, memories, mesh). Identifies stuck, orphaned, and inconsistent state. |
-| `memory_export` |  | none | Export all memory data as JSON. |
+| `memory_diagnose` | yes | `categories`: string | Run health checks across all subsystems (actions, leases, sentinels, sketches, signals, sessions, memories, mesh, index). Identifies stuck, orphaned, and inconsistent state. |
+| `memory_export` |  | `maxSessions`: number, `offset`: number, `collectionLimit`: number, `collectionOffset`: number, `collections`: string | Export memory data as JSON. Past the transport size limit the export is refused, so use the paging arguments on a large store. |
 | `memory_facet_query` |  | `matchAll`: string, `matchAny`: string, `targetType`: string | Query targets by facet tags with AND/OR logic. Find all actions tagged priority:urgent AND team:backend. |
 | `memory_facet_tag` |  | `targetId`*: string, `targetType`*: string, `dimension`*: string, `value`*: string | Attach a structured tag (dimension:value) to an action, memory, or observation for multi-dimensional categorization. |
 | `memory_file_history` |  | `files`*: string, `sessionId`: string | Get past observations about specific files. |
 | `memory_frontier` |  | `project`: string, `agentId`: string, `limit`: number | Get all unblocked actions ranked by priority and urgency. Returns the frontier of actionable work with no unsatisfied dependencies. |
-| `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string | Delete specific memories with audit trail. |
-| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string | Query the knowledge graph for entities and relationships. |
+| `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string, `sessionId`: string | Delete specific memories with audit trail. Observation ids are resolved to their owning session automatically (or pass sessionId). |
+| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string, `limit`: number, `includeSources`: boolean | Query the knowledge graph for entities and relationships. |
 | `memory_heal` |  | `categories`: string, `dryRun`: string | Auto-fix all fixable issues found by diagnostics. Unblocks stuck actions, expires stale leases, cleans up orphaned data. |
 | `memory_insight_list` |  | `project`: string, `minConfidence`: number, `limit`: number | List synthesized insights, higher-order observations derived from patterns across memories, lessons, and crystals. |
 | `memory_lease` |  | `actionId`*: string, `agentId`*: string, `operation`*: string, `result`: string, `ttlMs`: number | Acquire, release, or renew an exclusive lease on an action. Prevents multiple agents from working on the same thing. |
@@ -34,16 +34,16 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_mesh_sync` |  | `peerId`: string, `direction`: string | Sync memories and actions with peer agentmemory instances for multi-agent collaboration. |
 | `memory_next` |  | `project`: string, `agentId`: string | Get the single most important next action to work on. Combines dependency resolution, priority, and recency into a score. |
 | `memory_obsidian_export` |  | `vaultDir`: string, `types`: string | Export memories, lessons, and crystals as Obsidian-compatible Markdown files with YAML frontmatter and wikilinks for graph view. |
-| `memory_patterns` |  | `project`: string | Detect recurring patterns across sessions. |
+| `memory_patterns` |  | `project`: string, `maxSessions`: number, `sinceDays`: number | Detect recurring patterns across sessions. |
 | `memory_profile` |  | `project`*: string, `refresh`: string | User/project profile with top concepts and file patterns. |
-| `memory_recall` | yes | `query`*: string, `limit`: number, `format`: string, `token_budget`: number | Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before. |
+| `memory_recall` | yes | `query`*: string, `limit`: number, `format`: string, `token_budget`: number, `project`: string | Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before. |
 | `memory_reflect` | yes | `project`: string, `maxClusters`: number | Traverse the knowledge graph, group related memories by concept clusters, and synthesize higher-order insights via LLM. Returns new and reinforced insights. |
 | `memory_relations` |  | `memoryId`*: string, `maxHops`: number, `minConfidence`: number | Query the memory relationship graph. |
 | `memory_routine_run` |  | `routineId`*: string, `project`: string, `initiatedBy`: string | Instantiate a frozen workflow routine, creating actions for each step with proper dependencies. |
 | `memory_save` | yes | `content`*: string, `type`: string, `concepts`: string, `files`: string, `project`: string, `agentId`: string | Explicitly save an important insight, decision, or pattern to long-term memory. |
 | `memory_sentinel_create` |  | `name`*: string, `type`*: string, `config`: string, `linkedActionIds`: string, `expiresInMs`: number | Create an event-driven sentinel that watches for conditions (webhook, timer, threshold, pattern, approval) and auto-unblocks gated actions when triggered. |
 | `memory_sentinel_trigger` |  | `sentinelId`*: string, `result`: string | Externally fire a sentinel, providing an optional result payload. Unblocks any gated actions. |
-| `memory_sessions` | yes | none | List recent sessions with their status and observation counts. |
+| `memory_sessions` | yes | `limit`: number, `project`: string, `status`: string | List recent sessions with their status and observation counts. Returns the newest sessions first, projected to a summary row. |
 | `memory_signal_read` |  | `agentId`*: string, `unreadOnly`: string, `threadId`: string, `limit`: number | Read messages for an agent. Marks delivered messages as read. |
 | `memory_signal_send` |  | `from`*: string, `to`: string, `content`*: string, `type`: string, `replyTo`: string | Send a message to another agent or broadcast. Supports threading, typed messages, and TTL expiration. |
 | `memory_sketch_create` |  | `title`*: string, `description`: string, `expiresInMs`: number, `project`: string | Create an ephemeral action graph for exploratory work. Auto-expires after TTL. Can be promoted to permanent actions or discarded. |
@@ -54,13 +54,13 @@ agentmemory exposes 54 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_slot_get` |  | `label`*: string | Read a single slot by label. |
 | `memory_slot_list` |  | none | List all memory slots (pinned + project + global). Slots are editable, size-limited memory units the agent can read and modify across sessions. |
 | `memory_slot_replace` |  | `label`*: string, `content`*: string | Replace slot content in place. Fails if content exceeds sizeLimit. |
-| `memory_smart_search` | yes | `query`*: string, `expandIds`: string, `limit`: number | Hybrid semantic+keyword search with progressive disclosure. |
+| `memory_smart_search` | yes | `query`*: string, `expandIds`: string, `limit`: number, `project`: string | Hybrid semantic+keyword search with progressive disclosure. |
 | `memory_snapshot_create` |  | `message`: string | Create a git-versioned snapshot of current memory state. |
 | `memory_team_feed` |  | `limit`: number | Get recent shared items from all team members. |
 | `memory_team_share` |  | `itemId`*: string, `itemType`*: string | Share a memory or observation with team members. |
 | `memory_timeline` |  | `anchor`*: string, `project`: string, `before`: number, `after`: number | Chronological observations around an anchor point. |
 | `memory_verify` |  | `id`*: string | Verify a memory or observation by tracing its citation chain back to source observations and session context. Returns provenance information including confidence scores. |
-| `memory_vision_search` |  | `queryText`: string, `queryImageRef`: string, `queryImageBase64`: string, `topK`: number, `sessionId`: string | Cross-modal image search via CLIP embeddings. Pass queryText to find screenshots matching a description, or queryImageBase64/queryImageRef to find similar images. Requires AGENTMEMORY_IMAGE_EMBEDDINGS=true. |
+| `memory_vision_search` |  | `queryText`: string, `queryImageRef`: string, `queryImageBase64`: string, `topK`: number, `limit`: number, `sessionId`: string | Cross-modal image search via CLIP embeddings. Pass queryText to find screenshots matching a description, or queryImageBase64/queryImageRef to find similar images. Requires AGENTMEMORY_IMAGE_EMBEDDINGS=true. |
 
 `*` marks required parameters.
 <!-- AUTOGEN:tools END -->

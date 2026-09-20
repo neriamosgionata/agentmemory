@@ -201,8 +201,11 @@ export function loadConfig(): AgentMemoryConfig {
     restPort + 1;
   const viewerPort =
     parseInt(env["III_VIEWER_PORT"] || "", 10) || restPort + 2;
+  // Compose daemons inject III_URL into every container, so it takes
+  // precedence over our derived port when III_ENGINE_URL is not set.
   const engineUrl =
     env["III_ENGINE_URL"] ||
+    env["III_URL"] ||
     `ws://localhost:${
       parseInt(env["III_ENGINE_PORT"] || "", 10) || restPort + 46023
     }`;
@@ -281,6 +284,16 @@ export function detectEmbeddingProvider(
   return null;
 }
 
+// Claude Code relocates its whole config surface when CLAUDE_CONFIG_DIR is
+// set (XDG setups). Every call site that used to hardcode ~/.claude must go
+// through here, or it writes/reads files Claude Code never touches. #1067/#1103
+export function claudeConfigDir(): string {
+  const raw = getMergedEnv()["CLAUDE_CONFIG_DIR"];
+  return typeof raw === "string" && raw.trim()
+    ? raw.trim()
+    : join(homedir(), ".claude");
+}
+
 export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
   const env = getMergedEnv();
   const enabled = env["CLAUDE_MEMORY_BRIDGE"] === "true";
@@ -297,8 +310,7 @@ export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
     // per-topic `.md` file per memory (verified against Claude Code 2.x).
     const safePath = projectPath.replace(/[/\\]/g, "-");
     memoryFilePath = join(
-      homedir(),
-      ".claude",
+      claudeConfigDir(),
       "projects",
       safePath,
       "memory",
@@ -383,6 +395,66 @@ export function isGraphExtractionEnabled(): boolean {
 
 export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
+}
+
+// Upstream #1168 / #1171: `sourceObservationIds` on graph nodes (and the
+// same field on edges) was capped at creation but re-unioned without a
+// cap on every merge. Because extraction re-observes the same entities
+// continuously, the array grew monotonically for the life of the graph
+// and ended up as ~97-99% of all bytes in the collection — measured here
+// at 9.55 MB of 9.4 MB across 500 nodes, with one `package.json` node
+// holding 4,707 ids in 133 KB. Provenance past the most recent handful
+// carries almost no signal, so bound it and keep the newest.
+const GRAPH_MAX_SOURCE_IDS_DEFAULT = 10;
+
+export function getGraphMaxSourceIds(): number {
+  return Math.max(
+    1,
+    safeParseInt(
+      getMergedEnv()["GRAPH_MAX_SOURCE_IDS"],
+      GRAPH_MAX_SOURCE_IDS_DEFAULT,
+    ),
+  );
+}
+
+// Provider circuit breaker. The old hardcoded 3-failure trip was far
+// too tight for a hosted LLM proxy that returns the occasional 502 or
+// slow response: three scattered failures took the provider offline for
+// every caller. Ten failures since the last success is still a decisive
+// signal that the upstream is down, and a 15s recovery probe gets the
+// provider back quickly when it is not.
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 10;
+const CIRCUIT_BREAKER_FAILURE_WINDOW_MS = 60_000;
+const CIRCUIT_BREAKER_RECOVERY_TIMEOUT_MS = 15_000;
+
+function positiveEnvInt(value: string | undefined, fallback: number): number {
+  const parsed = safeParseInt(value, fallback);
+  // safeParseInt returns 0 or a negative number verbatim; CircuitBreaker
+  // rejects those and substitutes its own legacy fallbacks, so an override of
+  // "0" would silently select 3 / 60s / 30s rather than the values below.
+  return parsed > 0 ? parsed : fallback;
+}
+
+export function getCircuitBreakerOptions(): {
+  failureThreshold: number;
+  failureWindowMs: number;
+  recoveryTimeoutMs: number;
+} {
+  const env = getMergedEnv();
+  return {
+    failureThreshold: positiveEnvInt(
+      env["AGENTMEMORY_CIRCUIT_FAILURE_THRESHOLD"],
+      CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    ),
+    failureWindowMs: positiveEnvInt(
+      env["AGENTMEMORY_CIRCUIT_FAILURE_WINDOW_MS"],
+      CIRCUIT_BREAKER_FAILURE_WINDOW_MS,
+    ),
+    recoveryTimeoutMs: positiveEnvInt(
+      env["AGENTMEMORY_CIRCUIT_RECOVERY_TIMEOUT_MS"],
+      CIRCUIT_BREAKER_RECOVERY_TIMEOUT_MS,
+    ),
+  };
 }
 
 // window for the smart-search followup-rate diagnostic. A second

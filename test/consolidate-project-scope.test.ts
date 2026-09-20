@@ -152,6 +152,40 @@ describe("mem::consolidate — cross-project existingMatch guard", () => {
     expect(apiMemories[0].title).toBe("synthesized memory title");
   });
 
+  it("evolves instead of duplicating when two concept groups produce the same title in one run (#747)", async () => {
+    const sdk = makeMockSdk();
+    const kv = makeMockKV();
+    const provider = makeProvider("shared title");
+
+    const session = makeSession("sess_dup", "api");
+    await kv.set(KV.sessions, session.id, session);
+    for (let i = 0; i < 3; i++) {
+      await kv.set(
+        KV.observations(session.id),
+        `obs_a_${i}`,
+        makeObs(`obs_a_${i}`, session.id, "auth"),
+      );
+    }
+    for (let i = 0; i < 3; i++) {
+      await kv.set(
+        KV.observations(session.id),
+        `obs_c_${i}`,
+        makeObs(`obs_c_${i}`, session.id, "caching"),
+      );
+    }
+
+    registerConsolidateFunction(sdk as never, kv as never, provider as never);
+    await sdk.trigger("mem::consolidate", { project: "api", minObservations: 1 });
+
+    const latest = (await kv.list<Memory>(KV.memories)).filter(
+      (m) => m.isLatest,
+    );
+    expect(latest).toHaveLength(1);
+    expect(latest[0].title).toBe("shared title");
+    expect(latest[0].version).toBe(2);
+    expect(latest[0].parentId).toBeDefined();
+  });
+
   it("evolves an existing memory within the same project when titles match", async () => {
     const sdk = makeMockSdk();
     const kv = makeMockKV();

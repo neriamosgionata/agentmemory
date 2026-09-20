@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type ISdk } from "../iii.js";
 import type { CompressedObservation, HookPayload, Session } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -7,6 +7,7 @@ import {
   getAgentId,
   getConsolidationCooldownMs,
   isConsolidationEnabled,
+  isGraphExtractionEnabled,
 } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -107,20 +108,26 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     if (isReflectEnabled()) {
       fireVoid("mem::slot-reflect", { sessionId: data.sessionId });
     }
-    // Unconditional: mem::graph-extract gates its LLM pass internally.
-    try {
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(data.sessionId),
-      );
-      const compressed = observations.filter((o) => o.title);
-      if (compressed.length > 0) {
-        fireVoid("mem::graph-extract", { observations: compressed });
+    // #1238: GRAPH_EXTRACTION_ENABLED=false is the master switch for graph
+    // writes. The structural (heuristic) pass used to run regardless, so the
+    // graph kept growing on session stop even with the flag off. Explicit
+    // calls to mem::graph-extract / api::graph-extract still work for
+    // operators who want a one-off import.
+    if (isGraphExtractionEnabled()) {
+      try {
+        const observations = await kv.list<CompressedObservation>(
+          KV.observations(data.sessionId),
+        );
+        const compressed = observations.filter((o) => o.title);
+        if (compressed.length > 0) {
+          fireVoid("mem::graph-extract", { observations: compressed });
+        }
+      } catch (err) {
+        logger.warn("graph-extract trigger failed", {
+          sessionId: data.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-    } catch (err) {
-      logger.warn("graph-extract trigger failed", {
-        sessionId: data.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
     // Crystals + lessons consolidation. The stop lifecycle is the single
     // source of truth: event::session::stopped fires for ALL agents (the

@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
+import { TriggerAction, type ISdk, type ApiRequest } from "../iii.js";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -314,6 +314,7 @@ export function registerApiTriggers(
           },
         };
       }
+      const agentId = asNonEmptyString(body.agentId);
       const payload: HookPayload = {
         hookType: hookType as HookPayload["hookType"],
         sessionId,
@@ -321,6 +322,7 @@ export function registerApiTriggers(
         cwd,
         timestamp,
         data: body.data,
+        ...(agentId ? { agentId } : {}),
       };
       const result = await sdk.trigger({ function_id: "mem::observe", payload });
       return { status_code: 201, body: result };
@@ -512,6 +514,34 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/compress-file", http_method: "POST" },
   });
 
+  // #1228: recovery for observations whose compression failed. Bounded per
+  // call; repeat to drain a backlog.
+  sdk.registerFunction("api::recompress",
+    async (req: ApiRequest<{ sessionId?: string; limit?: number }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const sessionId = asNonEmptyString(body.sessionId);
+      const limit =
+        typeof body.limit === "number" && Number.isFinite(body.limit)
+          ? body.limit
+          : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::recompress",
+        payload: {
+          ...(sessionId !== undefined && { sessionId }),
+          ...(limit !== undefined && { limit }),
+        },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::recompress",
+    config: { api_path: "/agentmemory/recompress", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::replay::load",
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -665,10 +695,28 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
-      await kv.update(KV.sessions, sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
-        { type: "set", path: "status", value: "completed" },
-      ]);
+      // state::update has upsert semantics. A lifecycle adapter can emit an
+      // end event before its first observation has created the corresponding
+      // agentmemory session (for example, OpenClaw's /new command). Updating
+      // that missing key would create a partial row with only status/endedAt,
+      // which later breaks consumers that require Session.id.
+      const endResult = await withKeyedLock(`obs:${sessionId}`, async () => {
+        const session = await kv.get<Session>(KV.sessions, sessionId);
+        if (!session || session.id !== sessionId) return "not_found" as const;
+        if (session.status === "completed") return "already_completed" as const;
+
+        await kv.update(KV.sessions, sessionId, [
+          { type: "set", path: "endedAt", value: new Date().toISOString() },
+          { type: "set", path: "status", value: "completed" },
+        ]);
+        return "ended" as const;
+      });
+      if (endResult !== "ended") {
+        return {
+          status_code: 200,
+          body: { success: true, ended: false, reason: endResult },
+        };
+      }
       // Fan out session-stopped lifecycle (non-blocking).
       try {
         sdk.trigger({
@@ -682,7 +730,7 @@ export function registerApiTriggers(
           error: err instanceof Error ? err.message : String(err),
         });
       }
-      return { status_code: 200, body: { success: true } };
+      return { status_code: 200, body: { success: true, ended: true } };
     },
   );
   sdk.registerTrigger({
@@ -696,14 +744,18 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::summarize", 
-    async (req: ApiRequest<{ sessionId: string }>): Promise<Response> => {
-      const sessionId = asNonEmptyString((req.body as Record<string, unknown>)?.sessionId);
+    async (req: ApiRequest<{ sessionId: string; force?: boolean }>): Promise<Response> => {
+      const body = (req.body as Record<string, unknown>) ?? {};
+      const sessionId = asNonEmptyString(body.sessionId);
       if (!sessionId) {
         return { status_code: 400, body: { error: "sessionId is required" } };
       }
       const result = await sdk.trigger({
         function_id: "mem::summarize",
-        payload: { sessionId },
+        payload: {
+          sessionId,
+          ...(body.force === true && { force: true }),
+        },
       });
       return { status_code: 200, body: result };
     },
@@ -850,7 +902,37 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const sessions = await kv.list<Session>(KV.sessions);
+      let sessions: Session[];
+      try {
+        sessions = await kv.list<Session>(KV.sessions);
+      } catch (err) {
+        // #1326: state::list over the sessions scope can stall in the
+        // engine's file_based adapter. StateKV's 10s budget surfaces it
+        // here; return a typed 503 instead of an opaque 500 so the viewer
+        // and doctor can show an actionable message.
+        const detail = err instanceof Error ? err.message : String(err);
+        logger.warn("sessions list unavailable", { detail });
+        return {
+          status_code: 503,
+          body: {
+            sessions: [],
+            error: "sessions_unavailable",
+            detail,
+            hint: "state::list(mem:sessions) did not return within the KV budget. Restart the daemon, or run `agentmemory doctor` (state-store-corruption check).",
+          },
+        };
+      }
+      // Be tolerant of legacy partial rows created by state::update before
+      // the session existed. In particular, never issue state::get with an
+      // undefined summary key: iii-engine can leave that invocation pending
+      // until the caller times out, making the viewer look empty.
+      const validSessions = sessions.filter(
+        (session): session is Session =>
+          !!session &&
+          typeof session === "object" &&
+          typeof session.id === "string" &&
+          session.id.length > 0,
+      );
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -863,27 +945,34 @@ export function registerApiTriggers(
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
       const filtered = filterAgentId
-        ? sessions.filter((s) => s.agentId === filterAgentId)
-        : sessions;
-      // Bounded fan-out: each kv.get is a full engine invocation, so
-      // Promise.all over hundreds of sessions saturates the invocation
-      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
-      // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
-      const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
-        const results = await Promise.all(
-          chunk.map((s) =>
-            kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-          ),
-        );
-        summaries.push(...results);
-      }
-      const withSummary = filtered.map((s, i) =>
-        summaries[i] ? { ...s, summary: summaries[i] } : s,
+        ? validSessions.filter((s) => s.agentId === filterAgentId)
+        : validSessions;
+      const requestedLimit = parseOptionalPositiveInt(
+        req.query_params?.["limit"],
       );
-      return { status_code: 200, body: { sessions: withSummary } };
+      if (requestedLimit === null) {
+        return {
+          status_code: 400,
+          body: { error: "invalid numeric parameter: limit" },
+        };
+      }
+      const limited =
+        requestedLimit === undefined
+          ? filtered
+          : filtered.slice(0, Math.min(requestedLimit, 500));
+      const summariesList = await kv.list<SessionSummary>(KV.summaries).catch(() => []);
+      const summaryBySessionId = new Map<string, SessionSummary>();
+      for (const sm of summariesList) {
+        if (sm?.sessionId) summaryBySessionId.set(sm.sessionId, sm);
+      }
+      const withSummary = limited.map((s) => {
+        const sum = summaryBySessionId.get(s.id);
+        return sum ? { ...s, summary: sum } : s;
+      });
+      return {
+        status_code: 200,
+        body: { sessions: withSummary, total: filtered.length },
+      };
     },
   );
   sdk.registerTrigger({
@@ -1033,6 +1122,13 @@ export function registerApiTriggers(
       ) {
         return { status_code: 400, body: { error: "project must be a non-empty string" } };
       }
+      // agentId is optional here on purpose: env AGENT_ID fallback is
+      // handled once, downstream, by mem::remember (remember.ts). Doing
+      // it here too would let the two fallbacks disagree.
+      const agentId =
+        typeof req.body.agentId === "string" && req.body.agentId.trim().length > 0
+          ? req.body.agentId.trim().slice(0, 128)
+          : undefined;
       const result = await sdk.trigger({
         function_id: "mem::remember",
         payload: {
@@ -1043,9 +1139,7 @@ export function registerApiTriggers(
           ...(req.body.ttlDays !== undefined && { ttlDays: req.body.ttlDays }),
           ...(req.body.sourceObservationIds !== undefined && { sourceObservationIds: req.body.sourceObservationIds }),
           ...(req.body.project !== undefined && { project: req.body.project }),
-          ...(typeof req.body.agentId === "string" && req.body.agentId.trim()
-            ? { agentId: req.body.agentId.trim() }
-            : {}),
+          ...(agentId !== undefined && { agentId }),
         },
       });
       return { status_code: 201, body: result };
@@ -1100,10 +1194,27 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::patterns", 
-    async (req: ApiRequest<{ project?: string }>): Promise<Response> => {
+    async (req: ApiRequest<{ project?: string; maxSessions?: number; sinceDays?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const result = await sdk.trigger({ function_id: "mem::patterns", payload: req.body });
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const project = asNonEmptyString(body.project);
+      const maxSessions =
+        typeof body.maxSessions === "number" && Number.isFinite(body.maxSessions)
+          ? body.maxSessions
+          : undefined;
+      const sinceDays =
+        typeof body.sinceDays === "number" && Number.isFinite(body.sinceDays)
+          ? body.sinceDays
+          : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::patterns",
+        payload: {
+          ...(project !== undefined && { project }),
+          ...(maxSessions !== undefined && { maxSessions }),
+          ...(sinceDays !== undefined && { sinceDays }),
+        },
+      });
       return { status_code: 200, body: result };
     },
   );
@@ -1316,9 +1427,18 @@ export function registerApiTriggers(
       // real corpus (40 sessions × 34K observations × 8K memories) hit the
       // iii engine invocation timeout and `agentmemory status` reported 0.
       // Pass through the query-string pagination so callers can chunk.
+      const payload: {
+        maxSessions?: number;
+        offset?: number;
+        collectionLimit?: number;
+        collectionOffset?: number;
+        collections?: string;
+      } = {};
       const rawMax = req.query_params?.["maxSessions"];
       const rawOffset = req.query_params?.["offset"];
-      const payload: { maxSessions?: number; offset?: number } = {};
+      const rawCollectionLimit = req.query_params?.["collectionLimit"];
+      const rawCollectionOffset = req.query_params?.["collectionOffset"];
+      const rawCollections = req.query_params?.["collections"];
       if (typeof rawMax === "string") {
         const n = Number(rawMax);
         if (Number.isInteger(n) && n > 0) payload.maxSessions = n;
@@ -1327,11 +1447,30 @@ export function registerApiTriggers(
         const n = Number(rawOffset);
         if (Number.isInteger(n) && n >= 0) payload.offset = n;
       }
+      if (typeof rawCollectionLimit === "string") {
+        const n = Number(rawCollectionLimit);
+        if (Number.isInteger(n) && n > 0) payload.collectionLimit = n;
+      }
+      if (typeof rawCollectionOffset === "string") {
+        const n = Number(rawCollectionOffset);
+        if (Number.isInteger(n) && n >= 0) payload.collectionOffset = n;
+      }
+      // Forwarded raw, empty value included: mem::export owns the name
+      // vocabulary, and only it can tell "?collections=" (an explicit
+      // empty selection) from an absent parameter (every collection).
+      if (typeof rawCollections === "string") {
+        payload.collections = rawCollections;
+      }
       const result = await sdk.trigger({
         function_id: "mem::export",
         payload,
       });
-      return { status_code: 200, body: result };
+      // #1334: the refusal used to ride HTTP 200, so scripts kept parsing a
+      // body with success:false and no data. Surface it as 413.
+      const oversized =
+        result && typeof result === "object" &&
+        (result as { oversized?: unknown }).oversized === true;
+      return { status_code: oversized ? 413 : 200, body: result };
     },
   );
   sdk.registerTrigger({
@@ -1561,9 +1700,15 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       try {
+        const body = (req.body as Record<string, unknown>) || {};
+        const confirm = body.confirm === true;
+        const maxRecords =
+          typeof body.maxRecords === "number" && Number.isFinite(body.maxRecords)
+            ? body.maxRecords
+            : undefined;
         const result = await sdk.trigger({
           function_id: "mem::graph-reset",
-          payload: {},
+          payload: { confirm, ...(maxRecords !== undefined && { maxRecords }) },
         });
         return { status_code: 200, body: result };
       } catch {
@@ -1608,54 +1753,91 @@ export function registerApiTriggers(
   // Viewer calls this when the graph is empty (#666). Iterates every
   // session, collects observations that have a `title` (compressed only),
   // and feeds them through `mem::graph-extract` in batches.
+  //
+  // #1339: the loop used to walk every session in one request, so a large
+  // store outlived the HTTP invocation (500 "Invocation stopped" after ~3
+  // min) while the server-side loop kept burning LLM calls for hours. Each
+  // call is now bounded by maxSessions AND a wall-clock budget, and reports
+  // nextOffset/hasMore so callers can drain in resumable chunks.
   sdk.registerFunction("api::graph-build",
-    async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
+    async (req: ApiRequest<{ batchSize?: number; maxSessions?: number; offset?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const body = (req.body ?? {}) as { batchSize?: number; maxSessions?: number; offset?: number };
       const batchSize = Math.max(
         1,
-        Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
+        Math.min(100, Number(body.batchSize) || 25),
       );
+      const maxSessions = Math.max(
+        1,
+        Math.min(200, Number(body.maxSessions) || 25),
+      );
+      const offset = Math.max(0, Math.floor(Number(body.offset) || 0));
+      const timeBudgetMs = 60_000;
+      const startedAt = Date.now();
       try {
         const sessions = await kv.list<Session>(KV.sessions);
+        const window = sessions.slice(offset, offset + maxSessions);
         let totalNodes = 0;
         let totalEdges = 0;
         let batchesRun = 0;
-        for (const session of sessions) {
+        let processedSessions = 0;
+        let nextOffset = offset;
+        let budgetExceeded = false;
+        for (const session of window) {
+          if (Date.now() - startedAt > timeBudgetMs) {
+            budgetExceeded = true;
+            break;
+          }
           const sid = session?.id;
-          if (typeof sid !== "string" || sid.length === 0) continue;
+          if (typeof sid !== "string" || sid.length === 0) {
+            nextOffset++;
+            continue;
+          }
           const observations = await kv.list<CompressedObservation>(KV.observations(sid));
           const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
-          if (compressed.length === 0) continue;
-          for (let i = 0; i < compressed.length; i += batchSize) {
-            const batch = compressed.slice(i, i + batchSize);
-            try {
-              const result = (await sdk.trigger({
-                function_id: "mem::graph-extract",
-                payload: { observations: batch },
-              })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
-              if (result?.success) {
-                totalNodes += Number(result.nodesAdded) || 0;
-                totalEdges += Number(result.edgesAdded) || 0;
+          if (compressed.length > 0) {
+            for (let i = 0; i < compressed.length; i += batchSize) {
+              const batch = compressed.slice(i, i + batchSize);
+              try {
+                const result = (await sdk.trigger({
+                  function_id: "mem::graph-extract",
+                  payload: { observations: batch },
+                })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
+                if (result?.success) {
+                  totalNodes += Number(result.nodesAdded) || 0;
+                  totalEdges += Number(result.edgesAdded) || 0;
+                }
+                batchesRun++;
+              } catch (err) {
+                logger.warn("graph-build batch failed", {
+                  sessionId: sid,
+                  batchIndex: Math.floor(i / batchSize),
+                  error: err instanceof Error ? err.message : String(err),
+                });
               }
-              batchesRun++;
-            } catch (err) {
-              logger.warn("graph-build batch failed", {
-                sessionId: sid,
-                batchIndex: Math.floor(i / batchSize),
-                error: err instanceof Error ? err.message : String(err),
-              });
             }
           }
+          processedSessions++;
+          nextOffset++;
         }
+        const hasMore = nextOffset < sessions.length;
         return {
           status_code: 200,
           body: {
             success: true,
             sessions: sessions.length,
+            processedSessions,
+            offset,
+            nextOffset,
+            hasMore,
+            budgetExceeded,
             batches: batchesRun,
             nodes: totalNodes,
             edges: totalEdges,
+            hint: hasMore
+              ? `Call again with offset=${nextOffset} (and the same maxSessions) until hasMore is false.`
+              : undefined,
           },
         };
       } catch {
@@ -1812,7 +1994,7 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::governance-delete", 
     async (
-      req: ApiRequest<{ memoryIds: string[]; reason?: string }>,
+      req: ApiRequest<{ memoryIds: string[]; reason?: string; sessionId?: string }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -1822,7 +2004,27 @@ export function registerApiTriggers(
           body: { error: "memoryIds array is required" },
         };
       }
-      const result = await sdk.trigger({ function_id: "mem::governance-delete", payload: req.body });
+      const memoryIds = req.body.memoryIds
+        .filter((id): id is string => typeof id === "string")
+        .map((id) => id.trim())
+        .filter(Boolean);
+      if (memoryIds.length === 0) {
+        return {
+          status_code: 400,
+          body: { error: "memoryIds must contain at least one string id" },
+        };
+      }
+      const sessionId = asNonEmptyString(req.body.sessionId);
+      const reason =
+        typeof req.body.reason === "string" ? req.body.reason : undefined;
+      const result = await sdk.trigger({
+        function_id: "mem::governance-delete",
+        payload: {
+          memoryIds,
+          ...(reason !== undefined && { reason }),
+          ...(sessionId !== undefined && { sessionId }),
+        },
+      });
       return { status_code: 200, body: result };
     },
   );
@@ -1938,6 +2140,11 @@ export function registerApiTriggers(
         normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
       const includeOrphans =
         req.query_params?.["includeOrphans"] === "true";
+      const projectParam = req.query_params?.["project"];
+      const project =
+        typeof projectParam === "string" && projectParam.trim()
+          ? projectParam.trim()
+          : undefined;
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? (isAgentScopeIsolated() ? getAgentId() : undefined);
@@ -1948,6 +2155,19 @@ export function registerApiTriggers(
             m.agentId === filterAgentId ||
             (includeOrphans && m.agentId === undefined),
         );
+      }
+      if (project) {
+        filtered = filtered.filter((m) => m.project === project);
+      }
+      if (latest) {
+        // kv.list is insertion-ordered, so slicing before sorting returned
+        // the OLDEST latest-version rows on a corpus larger than the limit —
+        // the viewer showed stale memories. Newest first. #990
+        filtered = filtered.slice().sort((a, b) => {
+          const at = a.updatedAt || a.createdAt || "";
+          const bt = b.updatedAt || b.createdAt || "";
+          return bt.localeCompare(at);
+        });
       }
 
       // viewer + `agentmemory status` were hitting this endpoint to
@@ -2027,8 +2247,11 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
-      return { status_code: 200, body: { semantic } };
+      const limitParam = parseOptionalPositiveInt(req.query_params?.["limit"]);
+      const limit = limitParam ?? 100;
+      const allSemantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
+      const semantic = allSemantic.slice(0, limit);
+      return { status_code: 200, body: { semantic, total: allSemantic.length } };
     },
   );
   sdk.registerTrigger({
@@ -2041,8 +2264,11 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
-      return { status_code: 200, body: { procedural } };
+      const limitParam = parseOptionalPositiveInt(req.query_params?.["limit"]);
+      const limit = limitParam ?? 100;
+      const allProcedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
+      const procedural = allProcedural.slice(0, limit);
+      return { status_code: 200, body: { procedural, total: allProcedural.length } };
     },
   );
   sdk.registerTrigger({
@@ -2055,8 +2281,11 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
-      return { status_code: 200, body: { relations } };
+      const limitParam = parseOptionalPositiveInt(req.query_params?.["limit"]);
+      const limit = limitParam ?? 100;
+      const allRelations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
+      const relations = allRelations.slice(0, limit);
+      return { status_code: 200, body: { relations, total: allRelations.length } };
     },
   );
   sdk.registerTrigger({
@@ -2080,7 +2309,11 @@ export function registerApiTriggers(
           body: { error: "queryText, queryImageRef, or queryImageBase64 required" },
         };
       }
-      const topKParsed = parseOptionalPositiveInt(body["topK"]);
+      // `limit` is the name every other search endpoint uses; accept it as
+      // an alias for topK (#1254).
+      const topKParsed = parseOptionalPositiveInt(
+        body["topK"] ?? body["limit"],
+      );
       if (topKParsed === null) {
         return { status_code: 400, body: { error: "topK must be a positive integer" } };
       }

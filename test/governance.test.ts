@@ -254,3 +254,80 @@ describe("Governance Functions", () => {
     expect(entries[0].functionId).toBe("mem::governance-delete");
   });
 });
+
+describe("governance-delete observations (#1273)", () => {
+  function makeObs(id: string, sessionId: string) {
+    return {
+      id,
+      sessionId,
+      timestamp: "2026-02-01T10:00:00Z",
+      type: "file_edit" as const,
+      title: "Edit auth",
+      facts: ["added check"],
+      narrative: "Modified the auth middleware for JWT validation.",
+      concepts: ["auth"],
+      files: ["src/auth.ts"],
+      importance: 6,
+    };
+  }
+
+  async function setup() {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerGovernanceFunction(sdk as never, kv as never);
+    await kv.set("mem:obs:ses_1", "obs_1", makeObs("obs_1", "ses_1"));
+    await kv.set("mem:obs:ses_1", "obs_2", makeObs("obs_2", "ses_1"));
+    return { sdk, kv };
+  }
+
+  it("resolves an observation id through the BM25 index and deletes the row", async () => {
+    const { sdk, kv } = await setup();
+    getSearchIndex().clear();
+    getSearchIndex().add(makeObs("obs_1", "ses_1"));
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_1"],
+      reason: "bad capture",
+    })) as {
+      success: boolean;
+      deleted: number;
+      deletedObservations: number;
+      notFound?: string[];
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(0);
+    expect(result.deletedObservations).toBe(1);
+    expect(result.notFound).toBeUndefined();
+    expect(await kv.get("mem:obs:ses_1", "obs_1")).toBeNull();
+    expect(getSearchIndex().has("obs_1")).toBe(false);
+  });
+
+  it("accepts an explicit sessionId for observations the index does not know", async () => {
+    const { sdk, kv } = await setup();
+    getSearchIndex().clear();
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_2"],
+      sessionId: "ses_1",
+      reason: "bad capture",
+    })) as { deletedObservations: number; notFound?: string[] };
+
+    expect(result.deletedObservations).toBe(1);
+    expect(result.notFound).toBeUndefined();
+    expect(await kv.get("mem:obs:ses_1", "obs_2")).toBeNull();
+  });
+
+  it("reports ids it could not locate instead of silently deleting zero", async () => {
+    const { sdk } = await setup();
+    getSearchIndex().clear();
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_missing"],
+    })) as { deleted: number; deletedObservations: number; notFound?: string[] };
+
+    expect(result.deleted).toBe(0);
+    expect(result.deletedObservations).toBe(0);
+    expect(result.notFound).toEqual(["obs_missing"]);
+  });
+});

@@ -67,12 +67,18 @@ import {
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import { renderEngineConfig } from "./cli/engine-config.js";
+import {
+  isComposeEngineVersion,
+  renderComposeEnv,
+  renderWorkerCompose,
+} from "./cli/compose-config.js";
+import { repairStateStore, scanStateStore } from "./state/store-repair.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
 import { setBootVerbose } from "./logger.js";
-import { hydrateProcessEnvFromFile } from "./config.js";
+import { claudeConfigDir, hydrateProcessEnvFromFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
@@ -112,18 +118,24 @@ if (args.includes("--version") || args.includes("-V")) {
   process.exit(0);
 }
 
-// Pinned iii-engine version. The unpinned `install.iii.dev/iii/main/install.sh`
-// script tracks `latest`, which made every fresh agentmemory install pull
-// engine 0.11.6 — and 0.11.6 introduces a new sandbox-everything-via-
-// `iii worker add` worker model that agentmemory hasn't been refactored
-// for yet (the CLI still registers its worker directly through the SDK). The
-// architectural mismatch surfaces as EPIPE reconnect loops and empty
-// search results after save. Pin to v0.11.2 — the last engine that runs
-// agentmemory's current worker model cleanly — until the refactor lands.
-// Override env var AGENTMEMORY_III_VERSION lets users on the sandbox
-// model already point at a newer engine without us cutting a release.
+// Pinned iii-engine version. Native installs run v0.24.0 through the
+// `iii compose` worker model (see COMPOSE_MODE below). The Docker path still
+// ships the legacy list-shaped iii-config.docker.yaml, which 0.23+ rejects,
+// so it stays on 0.22.1 unless the operator overrides the version.
+// Override env var AGENTMEMORY_III_VERSION points both paths at another pin.
+const USE_DOCKER_REQUESTED =
+  process.env["AGENTMEMORY_USE_DOCKER"] === "1" ||
+  process.env["AGENTMEMORY_USE_DOCKER"] === "true";
 const IIPINNED_VERSION =
-  process.env["AGENTMEMORY_III_VERSION"] || "0.11.2";
+  process.env["AGENTMEMORY_III_VERSION"] ||
+  (USE_DOCKER_REQUESTED ? "0.22.1" : "0.24.0");
+
+// Engine 0.23+ only runs the compose worker model. Auto-enable it for those
+// pins; the explicit env flag lets a 0.22 install test the path early.
+const COMPOSE_MODE =
+  process.env["AGENTMEMORY_III_COMPOSE"] === "true" ||
+  isComposeEngineVersion(IIPINNED_VERSION);
+let engineStartedViaCompose = false;
 
 // Map Node platform/arch → the asset name iii-hq/iii ships under
 // https://github.com/iii-hq/iii/releases/download/iii/v<version>/<asset>
@@ -150,7 +162,7 @@ function iiiReleaseAsset(): string | null {
 function iiiReleaseUrl(): string | null {
   const asset = iiiReleaseAsset();
   if (!asset) return null;
-  // Tag name is monorepo-prefixed: `iii/v0.11.2`. Slash is URL-encoded
+  // Tag name is monorepo-prefixed: `iii/v0.22.1`. Slash is URL-encoded
   // by GitHub when serving the download path, hence `iii/v...` not `iii%2Fv...`.
   return `https://github.com/iii-hq/iii/releases/download/iii/v${IIPINNED_VERSION}/${asset}`;
 }
@@ -204,7 +216,7 @@ Commands:
                      the engine was started natively but state file is missing).
   mcp                Start standalone MCP shim — opt-in surface for MCP-only clients
                      (Cursor, Gemini CLI, etc). REST always available at :3111.
-  import-jsonl [p]   Import Claude Code JSONL transcripts (default: ~/.claude/projects)
+  import-jsonl [p]   Import Claude Code JSONL transcripts (default: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
 
@@ -525,7 +537,7 @@ function whichBinary(name: string): string | null {
 // isolated from a user-managed iii on PATH or in ~/.local/bin. A
 // fresh box with iii 0.16.1 already on PATH refused to boot because the
 // hard-pin enforcer told users to overwrite their global install with
-// v0.11.2. Private install resolves the conflict without touching their
+// the pinned version. Private install resolves the conflict without touching their
 // existing iii.
 function agentmemoryBinDir(): string {
   if (IS_WINDOWS) {
@@ -742,6 +754,8 @@ function engineStateRestPort(state: EngineState): number {
 }
 
 async function startWorkerForEngineState(): Promise<void> {
+  // Compose runs the worker as the app container's scripts.run process.
+  if (engineStartedViaCompose) return;
   const workerPid = readWorkerPidfile();
   if (workerPid && pidAlive(workerPid)) return;
   if (configuredEngineMayStartWorker() && await waitForConfiguredWorker(5000)) {
@@ -1520,16 +1534,57 @@ function prepareEngineLaunch(configPath: string): {
 } {
   const home = homedir();
   const bundledConfig = isBundledConfig(configPath, __dirname);
-  const cwd = resolveEngineCwd(
-    configPath,
-    process.cwd(),
-    home,
-    bundledConfig,
-  );
+  // Engine 0.22 migrates the legacy `workers:` list into a configuration
+  // worker whose storage is cwd-relative (./config). Running every instance
+  // out of ~/.agentmemory made instance 1+ read instance 0's migrated
+  // ports/paths and bind the wrong REST port. Point the engine at its own
+  // data dir so ./config, ./data and friends are instance-scoped.
+  const cwd = bundledConfig
+    ? dataDirResolution.dataDir
+    : resolveEngineCwd(configPath, process.cwd(), home, bundledConfig);
   try {
     mkdirSync(cwd, { recursive: true });
   } catch {
     return { configPath, cwd: process.cwd() };
+  }
+  if (COMPOSE_MODE && bundledConfig) {
+    try {
+      const composePath = join(dataDirResolution.dataDir, "worker-compose.yaml");
+      const composeEnvPath = join(dataDirResolution.dataDir, "compose.env");
+      writeFileSync(
+        composeEnvPath,
+        renderComposeEnv({
+          dataDir: dataDirResolution.dataDir,
+          runtimeDir: dataDirResolution.dataDir,
+          ports: {
+            restPort: getRestPort(),
+            streamPort: getStreamPort(),
+            viewerPort: getConfiguredViewerPort(),
+          },
+        }),
+        "utf-8",
+      );
+      writeFileSync(
+        composePath,
+        renderWorkerCompose({
+          dataDir: dataDirResolution.dataDir,
+          nodeBin: process.execPath,
+          workerEntry: join(__dirname, "index.mjs"),
+          envFile: composeEnvPath,
+          ports: {
+            restPort: getRestPort(),
+            streamPort: getStreamPort(),
+            viewerPort: getConfiguredViewerPort(),
+            enginePort: getEnginePort(),
+          },
+        }),
+        "utf-8",
+      );
+      return { configPath: composePath, cwd: dataDirResolution.dataDir };
+    } catch (err) {
+      vlog(`compose config generation failed, using bundled config: ${String(err)}`);
+      return { configPath, cwd };
+    }
   }
   try {
     const rawConfig = readFileSync(configPath, "utf-8");
@@ -1554,6 +1609,18 @@ function prepareEngineLaunch(configPath: string): {
     const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
     mkdirSync(dirname(runtimePath), { recursive: true });
     writeFileSync(runtimePath, rewritten, "utf-8");
+    if (bundledConfig) {
+      // The engine migrates the legacy worker list into ./config exactly
+      // once; afterwards that store shadows every freshly rendered port and
+      // path. agentmemory owns this directory (runtime overrides live in
+      // .env), so clear it and let the engine re-migrate from the file just
+      // written.
+      try {
+        rmSync(join(cwd, "config"), { recursive: true, force: true });
+      } catch (err) {
+        vlog(`config store reset failed: ${String(err)}`);
+      }
+    }
     if (selectedInstance === 0 && dataDirResolution.source === "default") {
       for (const m of legacyDataMigrations(
         process.cwd(),
@@ -1590,6 +1657,17 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
     configPath: launch.configPath,
     binPath: iiiBin,
   });
+  if (launch.configPath.endsWith("worker-compose.yaml")) {
+    engineStartedViaCompose = true;
+    spawnEngineBackground(
+      iiiBin,
+      ["compose", "--up", "--file", launch.configPath],
+      "iii-compose",
+      launch.cwd,
+    );
+    s.stop(c.ok("iii-compose process started"));
+    return true;
+  }
   spawnEngineBackground(iiiBin, ["--config", launch.configPath], "iii-engine", launch.cwd);
   s.stop(c.ok("iii-engine process started"));
   return true;
@@ -1965,7 +2043,7 @@ function printReadyHint(consoleState: IiiConsoleState): void {
 async function main() {
   await assertRuntimePortOwnership();
   // Booting a second instance next to a live daemon registers a duplicate
-  // worker on the running engine, and on iii 0.11.2 the second instance's
+  // worker on the running engine, and on the pinned engine the second instance's
   // shutdown tears down the daemon's HTTP trigger routing (every
   // /agentmemory/* route 404s until a full engine restart). Refuse instead.
   // A different --instance resolves to a different port, so multi-instance
@@ -2316,7 +2394,7 @@ function findLatestDebugLog(debugDir: string): string | undefined {
 }
 
 function checkClaudeCodeHooks(): CCHooksCheck {
-  const debugDir = join(homedir(), ".claude", "debug");
+  const debugDir = join(claudeConfigDir(), "debug");
   if (!existsSync(debugDir)) return { state: "no-cc-dir" };
 
   const logPath = findLatestDebugLog(debugDir);
@@ -2488,6 +2566,33 @@ function buildDoctorEffects(): DoctorEffects {
     clearEnginePidAndState: () => {
       clearEnginePidfile();
       clearEngineState();
+    },
+    scanStateStore: () =>
+      scanStateStore(join(dataDirResolution.dataDir, "state_store.db")),
+    repairStateStore: async () => {
+      try {
+        const report = repairStateStore(
+          join(dataDirResolution.dataDir, "state_store.db"),
+        );
+        if (report.repaired.length === 0) {
+          return {
+            ok: report.errors.length === 0,
+            message:
+              report.errors.length > 0
+                ? `No files repaired. ${report.errors.join("; ")}`
+                : "No repairable files found (already clean or unparseable).",
+          };
+        }
+        const summary = report.repaired
+          .map((r) => `${r.file} (-${r.removedBytes}B)`)
+          .join(", ");
+        return { ok: true, message: `Truncated ${report.repaired.length} file(s): ${summary}` };
+      } catch (err) {
+        return {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
     },
   };
 }
@@ -3727,7 +3832,9 @@ async function runImportJsonl(): Promise<void> {
   const secret = process.env["AGENTMEMORY_SECRET"];
   if (secret) headers["authorization"] = `Bearer ${secret}`;
 
-  p.log.info(`Importing JSONL from ${pathArg || "~/.claude/projects"}…`);
+  p.log.info(
+    `Importing JSONL from ${pathArg || join(claudeConfigDir(), "projects")}…`,
+  );
   const spinner = p.spinner();
   spinner.start("scanning files");
 
@@ -3802,7 +3909,7 @@ async function runImportJsonl(): Promise<void> {
       if (discovered > upper || json.traversalCapped) {
         p.log.warn(
           `${baseMsg} Tree exceeds the server's --max-files limit of ${upper}; ` +
-            `batch by subdirectory (run import-jsonl once per project under ~/.claude/projects).`,
+            `batch by subdirectory (run import-jsonl once per project under ${join(claudeConfigDir(), "projects")}).`,
         );
       } else {
         const suggested = Math.min(

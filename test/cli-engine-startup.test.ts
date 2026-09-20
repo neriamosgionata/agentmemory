@@ -82,6 +82,10 @@ describe("fresh native engine startup", () => {
       "rewriteBundledConfig(",
     );
     expect(prepareBody).toContain(": renderEngineConfig(rawConfig, options)");
+    // Engine 0.22's configuration worker is cwd-relative, so the engine must
+    // run from its own data dir and the once-migrated store must be reset.
+    expect(prepareBody).toContain("? dataDirResolution.dataDir");
+    expect(prepareBody).toContain('rmSync(join(cwd, "config")');
 
     const workerStart = source.indexOf("async function startWorkerForEngineState");
     const workerEnd = source.indexOf("async function startEngine", workerStart);

@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type {
@@ -12,6 +12,8 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
+
+export const INSIGHT_MAX_SOURCE_IDS = 20;
 
 interface ConceptCluster {
   concepts: string[];
@@ -66,10 +68,11 @@ function buildGraphClusters(
 
   const visited = new Set<string>();
   const clusters: string[][] = [];
-  const conceptNodeIds = new Set(conceptNodes.map((n) => n.id));
+  const nodeById = new Map(conceptNodes.map((n) => [n.id, n]));
 
   for (const seed of sorted) {
-    if (visited.has(seed.id) || clusters.length >= maxClusters) break;
+    if (clusters.length >= maxClusters) break;
+    if (visited.has(seed.id)) continue;
 
     const cluster: string[] = [];
     const queue = [seed.id];
@@ -83,9 +86,9 @@ function buildGraphClusters(
         if (seen.has(current)) continue;
         seen.add(current);
 
-        if (conceptNodeIds.has(current)) {
-          const node = conceptNodes.find((n) => n.id === current);
-          if (node) cluster.push(node.name);
+        const node = nodeById.get(current);
+        if (node) {
+          cluster.push(node.name);
           visited.add(current);
         }
 
@@ -260,12 +263,16 @@ export function registerReflectFunctions(
           const insightRegex =
             /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
           let match;
-          let clusterCount = 0;
+          const parsed: Array<{
+            title: string;
+            content: string;
+            confidence: number;
+          }> = [];
 
           while (
             (match = insightRegex.exec(response)) !== null &&
-            clusterCount < maxInsightsPerCluster &&
-            totalInsights < maxTotal
+            parsed.length < maxInsightsPerCluster &&
+            totalInsights + parsed.length < maxTotal
           ) {
             const parsedConf = parseFloat(match[1]);
             const confidence = Number.isNaN(parsedConf)
@@ -276,37 +283,57 @@ export function registerReflectFunctions(
 
             if (!content) continue;
 
-            const fp = fingerprintId("ins", content.trim().toLowerCase());
-            const existing = await kv.get<Insight>(KV.insights, fp);
+            parsed.push({ title, content, confidence });
+          }
 
-            if (existing && !existing.deleted) {
-              reinforceInsight(existing);
-              await kv.set(KV.insights, existing.id, existing);
+          // One get per insight in parallel, then one batched write pass:
+          // the old sequential get+set per insight is what pushed reflect
+          // past the MCP call timeout on multi-insight clusters. #655
+          const prepared = await Promise.all(
+            parsed.map(async (p) => {
+              const fp = fingerprintId("ins", p.content.toLowerCase());
+              const existing = await kv
+                .get<Insight>(KV.insights, fp)
+                .catch(() => null);
+              return { ...p, fp, existing };
+            }),
+          );
+
+          const writes: Insight[] = [];
+          for (const p of prepared) {
+            if (p.existing && !p.existing.deleted) {
+              reinforceInsight(p.existing);
+              writes.push(p.existing);
               reinforced++;
             } else {
               const now = new Date().toISOString();
-              const insight: Insight = {
-                id: fp,
-                title,
-                content,
-                confidence,
+              writes.push({
+                id: p.fp,
+                title: p.title,
+                content: p.content,
+                confidence: p.confidence,
                 reinforcements: 0,
                 sourceConceptCluster: conceptNames,
-                sourceMemoryIds: cluster.factIds,
-                sourceLessonIds: cluster.lessonIds,
-                sourceCrystalIds: cluster.crystalIds,
+                sourceMemoryIds: (cluster.factIds || []).slice(-INSIGHT_MAX_SOURCE_IDS),
+                sourceLessonIds: (cluster.lessonIds || []).slice(-INSIGHT_MAX_SOURCE_IDS),
+                sourceCrystalIds: (cluster.crystalIds || []).slice(-INSIGHT_MAX_SOURCE_IDS),
                 project: data?.project,
                 tags: conceptNames,
                 createdAt: now,
                 updatedAt: now,
                 decayRate: 0.05,
-              };
-              await kv.set(KV.insights, insight.id, insight);
+              });
               newInsights++;
             }
-
-            clusterCount++;
             totalInsights++;
+          }
+
+          for (let i = 0; i < writes.length; i += 10) {
+            await Promise.all(
+              writes
+                .slice(i, i + 10)
+                .map((insight) => kv.set(KV.insights, insight.id, insight)),
+            );
           }
         } catch {
           continue;

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { claudeConfigDir } from "../../config.js";
 import * as p from "@clack/prompts";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 import {
@@ -18,9 +19,21 @@ import {
   type HookManifest,
 } from "./codex-hooks.js";
 
-const CLAUDE_DIR = join(homedir(), ".claude");
-const CLAUDE_JSON = join(homedir(), ".claude.json");
-const CLAUDE_SETTINGS = join(CLAUDE_DIR, "settings.json");
+// Resolved per call: CLAUDE_CONFIG_DIR can come from ~/.agentmemory/.env,
+// which is hydrated after module load. #1067
+function claudeDir(): string {
+  return claudeConfigDir();
+}
+function claudeSettings(): string {
+  return join(claudeDir(), "settings.json");
+}
+function claudeJson(): string {
+  // Claude Code keeps .claude.json in the config dir when CLAUDE_CONFIG_DIR
+  // is set; the legacy home path applies only to the default layout.
+  return process.env["CLAUDE_CONFIG_DIR"]?.trim()
+    ? join(claudeDir(), ".claude.json")
+    : join(homedir(), ".claude.json");
+}
 
 type ClaudeMcpEntry = typeof AGENTMEMORY_MCP_BLOCK;
 type ClaudeConfig = {
@@ -45,10 +58,12 @@ export const adapter: ConnectAdapter = {
     "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it.",
 
   detect(): boolean {
-    return existsSync(CLAUDE_DIR);
+    return existsSync(claudeDir());
   },
 
   async install(opts: ConnectOptions): Promise<ConnectResult> {
+    const CLAUDE_DIR = claudeDir();
+    const CLAUDE_JSON = claudeJson();
     const existing = readJsonSafe<ClaudeConfig>(CLAUDE_JSON);
     const next: ClaudeConfig = existing ? { ...existing } : {};
     const servers: Record<string, ClaudeMcpEntry> = {
@@ -141,6 +156,8 @@ function installClaudeHooks(opts: ConnectOptions): ConnectResult {
   }
 
   type ClaudeSettings = { hooks?: HookManifest["hooks"]; [key: string]: unknown };
+  const CLAUDE_DIR = claudeDir();
+  const CLAUDE_SETTINGS = claudeSettings();
   const existing = readJsonSafe<ClaudeSettings>(CLAUDE_SETTINGS) ?? {};
   const existingHooks: HookManifest | null = existing.hooks
     ? { hooks: existing.hooks }

@@ -1,9 +1,21 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import type { Action, ActionEdge } from "../types.js";
 import { recordAudit } from "./audit.js";
+
+// Actions written through curl / REST could carry tags as a CSV string even
+// though the model says string[]. Store one shape: the viewer crashed on
+// `(a.tags || []).join(...)` when a string slipped through. #906
+function normalizeTags(raw: unknown): string[] {
+  const list = Array.isArray(raw)
+    ? raw.filter((t): t is string => typeof t === "string")
+    : typeof raw === "string"
+      ? raw.split(",")
+      : [];
+  return list.map((t) => t.trim()).filter(Boolean);
+}
 
 export function registerActionsFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::action-create", 
@@ -35,7 +47,7 @@ export function registerActionsFunction(sdk: ISdk, kv: StateKV): void {
           updatedAt: now,
           createdBy: data.createdBy || "unknown",
           project: data.project,
-          tags: data.tags || [],
+          tags: normalizeTags(data.tags),
           sourceObservationIds: data.sourceObservationIds || [],
           sourceMemoryIds: data.sourceMemoryIds || [],
           parentId: data.parentId,
@@ -127,7 +139,7 @@ export function registerActionsFunction(sdk: ISdk, kv: StateKV): void {
           action.priority = Math.max(1, Math.min(10, data.priority));
         if (data.assignedTo !== undefined) action.assignedTo = data.assignedTo;
         if (data.result !== undefined) action.result = data.result;
-        if (data.tags !== undefined) action.tags = data.tags;
+        if (data.tags !== undefined) action.tags = normalizeTags(data.tags);
         action.updatedAt = new Date().toISOString();
 
         await kv.set(KV.actions, action.id, action);

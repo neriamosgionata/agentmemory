@@ -1,4 +1,4 @@
-import { registerWorker, TriggerAction } from "iii-sdk";
+import { registerWorker, TriggerAction } from "./iii.js";
 import {
   hydrateProcessEnvFromFile,
   loadConfig,
@@ -32,6 +32,7 @@ import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
 import { registerDiskSizeManager } from "./functions/disk-size-manager.js";
 import { registerCompressFunction } from "./functions/compress.js";
+import { registerRecompressFunction } from "./functions/recompress.js";
 import {
   registerSearchFunction,
   rebuildIndex,
@@ -242,6 +243,7 @@ async function main() {
   }
   registerDiskSizeManager(sdk, kv);
   registerCompressFunction(sdk, kv, provider, metricsStore);
+  registerRecompressFunction(sdk, kv);
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
@@ -420,6 +422,20 @@ async function main() {
     // anything and recall degrades without an error. Walk every stored
     // vector instead of trusting the first; refuse to load if anything
     // is off.
+    // #1373: an untabled model starts on a guessed width. Probe once before
+    // comparing against the persisted index, otherwise the mismatch guard
+    // would refuse to start (or discard a perfectly good index) purely
+    // because the guess was wrong.
+    if (embeddingProvider?.dimensionsInferred && embeddingProvider.probeDimensions) {
+      try {
+        const detected = await embeddingProvider.probeDimensions();
+        bootLog(`Detected embedding dimensions: ${detected}`);
+      } catch (err) {
+        console.warn(
+          `[agentmemory] Embedding dimension probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     const activeDim = embeddingProvider?.dimensions ?? 0;
     const { mismatches, seenDimensions } =
       activeDim > 0
@@ -464,7 +480,52 @@ async function main() {
     }
   }
 
-  const needsRebuild = bm25Index.size === 0;
+  // A vector load that rejected every bucket it read is the one failure BM25
+  // cannot stand in for: BM25 restores fine, so the store looks healthy, while
+  // the vectors sit on disk unreadable and nothing re-reads them. Rebuilding is
+  // the only exit. Kept off `vectorIndex.size === 0`, which is also the ordinary
+  // state of a store whose vectors were simply never written.
+  //
+  // #1372 residual: a partial vector loss (some buckets dropped by a torn
+  // save, or a provider switch that only rejected some records) leaves BM25
+  // healthy and the load "successful", so neither old gate fires. Rebuild when
+  // the restored vector coverage is far below BM25 with a provider active. One
+  // attempt per provider identity: the marker stops a store whose provider
+  // rejects every embed from re-embedding the whole corpus on every boot.
+  const VECTOR_REBUILD_MARKER_KEY = "vectors:rebuild-marker";
+  let vectorCoverageRebuild = false;
+  if (
+    loaded?.vector &&
+    vectorIndex !== null &&
+    embeddingProvider &&
+    bm25Index.size > 0 &&
+    loaded.vector.size < bm25Index.size * 0.5
+  ) {
+    const providerKey = `${embeddingProvider.name}:${embeddingProvider.dimensions}`;
+    const marker = await kv
+      .get<{ provider?: string }>(KV.bm25Index, VECTOR_REBUILD_MARKER_KEY)
+      .catch(() => null);
+    if (marker?.provider !== providerKey) {
+      vectorCoverageRebuild = true;
+      await kv
+        .set(KV.bm25Index, VECTOR_REBUILD_MARKER_KEY, {
+          provider: providerKey,
+          bm25: bm25Index.size,
+          vector: loaded.vector.size,
+          attemptedAt: new Date().toISOString(),
+        })
+        .catch(() => undefined);
+      console.warn(
+        `[agentmemory] Vector index covers ${loaded.vector.size} of ${bm25Index.size} ` +
+          `BM25 entries for provider ${providerKey} — rebuilding once.`,
+      );
+    }
+  }
+
+  const needsRebuild =
+    bm25Index.size === 0 ||
+    (vectorIndex !== null && loaded?.vectorRejected === true) ||
+    vectorCoverageRebuild;
 
   if (needsRebuild) {
     // Fire-and-forget. rebuildIndex iterates every observation across
@@ -536,7 +597,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 131 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

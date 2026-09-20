@@ -16,6 +16,8 @@
 //   agentmemory doctor --all       # apply every available fix without prompting (CI)
 //   agentmemory doctor --dry-run   # show what each fix WOULD do; execute nothing
 
+import type { StoreScanReport } from "../state/store-repair.js";
+
 export type DiagnosticStatus = {
   ok: boolean;
   /** Short status detail (one line). Shown alongside the check name. */
@@ -38,7 +40,7 @@ export type DoctorContext = {
   pidfilePath: string;
   /** Path to ~/.agentmemory/engine-state.json */
   enginePath: string;
-  /** Pinned engine version (e.g. "0.11.2"). */
+  /** Pinned engine version (e.g. "0.22.1"). */
   pinnedVersion: string;
 };
 
@@ -68,6 +70,7 @@ export const DIAGNOSTIC_IDS = [
   "stale-pidfile",
   "env-placeholder-keys",
   "iii-on-path-not-local-bin",
+  "state-store-corruption",
 ] as const;
 
 export type DiagnosticId = (typeof DIAGNOSTIC_IDS)[number];
@@ -175,6 +178,10 @@ export type DoctorEffects = {
   runStart: () => Promise<DiagnosticFixResult>;
   /** Clear pidfile + engine-state. */
   clearEnginePidAndState: () => void;
+  /** Inspect state_store.db scope files for trailing garbage. */
+  scanStateStore: () => StoreScanReport;
+  /** Truncate trailing garbage from suspicious scope files. */
+  repairStateStore: () => Promise<DiagnosticFixResult>;
 };
 
 export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
@@ -223,12 +230,31 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         "use a different worker model. Running a mismatched binary surfaces as EPIPE " +
         "reconnect loops and empty search results.",
       check: async (ctx) => {
+        // The runtime prefers the private pinned binary over PATH, so a PATH
+        // binary with the wrong version is not a failure when the private pin
+        // exists — the old check failed forever after its own fix. #874/#875
+        const localBin = effects.localBinIiiPath();
+        const localVersion = localBin
+          ? effects.iiiBinaryVersion(localBin)
+          : null;
+        const localPinned = localVersion === ctx.pinnedVersion;
         const bin = effects.findIiiBinary();
-        if (!bin) return { ok: false, detail: "iii not on PATH" };
+        if (!bin) {
+          return localPinned
+            ? { ok: true, detail: `using private pin ${localVersion}` }
+            : { ok: false, detail: "iii not on PATH" };
+        }
         const v = effects.iiiBinaryVersion(bin);
+        if (v === ctx.pinnedVersion) return { ok: true, detail: v };
+        if (localPinned) {
+          return {
+            ok: true,
+            detail: `PATH has ${v ?? "unknown"}; runtime uses private pin ${localVersion}`,
+          };
+        }
         if (!v) return { ok: false, detail: "iii on PATH but --version failed" };
         return {
-          ok: v === ctx.pinnedVersion,
+          ok: false,
           detail: `${v} (pinned ${ctx.pinnedVersion})`,
         };
       },
@@ -316,15 +342,22 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         "user-managed iii on PATH (homebrew, cargo, manual install) stays untouched. " +
         "When agentmemory needs the pin and PATH doesn't have it, it falls back to the " +
         "private install. If neither exists, run the installer.",
-      manualOnly: true,
       check: async () => {
         const bin = effects.findIiiBinary();
         if (!bin) return { ok: true, detail: "iii not on PATH (handled elsewhere)" };
         const localBin = effects.localBinIiiPath();
-        return {
-          ok: bin === localBin,
-          detail: bin === localBin ? undefined : `iii at: ${bin}`,
-        };
+        if (bin === localBin) return { ok: true };
+        // A different PATH binary is fine as long as the private pin exists:
+        // the runtime uses the pin, and this check exists to confirm the
+        // engine is covered — not to force PATH to match. #874
+        const hasPrivatePin =
+          localBin != null && effects.iiiBinaryVersion(localBin) !== null;
+        return hasPrivatePin
+          ? {
+              ok: true,
+              detail: "private pin present; PATH iii left untouched",
+            }
+          : { ok: false, detail: `iii at: ${bin}` };
       },
       fix: async () =>
         effects.runIiiInstaller().then((r) => ({
@@ -333,6 +366,48 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
             r.message ??
             "Installer wrote to ~/.agentmemory/bin/iii. Your PATH wasn't modified.",
         })),
+    },
+    {
+      id: "state-store-corruption",
+      message:
+        "State store has scope files with trailing garbage after their JSON body.",
+      fixPreview:
+        "Stop the engine, truncate the garbage bytes, restart. No records are deleted.",
+      moreInfo:
+        "The file_based KV adapter can append a few non-JSON bytes after the final " +
+        "token of a scope file (#1364). A strict whole-file parse then fails, so every " +
+        "read of that scope returns 'Invocation stopped' while sibling scopes stay " +
+        "healthy. The fix truncates each file back to its last complete JSON value; " +
+        "the engine is restarted because it serves reads from its in-memory copy.",
+      check: async () => {
+        const scan = effects.scanStateStore();
+        if (scan.errors.length > 0 && scan.scanned === 0) {
+          return { ok: true, detail: `scan skipped: ${scan.errors[0]}` };
+        }
+        return {
+          ok: scan.suspicious.length === 0,
+          detail:
+            scan.suspicious.length === 0
+              ? `${scan.scanned} scope file(s) clean`
+              : `${scan.suspicious.length} suspect: ${scan.suspicious.slice(0, 3).join(", ")}`,
+        };
+      },
+      fix: async () => {
+        const stopped = await effects.runStop();
+        if (!stopped.ok) {
+          return {
+            ok: false,
+            message: `Engine could not be stopped; refusing to truncate live files. ${stopped.message ?? ""}`.trim(),
+          };
+        }
+        const repaired = await effects.repairStateStore();
+        if (!repaired.ok) return repaired;
+        const started = await effects.runStart();
+        return {
+          ok: started.ok,
+          message: `${repaired.message ?? "Repair finished."} ${started.message ?? ""}`.trim(),
+        };
+      },
     },
   ];
 }

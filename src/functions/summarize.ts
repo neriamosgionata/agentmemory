@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type {
   CompressedObservation,
   SessionSummary,
@@ -105,6 +105,7 @@ async function produceSummaryXml(
   mode: "single" | "chunked";
   chunks: number;
   skipped?: number;
+  partialConcepts?: string[];
 }> {
   const chunkSize = getChunkSize();
   if (compressed.length <= chunkSize) {
@@ -165,6 +166,13 @@ async function produceSummaryXml(
     });
   }
 
+  // #1114: the reduce prompt used to carry each chunk's concepts verbatim, so
+  // duplicates across chunks survived into the merged summary and an LLM that
+  // emitted an empty <concepts> block silently erased them. Dedupe the input
+  // and keep the union as a fallback for the parsed result.
+  const partialConcepts = dedupeConcepts(
+    partials.flatMap((p) => p.concepts ?? []),
+  );
   const reduceInput = partials.map((p) => {
     const originalIdx = partialByIdx.indexOf(p);
     return {
@@ -172,7 +180,7 @@ async function produceSummaryXml(
       narrative: p.narrative,
       keyDecisions: p.keyDecisions,
       filesModified: p.filesModified,
-      concepts: p.concepts,
+      concepts: dedupeConcepts(p.concepts ?? []),
       obsRangeStart: originalIdx * chunkSize + 1,
       obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
     };
@@ -181,7 +189,27 @@ async function produceSummaryXml(
     REDUCE_SYSTEM,
     buildReducePrompt(reduceInput),
   );
-  return { response, mode: "chunked", chunks: chunks.length, skipped };
+  return {
+    response,
+    mode: "chunked",
+    chunks: chunks.length,
+    skipped,
+    partialConcepts,
+  };
+}
+
+function dedupeConcepts(concepts: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const concept of concepts) {
+    const trimmed = concept.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 // #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
@@ -233,7 +261,7 @@ export function registerSummarizeFunction(
   metricsStore?: MetricsStore,
 ): void {
   sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+    async (data: { sessionId: string; force?: boolean } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
@@ -260,7 +288,36 @@ export function registerSummarizeFunction(
         return { success: false, error: "no_observations" };
       }
 
-      if (provider.name === "noop") {
+      // #1244: session stop fires on every turn, so the same session was
+      // re-summarised hundreds of times (954x on one reported session) for
+      // no new material. Skip when a summary already covers the current
+      // observation count; `force: true` re-runs on demand.
+      if (data.force !== true) {
+        const existing = await kv
+          .get<SessionSummary>(KV.summaries, sessionId)
+          .catch(() => null);
+        if (
+          existing &&
+          typeof existing.title === "string" &&
+          existing.title.length > 0 &&
+          (existing.observationCount ?? 0) >= compressed.length
+        ) {
+          logger.info("Summarize skipped — summary already covers session", {
+            sessionId,
+            summarizedObservations: existing.observationCount,
+            currentObservations: compressed.length,
+          });
+          return {
+            success: true,
+            skipped: "already_summarized",
+            summary: existing,
+          };
+        }
+      }
+
+      // createProvider() wraps every base provider ("resilient(noop)"), so
+      // an exact name match never fires; match by substring as graph.ts does.
+      if (provider.name.includes("noop")) {
         logger.info("Summarize skipped — no LLM provider configured", {
           sessionId,
         });
@@ -282,6 +339,7 @@ export function registerSummarizeFunction(
         let response = "";
         let mode = "single";
         let chunks = 1;
+        let partialConcepts: string[] = [];
         for (let attempt = 1; attempt <= 2; attempt++) {
           const produced = await produceSummaryXml(
             provider,
@@ -292,6 +350,7 @@ export function registerSummarizeFunction(
           response = produced.response;
           mode = produced.mode;
           chunks = produced.chunks;
+          partialConcepts = produced.partialConcepts ?? [];
           if (!response || !response.trim()) {
             logger.warn("Empty provider response on summarize", {
               sessionId,
@@ -309,7 +368,38 @@ export function registerSummarizeFunction(
             session.project,
             compressed.length,
           );
-          if (summary) break;
+          if (summary) {
+            // #1114: keep the union of chunk concepts so a reduce pass that
+            // emitted an empty <concepts> block (or dropped some) cannot
+            // erase them, and duplicates never reach the stored summary.
+            summary.concepts = dedupeConcepts([
+              ...summary.concepts,
+              ...partialConcepts,
+            ]);
+            // #1240: a schema failure (e.g. narrative under the length floor)
+            // used to end the call after one attempt, so the retry loop never
+            // saw it. Validate inside the loop and let attempt 2 fix it.
+            const candidate = {
+              title: summary.title,
+              narrative: summary.narrative,
+              keyDecisions: summary.keyDecisions,
+              filesModified: summary.filesModified,
+              concepts: summary.concepts,
+            };
+            const attemptValidation = validateOutput(
+              SummaryOutputSchema,
+              candidate,
+              "mem::summarize",
+            );
+            if (attemptValidation.valid) break;
+            logger.warn("Summary validation failed", {
+              sessionId,
+              attempt,
+              errors: attemptValidation.result.errors,
+            });
+            summary = null;
+            continue;
+          }
           logger.warn("Failed to parse summary XML", { sessionId, attempt });
         }
 

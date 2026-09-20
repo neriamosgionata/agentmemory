@@ -18,7 +18,7 @@ vi.mock("../src/eval/schemas.js", () => ({
 }));
 
 vi.mock("../src/eval/validator.js", () => ({
-  validateOutput: () => ({ valid: true, result: { errors: [] } }),
+  validateOutput: vi.fn(() => ({ valid: true, result: { errors: [] } })),
 }));
 
 vi.mock("../src/eval/quality.js", () => ({
@@ -30,6 +30,8 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import { validateOutput } from "../src/eval/validator.js";
+import { createProvider } from "../src/providers/index.js";
 import type {
   CompressedObservation,
   Session,
@@ -146,6 +148,91 @@ async function setupHandler(opts: {
   return { handler, kv };
 }
 
+describe("mem::summarize schema retry (#1240)", () => {
+  it("retries once when the parsed summary fails schema validation", async () => {
+    (validateOutput as unknown as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => ({
+        valid: false,
+        result: { errors: ["narrative: Too small"] },
+      }));
+    const provider = makeProvider([
+      summaryXml({ title: "Too short", narrative: "tiny" }),
+      summaryXml({
+        title: "Recovered",
+        narrative: "A sufficiently detailed retry narrative.",
+      }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_retry",
+      obsCount: 5,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_retry" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(2);
+    const stored: any = await kv.get("summaries", "ses_retry");
+    expect(stored?.title).toBe("Recovered");
+  });
+});
+
+describe("mem::summarize no-op on unchanged sessions (#1244)", () => {
+  it("skips when an existing summary already covers the observation count", async () => {
+    const provider = makeProvider([summaryXml({ title: "Fresh" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_done",
+      obsCount: 5,
+      provider,
+    });
+    await kv.set("summaries", "ses_done", {
+      sessionId: "ses_done",
+      project: "test-project",
+      createdAt: "2026-09-01T00:00:00Z",
+      title: "Already summarized",
+      narrative: "An existing narrative that is long enough.",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 5,
+    });
+
+    const result: any = await handler({ sessionId: "ses_done" });
+
+    expect(result.success).toBe(true);
+    expect(result.skipped).toBe("already_summarized");
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  it("re-runs when new observations arrived or force is set", async () => {
+    const provider = makeProvider([summaryXml({ title: "Refreshed" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_grow",
+      obsCount: 5,
+      provider,
+    });
+    await kv.set("summaries", "ses_grow", {
+      sessionId: "ses_grow",
+      project: "test-project",
+      createdAt: "2026-09-01T00:00:00Z",
+      title: "Stale summary",
+      narrative: "An existing narrative that is long enough.",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 4,
+    });
+
+    const grown: any = await handler({ sessionId: "ses_grow" });
+    expect(grown.success).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+
+    const forced: any = await handler({ sessionId: "ses_grow", force: true });
+    expect(forced.success).toBe(true);
+    expect(provider.calls).toHaveLength(2);
+  });
+});
+
 describe("mem::summarize chunking", () => {
   const ORIGINAL_ENV = { ...process.env };
 
@@ -220,6 +307,27 @@ describe("mem::summarize chunking", () => {
     // not just the final chunk.
     expect(stored?.observationCount).toBe(250);
     expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
+  });
+
+  it("merges chunk concepts: dedupes and survives an empty reduce concepts block (#1114)", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1", concepts: ["auth", "jwt"] }),
+      summaryXml({ title: "Chunk 2", concepts: ["JWT", "tokens"] }),
+      summaryXml({ title: "Merged", concepts: [] }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_concepts",
+      obsCount: 250,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_concepts" });
+
+    expect(result.success).toBe(true);
+    const stored: any = await kv.get("summaries", "ses_concepts");
+    expect(stored?.concepts).toEqual(["auth", "jwt", "tokens"]);
   });
 
   it("SUMMARIZE_CHUNK_SIZE env override is respected", async () => {
@@ -478,5 +586,67 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("parse_failed");
+  });
+});
+
+describe("mem::summarize noop gate", () => {
+  it("skips the LLM pipeline when the configured provider is noop", async () => {
+    const provider = createProvider({
+      provider: "noop",
+      model: "noop",
+      maxTokens: 4096,
+    });
+    const summarizeSpy = vi.spyOn(provider, "summarize");
+    const { handler } = await setupHandler({
+      sessionId: "ses_noop",
+      obsCount: 5,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_noop" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("no_provider");
+    expect(summarizeSpy).not.toHaveBeenCalled();
+  });
+
+  it("wrapped noop provider (name 'resilient(noop)') short-circuits to no_provider without calling the provider", async () => {
+    const summarizeSpy = vi.fn(async () => "");
+    const provider = {
+      name: "resilient(noop)",
+      compress: async () => "",
+      summarize: summarizeSpy,
+    } as unknown as MemoryProvider;
+    const { handler } = await setupHandler({
+      sessionId: "ses_noop_wrapped",
+      obsCount: 3,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_noop_wrapped" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("no_provider");
+    expect(summarizeSpy).not.toHaveBeenCalled();
+  });
+
+  it("bare noop provider short-circuits to no_provider", async () => {
+    const summarizeSpy = vi.fn(async () => "");
+    const provider = {
+      name: "noop",
+      compress: async () => "",
+      summarize: summarizeSpy,
+    } as unknown as MemoryProvider;
+    const { handler } = await setupHandler({
+      sessionId: "ses_noop_bare",
+      obsCount: 3,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_noop_bare" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("no_provider");
+    expect(summarizeSpy).not.toHaveBeenCalled();
   });
 });

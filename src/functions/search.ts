@@ -1,4 +1,4 @@
-import type { ISdk } from 'iii-sdk'
+import type { ISdk } from "../iii.js"
 import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, Session } from '../types.js'
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
@@ -78,15 +78,33 @@ export function vectorIndexRemove(id: string): void {
 let indexPersistence: {
   scheduleSave: () => void;
   save: () => Promise<void>;
+  runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
 } | null = null;
 
 export function setIndexPersistence(
-  p: { scheduleSave: () => void; save: () => Promise<void> } | null,
+  p: {
+    scheduleSave: () => void;
+    save: () => Promise<void>;
+    runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
+  } | null,
 ): void {
   indexPersistence = p;
 }
 
+/**
+ * True while a full rebuild is clearing/refilling the indexes. Persistence
+ * triggered from delete paths must not serialize the half-built state, and
+ * must not block the delete for the (potentially hours-long) rebuild.
+ * rebuildIndex schedules a save once it finishes, so nothing is lost.
+ */
+let rebuildInFlight = false;
+
+export function isIndexRebuildInFlight(): boolean {
+  return rebuildInFlight;
+}
+
 export function scheduleIndexSave(): void {
+  if (rebuildInFlight) return;
   indexPersistence?.scheduleSave();
 }
 
@@ -100,6 +118,7 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
+  if (rebuildInFlight) return;
   await indexPersistence?.save();
 }
 
@@ -309,6 +328,24 @@ export async function indexRecords(
 }
 
 export async function rebuildIndex(kv: StateKV): Promise<number> {
+  const run = async (): Promise<number> => {
+    rebuildInFlight = true;
+    try {
+      return await rebuildIndexUnlocked(kv);
+    } finally {
+      rebuildInFlight = false;
+      // Publish the rebuilt index once, after the exclusive slot, instead of
+      // racing a debounce flush against the in-place clear/refill.
+      indexPersistence?.scheduleSave();
+    }
+  };
+  // Call as a method so `this` is the persistence instance; a bare method
+  // reference throws on the first this.saveQueue access.
+  if (!indexPersistence?.runExclusive) return run();
+  return indexPersistence.runExclusive(run);
+}
+
+async function rebuildIndexUnlocked(kv: StateKV): Promise<number> {
   const idx = getSearchIndex()
   idx.clear()
   memoryIndexReady = false
@@ -609,23 +646,125 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       const estimateTokens = (value: unknown): number =>
         Math.max(1, Math.ceil(JSON.stringify(value).length / 3))
 
-      const applyTokenBudget = <T>(items: T[]): {
+      const applyTokenBudget = <T>(
+        items: T[],
+        clipToBudget: (item: T, budget: number) => T | null,
+      ): {
         items: T[]
         used: number
         truncated: boolean
+        excluded: number
       } => {
-        if (!tokenBudget) return { items, used: items.reduce((sum, item) => sum + estimateTokens(item), 0), truncated: false }
+        if (!tokenBudget) {
+          return {
+            items,
+            used: items.reduce((sum, item) => sum + estimateTokens(item), 0),
+            truncated: false,
+            excluded: 0,
+          }
+        }
         const selected: T[] = []
         let used = 0
         for (const item of items) {
           const itemTokens = estimateTokens(item)
-          if (used + itemTokens > tokenBudget) {
-            return { items: selected, used, truncated: selected.length < items.length }
+          if (used + itemTokens <= tokenBudget) {
+            selected.push(item)
+            used += itemTokens
+            continue
           }
-          selected.push(item)
-          used += itemTokens
+          if (selected.length === 0) {
+            const clipped = clipToBudget(item, tokenBudget)
+            if (clipped) {
+              selected.push(clipped)
+              used += estimateTokens(clipped)
+              continue
+            }
+          }
+          return {
+            items: selected,
+            used,
+            truncated: selected.length < items.length,
+            excluded: items.length - selected.length,
+          }
         }
-        return { items: selected, used, truncated: false }
+        return { items: selected, used, truncated: false, excluded: 0 }
+      }
+
+      const clipTextFields = <T>(
+        item: T,
+        budget: number,
+        textFields: string[],
+      ): T | null => {
+        const shrink = (scale: number): T => {
+          const clipped: Record<string, unknown> = {
+            ...(item as Record<string, unknown>),
+          }
+          for (const field of textFields) {
+            const value = clipped[field]
+            if (typeof value === 'string') {
+              clipped[field] = value.slice(0, Math.floor(value.length * scale))
+            }
+          }
+          clipped.content_truncated = true
+          return clipped as T
+        }
+        let scale = 0.5
+        for (let pass = 0; pass < 12; pass++) {
+          const candidate = shrink(scale)
+          if (estimateTokens(candidate) <= budget) return candidate
+          scale *= 0.5
+        }
+        const candidate = shrink(0)
+        return estimateTokens(candidate) <= budget ? candidate : null
+      }
+
+      const clipFullResult = (
+        result: SearchResult,
+        budget: number,
+      ): SearchResult | null => {
+        const clipAt = (
+          narrativeScale: number,
+          factsScale: number,
+        ): SearchResult => ({
+          ...result,
+          observation: {
+            ...result.observation,
+            narrative: result.observation.narrative.slice(
+              0,
+              Math.floor(
+                result.observation.narrative.length * narrativeScale,
+              ),
+            ),
+            facts: result.observation.facts.map((fact) =>
+              fact.slice(0, Math.floor(fact.length * factsScale)),
+            ),
+          },
+          content_truncated: true,
+        })
+
+        let scale = 0.5
+        const factsFit = clipAt(0, 1)
+        if (estimateTokens(factsFit) <= budget) {
+          for (let pass = 0; pass < 12; pass++) {
+            const candidate = clipAt(scale, 1)
+            if (estimateTokens(candidate) <= budget) return candidate
+            scale *= 0.5
+          }
+          return factsFit
+        }
+
+        scale = 0.5
+        for (let pass = 0; pass < 12; pass++) {
+          const candidate = clipAt(0, scale)
+          if (estimateTokens(candidate) <= budget) return candidate
+          scale *= 0.5
+        }
+        const candidate: SearchResult = {
+          ...result,
+          observation: { ...result.observation, narrative: '', facts: [] },
+          content_truncated: true,
+        }
+        return estimateTokens(candidate) <= budget ? candidate : null
       }
 
       if (format === 'compact') {
@@ -637,13 +776,17 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           score: r.score,
           timestamp: r.observation.timestamp,
         }))
-        const packed = applyTokenBudget(compactResults)
+        const packed = applyTokenBudget(
+          compactResults,
+          (item, budget) => clipTextFields(item, budget, ['title']),
+        )
         return {
           format,
           results: packed.items,
           tokens_used: packed.used,
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
+          ...(packed.excluded > 0 ? { excluded_by_budget: packed.excluded } : {}),
         }
       }
 
@@ -656,7 +799,10 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           score: r.score,
           timestamp: r.observation.timestamp,
         }))
-        const packed = applyTokenBudget(narrativeResults)
+        const packed = applyTokenBudget(
+          narrativeResults,
+          (item, budget) => clipTextFields(item, budget, ['narrative']),
+        )
         const text = packed.items
           .map((r, index) => `${index + 1}. ${r.title}\n${r.narrative}`)
           .join('\n\n')
@@ -667,10 +813,13 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           tokens_used: packed.used,
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
+          ...(packed.excluded > 0 ? { excluded_by_budget: packed.excluded } : {}),
         }
       }
 
-      const packed = applyTokenBudget(enriched)
+      const packed = applyTokenBudget(enriched, (item, budget) =>
+        clipFullResult(item, budget),
+      )
 
       // Avoid logging raw cwd/project (host paths). Log only that filters were active.
       logger.info('Search completed', {
@@ -685,6 +834,7 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
         tokens_used: packed.used,
         tokens_budget: tokenBudget,
         truncated: packed.truncated,
+        ...(packed.excluded > 0 ? { excluded_by_budget: packed.excluded } : {}),
       }
     }
   )

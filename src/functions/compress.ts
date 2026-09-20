@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type ISdk } from "../iii.js";
 import { readFileSync } from "node:fs";
 import { isManagedImagePath } from "../utils/image-store.js";
 import type {
@@ -15,11 +15,12 @@ import {
 } from "../prompts/compression.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
+import { buildSyntheticCompression } from "./compress-synthetic.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
 
@@ -40,6 +41,24 @@ const VALID_TYPES = new Set<string>([
   "image",
   "other",
 ]);
+
+// #1270: does the raw payload carry anything a compressor could work with?
+function hasCompressionContent(raw: RawObservation): boolean {
+  const present = (value: unknown): boolean => {
+    if (value === null || value === undefined) return false;
+    if (typeof value === "string") return value.trim().length > 0;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === "object") return Object.keys(value).length > 0;
+    return true;
+  };
+  return (
+    present(raw.toolInput) ||
+    present(raw.toolOutput) ||
+    present(raw.userPrompt) ||
+    present(raw.assistantResponse) ||
+    present(raw.imageData)
+  );
+}
 
 function parseCompressionXml(
   xml: string,
@@ -120,41 +139,86 @@ export function registerCompressFunction(
       });
 
       try {
-        const validator = (response: string) => {
-          const parsed = parseCompressionXml(response);
-          if (!parsed) return { valid: false, errors: ["xml_parse_failed"] };
-          const result = validateOutput(
-            CompressOutputSchema,
-            parsed,
-            "mem::compress",
-          );
-          return result.valid
-            ? { valid: true }
-            : { valid: false, errors: result.result.errors };
-        };
+        // #1270: a payload with no tool input/output, prompt or assistant
+        // response carries nothing to compress. Calling the provider anyway
+        // burned an LLM request per content-free observation. Go straight to
+        // the zero-LLM synthetic compression instead.
+        let parsed:
+          | Omit<CompressedObservation, "id" | "sessionId" | "timestamp">
+          | null = null;
+        let retried = false;
+        let qualityScoreOverride: number | null = null;
 
-        const { response, retried } = await compressWithRetry(
-          provider,
-          COMPRESSION_SYSTEM,
-          prompt,
-          validator,
-          1,
-        );
-
-        const parsed = parseCompressionXml(response);
-        if (!parsed) {
-          const latencyMs = Date.now() - startMs;
-          if (metricsStore) {
-            await metricsStore.record("mem::compress", latencyMs, false);
-          }
-          logger.warn("Failed to parse compression XML", {
-            obsId: data.observationId,
-            retried,
+        if (!hasCompressionContent(data.raw)) {
+          const synthetic = buildSyntheticCompression({
+            ...data.raw,
+            id: data.observationId,
           });
-          return { success: false, error: "parse_failed" };
+          parsed = {
+            type: synthetic.type,
+            title: synthetic.title,
+            subtitle: synthetic.subtitle,
+            facts: synthetic.facts,
+            narrative: synthetic.narrative,
+            concepts: synthetic.concepts,
+            files: synthetic.files,
+            importance: synthetic.importance,
+          };
+          qualityScoreOverride = Math.round((synthetic.confidence ?? 0.3) * 100);
+          logger.info("Compression skipped — no compressible content", {
+            obsId: data.observationId,
+            hookType: data.raw.hookType,
+          });
+        } else {
+          const validator = (response: string) => {
+            const candidate = parseCompressionXml(response);
+            if (!candidate) return { valid: false, errors: ["xml_parse_failed"] };
+            const result = validateOutput(
+              CompressOutputSchema,
+              candidate,
+              "mem::compress",
+            );
+            return result.valid
+              ? { valid: true }
+              : { valid: false, errors: result.result.errors };
+          };
+
+          const attempt = await compressWithRetry(
+            provider,
+            COMPRESSION_SYSTEM,
+            prompt,
+            validator,
+            1,
+          );
+          retried = attempt.retried;
+
+          if (!attempt.valid) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::compress", latencyMs, false);
+            }
+            logger.warn("Compression response failed validation after retry", {
+              obsId: data.observationId,
+              retried,
+            });
+            return { success: false, error: "validation_failed" };
+          }
+
+          parsed = parseCompressionXml(attempt.response);
+          if (!parsed) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::compress", latencyMs, false);
+            }
+            logger.warn("Failed to parse compression XML", {
+              obsId: data.observationId,
+              retried,
+            });
+            return { success: false, error: "parse_failed" };
+          }
         }
 
-        const qualityScore = scoreCompression(parsed);
+        const qualityScore = qualityScoreOverride ?? scoreCompression(parsed);
 
         const compressed: CompressedObservation = {
           id: data.observationId,
@@ -192,6 +256,7 @@ export function registerCompressFunction(
           compressed.title + " " + (compressed.narrative || ""),
           { kind: "observation", logId: compressed.id },
         );
+        scheduleIndexSave();
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({

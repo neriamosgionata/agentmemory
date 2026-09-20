@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii.js";
 import type {
   SemanticMemory,
   ProceduralMemory,
@@ -87,21 +87,24 @@ export function registerConsolidationPipelineFunction(
             let match;
             let newFacts = 0;
             const now = new Date().toISOString();
+            const factMap = new Map(
+              existingSemantic.map((s) => [s.fact.toLowerCase(), s]),
+            );
+            const toWrite: SemanticMemory[] = [];
 
             while ((match = factRegex.exec(response)) !== null) {
               const parsedConf = parseFloat(match[1]);
               const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
               const fact = match[2].trim();
+              const key = fact.toLowerCase();
 
-              const existing = existingSemantic.find(
-                (s) => s.fact.toLowerCase() === fact.toLowerCase(),
-              );
+              const existing = factMap.get(key);
               if (existing) {
                 existing.accessCount++;
                 existing.lastAccessedAt = now;
                 existing.updatedAt = now;
                 existing.confidence = Math.max(existing.confidence, confidence);
-                await kv.set(KV.semantic, existing.id, existing);
+                toWrite.push(existing);
               } else {
                 const sem: SemanticMemory = {
                   id: generateId("sem"),
@@ -115,9 +118,19 @@ export function registerConsolidationPipelineFunction(
                   createdAt: now,
                   updatedAt: now,
                 };
-                await kv.set(KV.semantic, sem.id, sem);
+                factMap.set(key, sem);
+                toWrite.push(sem);
                 newFacts++;
               }
+            }
+            // Batch the writes: 20+ sequential state::set round-trips are what
+            // pushed semantic consolidate past the MCP call timeout. #655
+            for (let i = 0; i < toWrite.length; i += 10) {
+              await Promise.all(
+                toWrite
+                  .slice(i, i + 10)
+                  .map((sem) => kv.set(KV.semantic, sem.id, sem)),
+              );
             }
             results.semantic = { newFacts, totalSummaries: summaries.length };
           } catch (err) {

@@ -45,6 +45,8 @@ function stubEffects(overrides: Partial<DoctorEffects> = {}): DoctorEffects {
     runStop: async () => ({ ok: true, message: "stopped" }),
     runStart: async () => ({ ok: true, message: "started" }),
     clearEnginePidAndState: () => {},
+    scanStateStore: () => ({ scanned: 0, suspicious: [], errors: [] }),
+    repairStateStore: async () => ({ ok: true, message: "repaired" }),
     ...overrides,
   };
 }
@@ -169,17 +171,48 @@ describe("doctor v2 diagnostic catalog", () => {
     expect(status.detail).toContain("ANTHROPIC_API_KEY");
   });
 
-  it("iii-on-path-not-local-bin warns when iii lives in another location", async () => {
+  it("engine-version-mismatch passes when PATH differs but the private pin is current (#875)", async () => {
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        findIiiBinary: () => "/usr/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: (bin: string) =>
+          bin === "/usr/bin/iii" ? "0.23.0" : "0.11.2",
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "engine-version-mismatch")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(true);
+    expect(status.detail).toContain("private pin");
+  });
+
+  it("iii-on-path-not-local-bin passes when the private pin covers the engine (#874)", async () => {
     const diagnostics = buildDiagnostics(
       stubEffects({
         findIiiBinary: () => "/opt/homebrew/bin/iii",
-        localBinIiiPath: () => "/Users/test/.local/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: () => "0.11.2",
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "iii-on-path-not-local-bin")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(true);
+    expect(check.manualOnly).toBeUndefined();
+  });
+
+  it("iii-on-path-not-local-bin fails when neither PATH nor a private pin exists (#874)", async () => {
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        findIiiBinary: () => "/opt/homebrew/bin/iii",
+        localBinIiiPath: () => "/Users/test/.agentmemory/bin/iii",
+        iiiBinaryVersion: (bin: string) =>
+          bin === "/opt/homebrew/bin/iii" ? "0.11.2" : null,
       }),
     );
     const check = diagnostics.find((d) => d.id === "iii-on-path-not-local-bin")!;
     const status = await check.check(stubCtx());
     expect(status.ok).toBe(false);
-    expect(check.manualOnly).toBe(true);
+    expect(status.detail).toContain("/opt/homebrew/bin/iii");
   });
 
   it("dryRunPlan lists each failing diagnostic with the fix preview", () => {
@@ -202,6 +235,70 @@ describe("doctor v2 diagnostic catalog", () => {
     const lines = dryRunPlan(stubCtx(), results);
     expect(lines.length).toBe(1);
     expect(lines[0]).toContain("All checks passing");
+  });
+
+  it("state-store-corruption passes on a clean scan", async () => {
+    const diagnostics = buildDiagnostics(stubEffects());
+    const check = diagnostics.find((d) => d.id === "state-store-corruption")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(true);
+  });
+
+  it("state-store-corruption fails and the fix stops, repairs, restarts in order", async () => {
+    const order: string[] = [];
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        scanStateStore: () => ({
+          scanned: 3,
+          suspicious: ["mem%3Ainsights.bin"],
+          errors: [],
+        }),
+        runStop: async () => {
+          order.push("stop");
+          return { ok: true, message: "stopped" };
+        },
+        repairStateStore: async () => {
+          order.push("repair");
+          return { ok: true, message: "truncated 1 file" };
+        },
+        runStart: async () => {
+          order.push("start");
+          return { ok: true, message: "started" };
+        },
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "state-store-corruption")!;
+    const status = await check.check(stubCtx());
+    expect(status.ok).toBe(false);
+    expect(status.detail).toContain("insights.bin");
+
+    const fix = await check.fix(stubCtx());
+    expect(fix.ok).toBe(true);
+    expect(order).toEqual(["stop", "repair", "start"]);
+  });
+
+  it("state-store-corruption refuses to truncate when the engine will not stop", async () => {
+    let repaired = false;
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        scanStateStore: () => ({
+          scanned: 1,
+          suspicious: ["mem%3Ainsights.bin"],
+          errors: [],
+        }),
+        runStop: async () => ({ ok: false, message: "pids survived" }),
+        repairStateStore: async () => {
+          repaired = true;
+          return { ok: true, message: "should not run" };
+        },
+      }),
+    );
+    const fix = await diagnostics
+      .find((d) => d.id === "state-store-corruption")!
+      .fix(stubCtx());
+    expect(fix.ok).toBe(false);
+    expect(fix.message).toContain("refusing");
+    expect(repaired).toBe(false);
   });
 });
 

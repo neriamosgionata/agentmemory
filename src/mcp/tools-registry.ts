@@ -30,7 +30,18 @@ export const CORE_TOOLS: McpToolDef[] = [
         },
         token_budget: {
           type: "number",
-          description: "Optional token budget to trim returned results",
+          description:
+            "Optional token budget: returned results are trimmed to fit it " +
+            "(tokens_used <= token_budget). Results that do not fit are " +
+            "dropped and reported via excluded_by_budget. If the top result " +
+            "alone exceeds the budget it is returned clipped with " +
+            "content_truncated: true instead of dropped.",
+        },
+        project: {
+          type: "string",
+          description:
+            "Filter results to memories saved under this stable canonical project " +
+            "identifier (same value used with memory_save's project field).",
         },
       },
       required: ["query"],
@@ -115,14 +126,33 @@ export const CORE_TOOLS: McpToolDef[] = [
       type: "object",
       properties: {
         project: { type: "string", description: "Project path to analyze" },
+        maxSessions: {
+          type: "number",
+          description: "Most recent sessions to scan (default 100, max 500)",
+        },
+        sinceDays: {
+          type: "number",
+          description: "Only scan sessions started within the last N days",
+        },
       },
     },
   },
   {
     name: "memory_sessions",
     description:
-      "List recent sessions with their status and observation counts.",
-    inputSchema: { type: "object", properties: {} },
+      "List recent sessions with their status and observation counts. "
+      + "Returns the newest sessions first, projected to a summary row.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Max sessions to return (default 20, max 200)",
+        },
+        project: { type: "string", description: "Filter by project" },
+        status: { type: "string", description: "Filter by status" },
+      },
+    },
   },
   {
     name: "memory_smart_search",
@@ -136,6 +166,12 @@ export const CORE_TOOLS: McpToolDef[] = [
           description: "Comma-separated observation IDs to expand",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        project: {
+          type: "string",
+          description:
+            "Filter results to memories saved under this stable canonical project " +
+            "identifier (same value used with memory_save's project field).",
+        },
       },
       required: ["query"],
     },
@@ -151,6 +187,7 @@ export const CORE_TOOLS: McpToolDef[] = [
         queryImageRef: { type: "string", description: "Absolute path to a stored image to match against" },
         queryImageBase64: { type: "string", description: "Raw base64 image bytes or data URL" },
         topK: { type: "number", description: "Max results (default 10, max 50)" },
+        limit: { type: "number", description: "Alias for topK (#1254)" },
         sessionId: { type: "string", description: "Filter to a single session" },
       },
     },
@@ -195,8 +232,32 @@ export const CORE_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_export",
-    description: "Export all memory data as JSON.",
-    inputSchema: { type: "object", properties: {} },
+    description:
+      "Export memory data as JSON. Past the transport size limit the export is refused, so use the paging arguments on a large store.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxSessions: {
+          type: "number",
+          description: "Sessions per page (with their observations)",
+        },
+        offset: { type: "number", description: "Session offset" },
+        collectionLimit: {
+          type: "number",
+          description:
+            "Rows per page for memories, graph, lessons and the other top-level collections",
+        },
+        collectionOffset: {
+          type: "number",
+          description: "Row offset for the top-level collections",
+        },
+        collections: {
+          type: "string",
+          description:
+            "Comma-separated allowlist of top-level collections to return, e.g. memories,summaries,lessons. Unknown names are ignored. Omit for all of them; totals still cover every collection either way.",
+        },
+      },
+    },
   },
   {
     name: "memory_relations",
@@ -280,6 +341,17 @@ export const V040_TOOLS: McpToolDef[] = [
           description: "Max BFS depth (default 3, max 5)",
         },
         query: { type: "string", description: "Search nodes by name" },
+        limit: {
+          type: "number",
+          description: "Max nodes to return (default 25, max 200)",
+        },
+        includeSources: {
+          type: "boolean",
+          description:
+            "Return the full sourceObservationIds array per node/edge. "
+            + "Off by default: it is ~99% of the payload. A count is always "
+            + "returned as sourceObservationCount.",
+        },
       },
     },
   },
@@ -338,15 +410,20 @@ export const V040_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_governance_delete",
-    description: "Delete specific memories with audit trail.",
+    description: "Delete specific memories with audit trail. Observation ids are resolved to their owning session automatically (or pass sessionId).",
     inputSchema: {
       type: "object",
       properties: {
         memoryIds: {
           type: "string",
-          description: "Comma-separated memory IDs to delete",
+          description: "Comma-separated memory or observation IDs to delete",
         },
         reason: { type: "string", description: "Reason for deletion" },
+        sessionId: {
+          type: "string",
+          description:
+            "Optional session that owns the observation ids; needed for observations not in the BM25 index",
+        },
       },
       required: ["memoryIds"],
     },
@@ -381,6 +458,10 @@ export const V050_TOOLS: McpToolDef[] = [
           description: "Priority 1-10 (10 highest)",
         },
         project: { type: "string", description: "Project path" },
+        createdBy: {
+          type: "string",
+          description: "Agent or user that created the action (default: unknown)",
+        },
         tags: {
           type: "string",
           description: "Comma-separated tags",
@@ -672,7 +753,7 @@ export const V051_TOOLS: McpToolDef[] = [
   {
     name: "memory_diagnose",
     description:
-      "Run health checks across all subsystems (actions, leases, sentinels, sketches, signals, sessions, memories, mesh). Identifies stuck, orphaned, and inconsistent state.",
+      "Run health checks across all subsystems (actions, leases, sentinels, sketches, signals, sessions, memories, mesh, index). Identifies stuck, orphaned, and inconsistent state.",
     inputSchema: {
       type: "object",
       properties: {

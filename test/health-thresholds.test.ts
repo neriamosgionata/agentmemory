@@ -95,3 +95,48 @@ describe("evaluateHealth memory severity", () => {
     expect(strict.status).toBe("healthy");
   });
 });
+
+describe("evaluateHealth cpu scale", () => {
+  it("treats cpu.percent as machine-relative (#1235)", () => {
+    // 244% single-core on 16 cores is 15.25% of the machine.
+    const s = snap({ cpu: { userMicros: 0, systemMicros: 0, percent: 15.25, cores: 16 } });
+    expect(evaluateHealth(s).status).toBe("healthy");
+  });
+
+  it("still goes critical on genuine machine-wide saturation", () => {
+    const s = snap({ cpu: { userMicros: 0, systemMicros: 0, percent: 95, cores: 16 } });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("critical");
+    expect(alerts.find((a) => a.startsWith("cpu_critical_"))).toBeDefined();
+  });
+});
+
+describe("evaluateHealth heap denominator", () => {
+  it("stays healthy at 10% of the heap limit even when heapTotal is nearly full (#1223)", () => {
+    const s = snap({
+      memory: {
+        heapUsed: 849 * 1024 * 1024,
+        heapTotal: 860 * 1024 * 1024,
+        heapLimit: 8192 * 1024 * 1024,
+        rss: 1200 * 1024 * 1024,
+        external: 0,
+      },
+    });
+    const { status, alerts, notes } = evaluateHealth(s);
+    expect(status).toBe("healthy");
+    expect(alerts).toEqual([]);
+    expect(notes.find((n) => n.startsWith("memory_heap_tight_"))).toBeUndefined();
+  });
+
+  it("falls back to heapTotal when heapLimit is absent (pre-#1223 snapshots)", () => {
+    const s = snap({
+      memory: {
+        heapUsed: 970 * 1024 * 1024,
+        heapTotal: 1000 * 1024 * 1024,
+        rss: 1100 * 1024 * 1024,
+        external: 0,
+      },
+    });
+    expect(evaluateHealth(s).status).toBe("critical");
+  });
+});

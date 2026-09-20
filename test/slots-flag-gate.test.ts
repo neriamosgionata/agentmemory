@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -86,5 +92,17 @@ describe("isReflectEnabled — reads merged env (#678)", () => {
     );
     const { isReflectEnabled } = await import("../src/functions/slots.js");
     expect(isReflectEnabled()).toBe(true);
+  });
+});
+
+describe("MCP slot dispatch gate (#888)", () => {
+  it("guards every slot tool with isSlotsEnabled and a typed error", () => {
+    const server = readFileSync("src/mcp/server.ts", "utf-8");
+    const guards =
+      server.match(
+        /if \(!isSlotsEnabled\(\)\) return slotsDisabledResult\(\);/g,
+      ) ?? [];
+    expect(guards.length).toBe(6);
+    expect(server).toContain("AGENTMEMORY_SLOTS");
   });
 });

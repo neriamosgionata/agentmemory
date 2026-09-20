@@ -4,7 +4,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerReflectFunctions } from "../src/functions/reflect.js";
+import { registerReflectFunctions, INSIGHT_MAX_SOURCE_IDS } from "../src/functions/reflect.js";
 import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
 
 function mockKV() {
@@ -218,6 +218,60 @@ describe("Reflect", () => {
       expect(after[0].reinforcements).toBe(1);
     });
 
+    it("clusters every disconnected concept group instead of stopping at a visited seed", async () => {
+      await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+      await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+      await kv.set("mem:graph:nodes", "node_gamma", makeConceptNode("gamma"));
+      await kv.set("mem:graph:nodes", "node_delta", makeConceptNode("delta"));
+      await kv.set("mem:graph:nodes", "node_epsilon", makeConceptNode("epsilon"));
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+      await kv.set("mem:graph:edges", "edge_bg", makeEdge("beta", "gamma"));
+      await kv.set("mem:graph:edges", "edge_ga", makeEdge("gamma", "alpha"));
+      await kv.set("mem:graph:edges", "edge_de", makeEdge("delta", "epsilon"));
+
+      await kv.set("mem:semantic", "sem_a1", makeSemantic("alpha beta gamma pipeline"));
+      await kv.set("mem:semantic", "sem_a2", makeSemantic("alpha caching layer"));
+      await kv.set("mem:semantic", "sem_a3", makeSemantic("beta gamma queue"));
+      await kv.set("mem:semantic", "sem_b1", makeSemantic("delta epsilon storage"));
+      await kv.set("mem:semantic", "sem_b2", makeSemantic("delta epsilon index"));
+      await kv.set("mem:semantic", "sem_b3", makeSemantic("epsilon delta flush"));
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        clustersProcessed: number;
+        newInsights: number;
+      };
+
+      expect(result.clustersProcessed).toBe(2);
+      expect(result.newInsights).toBe(2);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    });
+
+    it("stops at the maxClusters bound even when more groups exist", async () => {
+      await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+      await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+      await kv.set("mem:graph:nodes", "node_gamma", makeConceptNode("gamma"));
+      await kv.set("mem:graph:nodes", "node_delta", makeConceptNode("delta"));
+      await kv.set("mem:graph:nodes", "node_epsilon", makeConceptNode("epsilon"));
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+      await kv.set("mem:graph:edges", "edge_bg", makeEdge("beta", "gamma"));
+      await kv.set("mem:graph:edges", "edge_ga", makeEdge("gamma", "alpha"));
+      await kv.set("mem:graph:edges", "edge_de", makeEdge("delta", "epsilon"));
+
+      await kv.set("mem:semantic", "sem_a1", makeSemantic("alpha beta gamma pipeline"));
+      await kv.set("mem:semantic", "sem_a2", makeSemantic("alpha caching layer"));
+      await kv.set("mem:semantic", "sem_a3", makeSemantic("beta gamma queue"));
+      await kv.set("mem:semantic", "sem_b1", makeSemantic("delta epsilon storage"));
+      await kv.set("mem:semantic", "sem_b2", makeSemantic("delta epsilon index"));
+      await kv.set("mem:semantic", "sem_b3", makeSemantic("epsilon delta flush"));
+
+      const result = (await sdk.trigger("mem::reflect", { maxClusters: 1 })) as {
+        clustersProcessed: number;
+      };
+
+      expect(result.clustersProcessed).toBe(1);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
     it("falls back to Jaccard grouping when graph is empty", async () => {
       await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("security testing prevents bugs"));
@@ -250,6 +304,61 @@ describe("Reflect", () => {
 
       expect(result.success).toBe(true);
       expect(result.newInsights).toBe(0);
+    });
+
+    it("caps sourceMemoryIds, sourceLessonIds, and sourceCrystalIds at 20 preserving freshest items", async () => {
+      expect(INSIGHT_MAX_SOURCE_IDS).toBe(20);
+
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+
+      for (let i = 0; i < 25; i++) {
+        const pad = i.toString().padStart(2, "0");
+        await kv.set(
+          "mem:semantic",
+          `sem_${pad}`,
+          makeSemantic(`security fact ${pad}`, `sem_${pad}`),
+        );
+        await kv.set(
+          "mem:lessons",
+          `lsn_${pad}`,
+          {
+            ...makeLesson(`security lesson ${pad}`, ["security"]),
+            id: `lsn_${pad}`,
+          },
+        );
+        await kv.set(
+          "mem:crystals",
+          `crys_${pad}`,
+          {
+            ...makeCrystal(`crystal narrative ${pad}`, [`security topic ${pad}`]),
+            id: `crys_${pad}`,
+          },
+        );
+      }
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        success: boolean;
+        newInsights: number;
+      };
+
+      expect(result.success).toBe(true);
+      expect(result.newInsights).toBeGreaterThan(0);
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBeGreaterThan(0);
+      for (const ins of insights) {
+        expect(ins.sourceMemoryIds.length).toBe(20);
+        expect(ins.sourceLessonIds.length).toBe(20);
+        expect(ins.sourceCrystalIds.length).toBe(20);
+        expect(ins.sourceMemoryIds[0]).toBe("sem_05");
+        expect(ins.sourceMemoryIds[19]).toBe("sem_24");
+        expect(ins.sourceLessonIds[0]).toBe("lsn_05");
+        expect(ins.sourceLessonIds[19]).toBe("lsn_24");
+        expect(ins.sourceCrystalIds[0]).toBe("crys_05");
+        expect(ins.sourceCrystalIds[19]).toBe("crys_24");
+      }
     });
   });
 

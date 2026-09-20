@@ -1,6 +1,16 @@
 const DEFAULT_URL = "http://localhost:3111";
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
-const CALL_TIMEOUT_MS = 15_000;
+const DEFAULT_CALL_TIMEOUT_MS = 15_000;
+
+// mem::consolidate / mem::reflect routinely run past 15s on a large store.
+// The hardcoded bound aborted them from the stdio shim even though the
+// daemon was still working. Configurable, same shape as the probe timeout. #866
+export function callTimeoutMs(): number {
+  const raw = process.env["AGENTMEMORY_CALL_TIMEOUT_MS"];
+  if (!raw) return DEFAULT_CALL_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_CALL_TIMEOUT_MS;
+}
 const LOCAL_MODE_TTL_MS = 30_000;
 
 function probeTimeoutMs(): number {
@@ -144,7 +154,7 @@ export async function resolveHandle(): Promise<Handle> {
               ...authHeader(),
               ...(init?.headers as Record<string, string> | undefined),
             },
-            signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+            signal: AbortSignal.timeout(callTimeoutMs()),
           });
           if (!res.ok) {
             throw new Error(

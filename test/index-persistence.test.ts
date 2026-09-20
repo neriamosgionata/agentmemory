@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { IndexPersistence } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
@@ -9,6 +10,23 @@ const BM25_LEGACY_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
 const VECTOR_LEGACY_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
+const VECTOR_BUCKET_SCOPE = "mem:index:bm25:vectors:v2";
+// Mirrors the cap isValidBucketEntry enforces at load time.
+const MAX_BUCKET_CHUNKS = 10_000;
+
+// Mirrors the production key builder. Chunk keys carry the bucket's content
+// hash so a bucket is never overwritten in place.
+function chunkKey(bucketKey: string, hash: string, chunk = 0): string {
+  return `${bucketKey}:${hash.slice(0, 12)}:${String(chunk).padStart(5, "0")}`;
+}
+
+type TestVectorBucketManifest = {
+  v: 2;
+  layout: number;
+  buckets: number;
+  chunkChars: number;
+  shards: Record<string, { hash: string; chunks: number }>;
+};
 
 type TestIndexShardManifest = {
   v: 1;
@@ -68,6 +86,14 @@ function makeBm25(id: string, title: string): SearchIndex {
 function makeVector(id = "obs_1"): VectorIndex {
   const vector = new VectorIndex();
   vector.add(id, "ses_1", new Float32Array([0.1, 0.2, 0.3]));
+  return vector;
+}
+
+function seeded(count: number): VectorIndex {
+  const vector = new VectorIndex();
+  for (let i = 0; i < count; i++) {
+    vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+  }
   return vector;
 }
 
@@ -256,17 +282,24 @@ describe("IndexPersistence", () => {
     });
     await persistence.save();
 
-    const manifest = await kv.get<TestIndexShardManifest>(
+    const manifest = await kv.get<TestVectorBucketManifest>(
       BM25_SCOPE,
       VECTOR_MANIFEST_KEY,
     );
     expect(manifest).not.toBeNull();
-    expect(manifest!.generation).toBe("gen_vector");
-    expect(manifest!.shards.length).toBeGreaterThan(1);
-    expect(manifest!.shards[0].scope).toContain(":gen_vector:");
+    expect(manifest!.v).toBe(2);
+    const bucketKeys = Object.keys(manifest!.shards);
+    expect(bucketKeys.length).toBe(1);
+    // shardChars: 40 against a 32-float embedding, so the bucket must still be
+    // chunked. Bucketing bounds the rewrite; chunking bounds the payload.
+    expect(manifest!.shards[bucketKeys[0]].chunks).toBeGreaterThan(1);
     await expect(kv.get(BM25_SCOPE, VECTOR_LEGACY_KEY)).resolves.toBeNull();
+    // Vector payloads live outside the BM25 scope.
     await expect(
-      kv.get(manifest!.shards[0].scope, manifest!.shards[0].key),
+      kv.get(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(bucketKeys[0], manifest!.shards[bucketKeys[0]].hash),
+      ),
     ).resolves.toEqual(expect.any(String));
 
     const loaded = await persistence.load();
@@ -289,12 +322,18 @@ describe("IndexPersistence", () => {
       createGeneration: () => "gen_empty",
     }).save();
 
-    const vectorManifest = await kv.get<TestIndexShardManifest>(
+    const vectorManifest = await kv.get<TestVectorBucketManifest>(
       BM25_SCOPE,
       VECTOR_MANIFEST_KEY,
     );
     expect(vectorManifest).not.toBeNull();
-    expect(vectorManifest!.generation).toBe("gen_empty");
+    expect(vectorManifest!.v).toBe(2);
+    // The cleared index publishes a manifest naming no buckets, and the
+    // previous bucket is reclaimed rather than left to reload.
+    expect(Object.keys(vectorManifest!.shards)).toHaveLength(0);
+    await expect(
+      kv.list(VECTOR_BUCKET_SCOPE),
+    ).resolves.toHaveLength(0);
     const loaded = await new IndexPersistence(
       kv as never,
       new SearchIndex(),
@@ -789,5 +828,1385 @@ describe("IndexPersistence", () => {
     );
 
     await expect(persistence.load()).resolves.toBeDefined();
+  });
+
+  it("cleans up orphan shards from multiple older crashed generations on next save", async () => {
+    const REGISTRY_KEY = "generations:registry";
+    // Simulate two older crashed generations left in registry and KV
+    await kv.set("mem:index:bm25:bm25:gen_crash1:00000", "data", "crash1-shard0");
+    await kv.set("mem:index:bm25:bm25:gen_crash1:00001", "data", "crash1-shard1");
+    await kv.set("mem:index:bm25:bm25:gen_crash2:00000", "data", "crash2-shard0");
+
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, {
+      v: 1,
+      generations: {
+        gen_crash1: {
+          type: "bm25",
+          createdAt: new Date(Date.now() - 120_000).toISOString(),
+          shardScopes: [
+            "mem:index:bm25:bm25:gen_crash1:00000",
+            "mem:index:bm25:bm25:gen_crash1:00001",
+          ],
+        },
+        gen_crash2: {
+          type: "bm25",
+          createdAt: new Date(Date.now() - 100_000).toISOString(),
+          shardScopes: ["mem:index:bm25:bm25:gen_crash2:00000"],
+        },
+      },
+    });
+
+    const bm25 = makeBm25("obs_1", "healthy active index");
+    const persistence = new IndexPersistence(kv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_active",
+    });
+
+    await persistence.save();
+
+    // Shards from crashed generations must be deleted
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_crash1:00000", "data"),
+    ).resolves.toBeNull();
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_crash1:00001", "data"),
+    ).resolves.toBeNull();
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_crash2:00000", "data"),
+    ).resolves.toBeNull();
+
+    // Active shards must exist
+    const manifest = await getBm25Manifest(kv);
+    expect(manifest.generation).toBe("gen_active");
+    await expect(
+      kv.get(manifest.shards[0].scope, manifest.shards[0].key),
+    ).resolves.toEqual(expect.any(String));
+
+    // Registry must now only contain gen_active
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<string, unknown>;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    expect(registry).not.toBeNull();
+    expect(Object.keys(registry!.generations)).toEqual(["gen_active"]);
+  });
+
+  it("cleans up orphan shards from multiple older crashed generations on sweepOrphanShards()", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Setup active BM25 generation
+    const activeBm25 = makeBm25("obs_bm25", "active bm25");
+    const activeVector = makeVector("obs_vec");
+
+    const p = new IndexPersistence(kv as never, activeBm25, activeVector, {
+      shardChars: 80,
+      createGeneration: () => "gen_active",
+    });
+    await p.save();
+
+    // Inject orphan BM25 and vector generations into registry and KV (older than 60s grace period)
+    await kv.set("mem:index:bm25:bm25:gen_orphan_bm25:00000", "data", "orphan-bm25-shard");
+    await kv.set("mem:index:bm25:vectors:gen_orphan_vec:00000", "data", "orphan-vec-shard");
+
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<
+        string,
+        { type: "bm25" | "vector"; createdAt: string; shardScopes: string[] }
+      >;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    expect(registry).not.toBeNull();
+
+    registry!.generations["gen_orphan_bm25"] = {
+      type: "bm25",
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+      shardScopes: ["mem:index:bm25:bm25:gen_orphan_bm25:00000"],
+    };
+    registry!.generations["gen_orphan_vec"] = {
+      type: "vector",
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+      shardScopes: ["mem:index:bm25:vectors:gen_orphan_vec:00000"],
+    };
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, registry);
+
+    const stats = await p.sweepOrphanShards();
+    expect(stats.purgedGenerations).toBe(2);
+    expect(stats.deletedShards).toBe(2);
+
+    // Orphan shards must be deleted
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_orphan_bm25:00000", "data"),
+    ).resolves.toBeNull();
+    await expect(
+      kv.get("mem:index:bm25:vectors:gen_orphan_vec:00000", "data"),
+    ).resolves.toBeNull();
+
+    // Active shards must remain intact
+    const bm25Manifest = await kv.get<TestIndexShardManifest>(
+      BM25_SCOPE,
+      BM25_MANIFEST_KEY,
+    );
+    expect(bm25Manifest?.generation).toBe("gen_active");
+    await expect(
+      kv.get(bm25Manifest!.shards[0].scope, "data"),
+    ).resolves.toEqual(expect.any(String));
+
+    const vectorManifest = await kv.get<{
+      v: number;
+      shards: Record<string, { hash: string; chunks: number }>;
+    }>(BM25_SCOPE, VECTOR_MANIFEST_KEY);
+    // Post-#1258 the vector manifest is the v2 bucket form: no generation
+    // component, and the orphan sweep treats the whole legacy registry as
+    // reclaimable while the buckets stay intact.
+    expect(vectorManifest?.v).toBe(2);
+    const activeBucketKeys = Object.keys(vectorManifest!.shards ?? {});
+    expect(activeBucketKeys.length).toBeGreaterThan(0);
+    await expect(
+      kv.get(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(
+          activeBucketKeys[0]!,
+          vectorManifest!.shards[activeBucketKeys[0]!]!.hash,
+        ),
+      ),
+    ).resolves.toEqual(expect.any(String));
+
+    // Registry must now only contain active generations
+    const updatedRegistry = await kv.get<{
+      v: 1;
+      generations: Record<string, unknown>;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    expect(Object.keys(updatedRegistry!.generations).sort()).toEqual(["gen_active"]);
+  });
+
+  it("recovers from crash before publishing manifest by sweeping uncommitted shards", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Initial committed generation
+    const initialBm25 = makeBm25("obs_init", "initial active");
+    const persistence = new IndexPersistence(kv as never, initialBm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_initial",
+    });
+    await persistence.save();
+
+    // Crash simulation: save wrote shards and updated registry for gen_crash, but died before manifest write
+    await kv.set("mem:index:bm25:bm25:gen_crash:00000", "data", "crash-shard-data");
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<
+        string,
+        { type: "bm25" | "vector"; createdAt: string; shardScopes: string[] }
+      >;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    registry!.generations["gen_crash"] = {
+      type: "bm25",
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+      shardScopes: ["mem:index:bm25:bm25:gen_crash:00000"],
+    };
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, registry);
+
+    // Startup or load runs sweepOrphanShards
+    const stats = await persistence.sweepOrphanShards();
+    expect(stats.purgedGenerations).toBe(1);
+    expect(stats.deletedShards).toBe(1);
+
+    // Uncommitted crashed shards purged
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_crash:00000", "data"),
+    ).resolves.toBeNull();
+
+    // Initial generation still healthy and loadable
+    const loaded = await persistence.load();
+    expect(loaded.bm25!.search("initial").length).toBe(1);
+  });
+
+  it("rolls back registry entry and shards when shard write fails", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    const failingKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope.includes(":gen_fail:")) {
+          throw new Error("shard write disk full");
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+
+    const bm25 = makeBm25("obs_1", "fail shard write");
+    const persistence = new IndexPersistence(failingKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_fail",
+    });
+
+    await persistence.save();
+
+    // Registry must not retain gen_fail
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<string, unknown>;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    expect(registry?.generations["gen_fail"]).toBeUndefined();
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_fail:00000", "data"),
+    ).resolves.toBeNull();
+  });
+
+  it("rolls back registry entry and shards when manifest publish fails", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    const failingKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          throw new Error("manifest publish failed");
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+
+    const bm25 = makeBm25("obs_1", "fail manifest publish");
+    const persistence = new IndexPersistence(failingKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_fail_manifest",
+    });
+
+    await persistence.save();
+
+    // Registry must not retain gen_fail_manifest
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<string, unknown>;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    expect(registry?.generations["gen_fail_manifest"]).toBeUndefined();
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_fail_manifest:00000", "data"),
+    ).resolves.toBeNull();
+  });
+
+  it("load() triggers non-blocking orphan shard sweep", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Setup active generation
+    const activeBm25 = makeBm25("obs_1", "active bm25");
+    const persistence = new IndexPersistence(kv as never, activeBm25, null, {
+      shardChars: 80,
+      createGeneration: () => "gen_active",
+    });
+    await persistence.save();
+
+    // Inject orphan generation (older than 60s)
+    await kv.set("mem:index:bm25:bm25:gen_orphan:00000", "data", "orphan-data");
+    const registry = await kv.get<{
+      v: 1;
+      generations: Record<
+        string,
+        { type: "bm25" | "vector"; createdAt: string; shardScopes: string[] }
+      >;
+    }>(BM25_SCOPE, REGISTRY_KEY);
+    registry!.generations["gen_orphan"] = {
+      type: "bm25",
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+      shardScopes: ["mem:index:bm25:bm25:gen_orphan:00000"],
+    };
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, registry);
+
+    const loaded = await persistence.load();
+    expect(loaded.bm25).not.toBeNull();
+
+    // Flush async sweep
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_orphan:00000", "data"),
+    ).resolves.toBeNull();
+  });
+
+  it("fails closed on manifest read error during sweepOrphanShards without deleting shards", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Write a registered generation and its shard
+    await kv.set("mem:index:bm25:bm25:gen_test:00000", "data", "protected-data");
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, {
+      v: 1,
+      generations: {
+        gen_test: {
+          type: "bm25",
+          createdAt: new Date(Date.now() - 120_000).toISOString(),
+          shardScopes: ["mem:index:bm25:bm25:gen_test:00000"],
+        },
+      },
+    });
+
+    const errorKv = {
+      ...kv,
+      get: vi.fn(async (scope: string, key: string) => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          throw new Error("backend manifest read error");
+        }
+        return kv.get(scope, key);
+      }),
+    };
+
+    const persistence = new IndexPersistence(
+      errorKv as never,
+      new SearchIndex(),
+      null,
+    );
+
+    const stats = await persistence.sweepOrphanShards();
+    expect(stats.purgedGenerations).toBe(0);
+    expect(stats.deletedShards).toBe(0);
+
+    // Shards and registry must remain untouched
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_test:00000", "data"),
+    ).resolves.toBe("protected-data");
+
+    const reg = await kv.get<{ v: 1; generations: Record<string, unknown> }>(
+      BM25_SCOPE,
+      REGISTRY_KEY,
+    );
+    expect(reg?.generations["gen_test"]).toBeDefined();
+  });
+
+  it("preserves uncommitted generation younger than 60s grace period during sweep", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Generation created 10 seconds ago (in-flight write)
+    await kv.set("mem:index:bm25:bm25:gen_inflight:00000", "data", "in-flight-shard");
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, {
+      v: 1,
+      generations: {
+        gen_inflight: {
+          type: "bm25",
+          createdAt: new Date(Date.now() - 10_000).toISOString(),
+          shardScopes: ["mem:index:bm25:bm25:gen_inflight:00000"],
+        },
+      },
+    });
+
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    );
+
+    const stats = await persistence.sweepOrphanShards();
+    expect(stats.purgedGenerations).toBe(0);
+    expect(stats.deletedShards).toBe(0);
+
+    // In-flight shard and registry entry must be preserved
+    await expect(
+      kv.get("mem:index:bm25:bm25:gen_inflight:00000", "data"),
+    ).resolves.toBe("in-flight-shard");
+
+    const reg = await kv.get<{ v: 1; generations: Record<string, unknown> }>(
+      BM25_SCOPE,
+      REGISTRY_KEY,
+    );
+    expect(reg?.generations["gen_inflight"]).toBeDefined();
+  });
+
+  it("serializes concurrent save calls cleanly", async () => {
+    const executionOrder: string[] = [];
+    let activeSaves = 0;
+    let maxConcurrentSaves = 0;
+
+    const serializeKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (key === BM25_MANIFEST_KEY) {
+          activeSaves++;
+          if (activeSaves > maxConcurrentSaves) {
+            maxConcurrentSaves = activeSaves;
+          }
+          // Yield execution across microtasks to ensure concurrency contention is tested
+          await Promise.resolve();
+          await Promise.resolve();
+          executionOrder.push(`manifest_${(data as TestIndexShardManifest).generation}`);
+          activeSaves--;
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+
+    let genCounter = 0;
+    const bm25 = makeBm25("obs_concurrent", "concurrent test");
+    const persistence = new IndexPersistence(serializeKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++genCounter}`,
+    });
+
+    // Launch multiple saves concurrently
+    await Promise.all([
+      persistence.save(),
+      persistence.save(),
+      persistence.save(),
+    ]);
+
+    expect(maxConcurrentSaves).toBe(1);
+    expect(executionOrder).toEqual(["manifest_gen_1", "manifest_gen_2", "manifest_gen_3"]);
+  });
+
+  it("fails closed when generation registry is corrupted or throws on get", async () => {
+    const REGISTRY_KEY = "generations:registry";
+
+    // Set corrupted registry (not valid object)
+    await kv.set(BM25_SCOPE, REGISTRY_KEY, "invalid-registry-string");
+
+    const bm25 = makeBm25("obs_corrupt", "corrupt reg test");
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    // Save should catch failure and not throw unhandled exception
+    await persistence.save();
+
+    // sweepOrphanShards should return 0/0 and not delete anything
+    const stats = await persistence.sweepOrphanShards();
+    expect(stats.purgedGenerations).toBe(0);
+    expect(stats.deletedShards).toBe(0);
+  });
+});
+
+// Counts writes landing on vector bucket payload keys, so assertions are about
+// payload rewrites rather than manifest bookkeeping.
+function countingKV() {
+  const inner = mockKV();
+  let bucketWrites = 0;
+  return {
+    ...inner,
+    resetCount: () => {
+      bucketWrites = 0;
+    },
+    get bucketWrites() {
+      return bucketWrites;
+    },
+    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (scope === VECTOR_BUCKET_SCOPE) bucketWrites++;
+      return inner.set(scope, key, data);
+    },
+  };
+}
+
+describe("IndexPersistence vector bucketing", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("writes O(1) buckets when one vector is added, not O(corpus)", async () => {
+    const vector = seeded(60);
+    const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    });
+
+    await persistence.save();
+    expect(kv.bucketWrites).toBeGreaterThan(5);
+
+    vector.add("obs_new", "ses_1", new Float32Array([9, 9, 9]));
+    kv.resetCount();
+    await persistence.save();
+
+    expect(kv.bucketWrites).toBeLessThanOrEqual(2);
+    // Bounding the write count alone does not discriminate: skipping writes
+    // that were needed also lowers it. Read the result back.
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(61);
+    expect(
+      loaded.vector!.search(new Float32Array([9, 9, 9]), 61)
+        .some((r) => r.obsId === "obs_new"),
+    ).toBe(true);
+  });
+
+  // Covers the same-instance case too: saveVectorBuckets holds no state between
+  // saves, so a fresh instance and a reused one run the identical path.
+  it("rewrites nothing after a restart when nothing changed", async () => {
+    const vector = seeded(40);
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    }).save();
+
+    // Go through the real restart path. Seeding a fresh identical index would
+    // skip load() entirely, leaving the thing that actually keeps hashes stable
+    // across a restart — deserialize -> mergeSerialized row order -> identical
+    // serialised bytes — completely unpinned.
+    const reloaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reloaded.vector!.size).toBe(40);
+
+    kv.resetCount();
+    const restarted = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      reloaded.vector,
+      { shardChars: 400 },
+    );
+    await restarted.save();
+
+    expect(kv.bucketWrites).toBe(0);
+  });
+
+  it("writes only the removed observation's bucket on delete", async () => {
+    const vector = seeded(60);
+    const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    });
+    await persistence.save();
+
+    // obs_9 shares a bucket with obs_30, so removing it forces that bucket to be
+    // REWRITTEN with its surviving member. Removing a bucket's only occupant
+    // instead would just reclaim it and never exercise a write at all, which is
+    // what this test is supposed to be about.
+    vector.remove("obs_9");
+    kv.resetCount();
+    await persistence.save();
+
+    expect(kv.bucketWrites).toBeLessThanOrEqual(1);
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(59);
+    // The bucket-mate must survive the rewrite.
+    expect(
+      loaded.vector!.search(new Float32Array([30, 31, 32]), 59)
+        .some((r) => r.obsId === "obs_30"),
+    ).toBe(true);
+  });
+
+  it("round-trips every vector through the bucketed format", async () => {
+    const vector = seeded(50);
+    const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    });
+    await persistence.save();
+
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(50);
+    expect(
+      loaded.vector!.search(new Float32Array([7, 8, 9]))[0]?.obsId,
+    ).toBe("obs_7");
+  });
+
+  it("bounds each payload by shardChars even when a bucket is large", async () => {
+    // One bucket, many vectors in it: only chunking can bound the payload.
+    const vector = new VectorIndex();
+    for (let i = 0; i < 40; i++) {
+      vector.add(
+        `obs_${i}`,
+        "ses_1",
+        new Float32Array(Array.from({ length: 32 }, (_, n) => n + i)),
+      );
+    }
+    const maxChars = 120;
+    const guarded = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (typeof data === "string" && data.length > maxChars) {
+          throw new Error(`oversized state::set payload: ${scope}/${key}`);
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+    await new IndexPersistence(guarded as never, new SearchIndex(), vector, {
+      shardChars: maxChars,
+      vectorBuckets: 1,
+    }).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(40);
+  });
+
+  it("loads a v1 manifest and migrates it to buckets on the next save", async () => {
+    // Write the legacy offset-chunked format by hand, exactly as the v1 code
+    // shaped it, then prove no vectors are lost across the upgrade.
+    const legacy = seeded(20);
+    const serialized = legacy.serialize();
+    const shards: Array<{ scope: string; key: string; chars: number }> = [];
+    const chunkChars = 200;
+    for (let offset = 0; offset < serialized.length; offset += chunkChars) {
+      const scope = `mem:index:bm25:vectors:gen_v1:${String(
+        shards.length,
+      ).padStart(5, "0")}`;
+      const chunk = serialized.slice(offset, offset + chunkChars);
+      shards.push({ scope, key: "data", chars: chunk.length });
+      await kv.set(scope, "data", chunk);
+    }
+    await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, {
+      v: 1,
+      generation: "gen_v1",
+      shards,
+      chars: serialized.length,
+    });
+
+    // Load path still understands v1.
+    const before = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(before.vector!.size).toBe(20);
+
+    // First save migrates and reclaims the v1 shards.
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    const manifest = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    expect(manifest!.v).toBe(2);
+    for (const shard of shards) {
+      await expect(kv.get(shard.scope, shard.key)).resolves.toBeNull();
+    }
+    const after = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(after.vector!.size).toBe(20);
+  });
+
+  it("keeps previous buckets loadable when the manifest publish fails", async () => {
+    const vector = seeded(30);
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    }).save();
+
+    const failing = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === VECTOR_MANIFEST_KEY) {
+          throw new Error("vector manifest write failed");
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+    // Empty index: without deferring deletes until after publish, this would
+    // reclaim every bucket the still-live manifest names and lose the lot.
+    await new IndexPersistence(
+      failing as never,
+      new SearchIndex(),
+      new VectorIndex(),
+      { shardChars: 400 },
+    ).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(30);
+  });
+
+  it("skips a bucket whose body disagrees with its manifest hash", async () => {
+    const vector = seeded(30);
+    // Large shardChars keeps every bucket to a single chunk, so the stand-in
+    // body below is the bucket in full rather than a fragment of one.
+    const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 100_000,
+    });
+    await persistence.save();
+
+    const manifest = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const [tornKey] = Object.keys(manifest!.shards);
+    const tornHash = manifest!.shards[tornKey].hash;
+
+    // Critically, this stand-in is VALID JSON in the right row shape. An
+    // invalid body would be dropped by mergeSerialized regardless, so the test
+    // would pass with the hash check removed and prove nothing. Only content
+    // that would otherwise load cleanly can show the hash check doing work.
+    const ghost = JSON.stringify([
+      [
+        "obs_ghost",
+        {
+          embedding: Buffer.from(
+            new Float32Array([1, 2, 3]).buffer,
+          ).toString("base64"),
+          sessionId: "ses_1",
+        },
+      ],
+    ]);
+    await kv.set(VECTOR_BUCKET_SCOPE, chunkKey(tornKey, tornHash), ghost);
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    // The disagreeing bucket is dropped whole rather than trusted.
+    expect(
+      loaded.vector!.search(new Float32Array([1, 2, 3]), 50)
+        .some((r) => r.obsId === "obs_ghost"),
+    ).toBe(false);
+    // Every other bucket still loads.
+    expect(loaded.vector!.size).toBeGreaterThan(0);
+    expect(loaded.vector!.size).toBeLessThan(30);
+  });
+
+  // isValidBucketEntry rejects any entry above MAX_BUCKET_CHUNKS, so a save
+  // that publishes one hands the next boot a bucket it classifies as corrupt —
+  // dropping vectors whose bytes are entirely intact, and marking every load
+  // incomplete from then on. A small configured shardChars is all it takes.
+  it("fails the save rather than publish a bucket the loader will reject", async () => {
+    const vector = seeded(200);
+    // Asserted, not assumed: at one chunk per character the bucket has to clear
+    // the cap, or a shorter serialisation would leave this testing nothing.
+    const [, body] = [...vector.serializeBuckets(1)][0]!;
+    expect(body.length).toBeGreaterThan(MAX_BUCKET_CHUNKS);
+
+    // A good save first, so there is something to lose.
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+      vectorBuckets: 1,
+    }).save();
+
+    // save() funnels the failure through logFailure, so nothing throws out
+    // here. What has to hold is that the live manifest still names a readable
+    // bucket rather than an oversized one the loader will throw away.
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 1,
+      vectorBuckets: 1,
+    }).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(200);
+  });
+});
+
+// A content hash cannot see an addressing change: same bytes, different home.
+// These two cover that whole family — the bucket count and the chunk size are
+// the two inputs that decide where a vector's bytes live.
+describe("IndexPersistence vector layout changes", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("reclaims buckets stranded by a smaller bucket count", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const wide = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const widened = Object.keys(wide!.shards);
+    // Needs keys that only the 8-bucket layout can produce.
+    const beyondNarrow = widened.filter((key) => Number(key.slice(1)) >= 4);
+    expect(beyondNarrow.length).toBeGreaterThan(0);
+
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 4,
+    }).save();
+
+    // Every key the old layout owned and the new one cannot name must be gone.
+    for (const bucketKey of beyondNarrow) {
+      await expect(
+        kv.get(
+          VECTOR_BUCKET_SCOPE,
+          chunkKey(bucketKey, wide!.shards[bucketKey].hash),
+        ),
+      ).resolves.toBeNull();
+    }
+    const narrow = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    expect(narrow!.buckets).toBe(4);
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(40);
+  });
+
+  it("survives a chunk-size change that leaves content identical", async () => {
+    // Small chunks first, so buckets span several keys.
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(30), {
+      shardChars: 60,
+      vectorBuckets: 4,
+    }).save();
+
+    const wide = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const multiChunk = Object.entries(wide!.shards).find(
+      ([, entry]) => entry.chunks > 1,
+    );
+    expect(multiChunk).toBeDefined();
+    const [shrinkingKey, wideEntry] = multiChunk!;
+
+    // Same vectors, larger chunks. The bucket bodies are byte-identical, so the
+    // content hash matches and a hash-only skip would write nothing at all —
+    // while the manifest records the new, smaller chunk count. Load would then
+    // read too few keys and drop every bucket.
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(30), {
+      shardChars: 100_000,
+      vectorBuckets: 4,
+    }).save();
+
+    // The bucket now needs fewer keys, so its old tail must be reclaimed
+    // rather than left addressable-by-nobody.
+    // Chunk 0 keeps its key: same bucket, same content hash, same index. Only
+    // the tail is no longer addressed, and reclaiming it must not take chunk 0
+    // with it.
+    await expect(
+      kv.get(VECTOR_BUCKET_SCOPE, chunkKey(shrinkingKey, wideEntry.hash, 0)),
+    ).resolves.toEqual(expect.any(String));
+    for (let i = 1; i < wideEntry.chunks; i++) {
+      await expect(
+        kv.get(VECTOR_BUCKET_SCOPE, chunkKey(shrinkingKey, wideEntry.hash, i)),
+      ).resolves.toBeNull();
+    }
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(30);
+    expect(
+      loaded.vector!.search(new Float32Array([7, 8, 9]))[0]?.obsId,
+    ).toBe("obs_7");
+  });
+});
+
+describe("IndexPersistence torn vector save", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("loses nothing when a save dies partway through writing buckets", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const before = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(before.vector!.size).toBe(40);
+
+    // A second save with changed content that dies after some bucket writes and
+    // before the manifest publish. With in-place keys this would corrupt the
+    // buckets the live manifest still names, load would drop them, and — since
+    // rebuild is gated on BM25 being empty, never on the vector index — the
+    // next save would serialise the absence and lose them for good.
+    const changed = seeded(40);
+    for (let i = 0; i < 40; i++) {
+      changed.add(`obs_${i}`, "ses_1", new Float32Array([i + 99, i, i]));
+    }
+    let writes = 0;
+    const dying = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === VECTOR_BUCKET_SCOPE && ++writes > 3) {
+          throw new Error("engine died mid-save");
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+    await new IndexPersistence(dying as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // The old generation is still fully intact and loadable.
+    const after = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(after.vector!.size).toBe(40);
+    expect(
+      after.vector!.search(new Float32Array([7, 8, 9]), 50)[0]?.obsId,
+    ).toBe("obs_7");
+  });
+
+  it("resumes a reclaim that was published but never finished", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // Save again with different content, failing every delete so the reclaim
+    // list is published but never drained.
+    const changed = seeded(40);
+    changed.add("obs_extra", "ses_1", new Float32Array([5, 5, 5]));
+    const undeletable = {
+      ...kv,
+      delete: async (): Promise<void> => {
+        throw new Error("delete unavailable");
+      },
+    };
+    await new IndexPersistence(undeletable as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const stalled = await kv.get<TestVectorBucketManifest & {
+      reclaim?: Array<{ scope: string; key: string }>;
+    }>(BM25_SCOPE, VECTOR_MANIFEST_KEY);
+    expect(stalled!.reclaim!.length).toBeGreaterThan(0);
+    const stranded = stalled!.reclaim!.map((t) => t.key);
+
+    // A later healthy save must finish the job rather than orphan those keys.
+    await new IndexPersistence(kv as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    for (const key of stranded) {
+      await expect(kv.get(VECTOR_BUCKET_SCOPE, key)).resolves.toBeNull();
+    }
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(41);
+  });
+});
+
+// A failed read is not an empty store, and a mid-save mutation is not a
+// deletion. Both were measured to destroy data before these guards existed.
+describe("IndexPersistence vector save/load hazards", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  async function loadedSize(): Promise<number> {
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    return loaded.vector?.size ?? 0;
+  }
+
+  it("does not persist empty buckets when the index is cleared mid-save", async () => {
+    const vector = seeded(60);
+    // rebuildIndex() calls vectorIndex.clear() synchronously before its first
+    // await, so a search-triggered rebuild lands between two bucket writes.
+    let clearedAt = 0;
+    const clearing = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === VECTOR_BUCKET_SCOPE && ++clearedAt === 2) vector.clear();
+        return kv.set(scope, key, data);
+      },
+    };
+
+    await new IndexPersistence(clearing as never, new SearchIndex(), vector, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // Reading the live Map lazily would serialise every later bucket as "[]",
+    // hash it, publish it as truth, and reclaim the real content behind it.
+    expect(await loadedSize()).toBe(60);
+  });
+
+  it("does not wipe the index when the manifest read fails at load", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(60), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const blindKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === BM25_SCOPE && key === VECTOR_MANIFEST_KEY) {
+          throw new Error("manifest read timed out");
+        }
+        return kv.get(scope, key);
+      },
+    };
+    // Same instance loads then saves, exactly as src/index.ts does.
+    const persistence = new IndexPersistence(
+      blindKv as never,
+      new SearchIndex(),
+      new VectorIndex(),
+      { shardChars: 400, vectorBuckets: 8 },
+    );
+    await persistence.load();
+    await persistence.save();
+
+    expect(await loadedSize()).toBe(60);
+  });
+
+  it("does not delete a bucket whose chunk read failed at load", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(60), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const manifest = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const [victim] = Object.keys(manifest!.shards);
+    const victimChunk = chunkKey(victim, manifest!.shards[victim].hash, 0);
+
+    const flakyKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === VECTOR_BUCKET_SCOPE && key === victimChunk) {
+          throw new Error("chunk read timed out");
+        }
+        return kv.get(scope, key);
+      },
+    };
+    const persistence = new IndexPersistence(
+      flakyKv as never,
+      new SearchIndex(),
+      new VectorIndex(),
+      { shardChars: 400, vectorBuckets: 8 },
+    );
+    const partial = await persistence.load();
+    expect(partial.vector!.size).toBeLessThan(60);
+
+    // The blip must not be converted into a permanent delete.
+    await persistence.save();
+    expect(await loadedSize()).toBe(60);
+  });
+});
+
+// Every other test in this file writes and reads through the same build, so the
+// suite is self-consistent under ANY addressing change and cannot see one. This
+// is the only cross-version fixture: it stands in for "a store written by an
+// older layout" and pins the guard that forces a rewrite instead of a skip.
+describe("IndexPersistence vector layout version", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("rewrites everything when the stored layout version differs", async () => {
+    const vector = seeded(20);
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    }).save();
+
+    // Rewrite the manifest as an older layout while KEEPING every content hash,
+    // then drop the payload keys. Same content, different addressing — exactly
+    // the shape a content hash cannot detect on its own. A build that trusts the
+    // hash alone skips every write and then cannot find its own data.
+    const current = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, {
+      ...current!,
+      layout: current!.layout - 1,
+    });
+    for (const [bucketKey, entry] of Object.entries(current!.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        await kv.delete(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i));
+      }
+    }
+
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(20);
+  });
+});
+
+// Stands in for a store written by a build whose contentHash was a different
+// function: same bodies, same manifest shape, chunk keys still derived from the
+// hash the manifest records — so every chunk is found and every hash fails.
+async function rehashStoreUnder(
+  kv: ReturnType<typeof countingKV>,
+  algorithm: string,
+): Promise<void> {
+  const manifest = (await kv.get<TestVectorBucketManifest>(
+    BM25_SCOPE,
+    VECTOR_MANIFEST_KEY,
+  ))!;
+  const shards: TestVectorBucketManifest["shards"] = {};
+  for (const [bucketKey, entry] of Object.entries(manifest.shards)) {
+    const parts: string[] = [];
+    for (let i = 0; i < entry.chunks; i++) {
+      parts.push(
+        (await kv.get<string>(
+          VECTOR_BUCKET_SCOPE,
+          chunkKey(bucketKey, entry.hash, i),
+        ))!,
+      );
+    }
+    const rehashed = createHash(algorithm)
+      .update(parts.join(""))
+      .digest("hex");
+    for (let i = 0; i < entry.chunks; i++) {
+      await kv.delete(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i));
+      await kv.set(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(bucketKey, rehashed, i),
+        parts[i],
+      );
+    }
+    shards[bucketKey] = { hash: rehashed, chunks: entry.chunks };
+  }
+  await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, { ...manifest, shards });
+}
+
+describe("IndexPersistence vector hash-format change", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  // Both hashes a bucket may legitimately carry. Whichever one this build
+  // publishes, the other stands for a store written either side of the
+  // migration — an older build's, or a newer build's after a rollback.
+  for (const algorithm of ["sha1", "sha256"]) {
+    it(`reads a bucket whose manifest records a ${algorithm} hash`, async () => {
+      await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+        shardChars: 400,
+      }).save();
+
+      await rehashStoreUnder(kv, algorithm);
+
+      const loaded = await new IndexPersistence(
+        kv as never,
+        new SearchIndex(),
+        null,
+      ).load();
+      expect(loaded.vector!.size).toBe(20);
+      expect(loaded.vectorRejected).toBe(false);
+    });
+  }
+
+  it("migrates a store off the previous bucket hash without re-embedding", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    // Stands in for a store this branch's earlier builds wrote: sha1 bucket
+    // hashes, under the layout that published them.
+    await rehashStoreUnder(kv, "sha1");
+    const current = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+    await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, {
+      ...current,
+      layout: current.layout - 1,
+    });
+    const stale = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+
+    const live = new VectorIndex();
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      live,
+      { shardChars: 400 },
+    );
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(20);
+    live.restoreFrom(loaded.vector!);
+
+    await persistence.save();
+
+    const migrated = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+    expect(migrated.layout).toBe(stale.layout + 1);
+    for (const entry of Object.values(migrated.shards)) {
+      // sha256 hex. sha1 would be 40.
+      expect(entry.hash).toHaveLength(64);
+    }
+    for (const [bucketKey, entry] of Object.entries(stale.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        expect(
+          await kv.get(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i)),
+        ).toBeNull();
+      }
+    }
+
+    const reopened = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reopened.vector!.size).toBe(20);
+  });
+
+  it("recovers when a hash change makes every bucket unverifiable", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    await rehashStoreUnder(kv, "sha512");
+    const alien = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+
+    // Boot. The live index starts empty and only ever holds what load hands it.
+    const live = new VectorIndex();
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      live,
+      { shardChars: 400 },
+    );
+    const loaded = await persistence.load();
+    if (loaded.vector && loaded.vector.size > 0) live.restoreFrom(loaded.vector);
+    expect(live.size).toBe(0);
+
+    // A debounce flush can land long before any rebuild finishes. It must not
+    // turn "could not verify" into a delete.
+    await persistence.save();
+    for (const [bucketKey, entry] of Object.entries(alien.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        expect(
+          await kv.get(
+            VECTOR_BUCKET_SCOPE,
+            chunkKey(bucketKey, entry.hash, i),
+          ),
+        ).not.toBeNull();
+      }
+    }
+
+    // Stands in for rebuildIndex(), which src/index.ts fires on this signal and
+    // which refills the live index before scheduling a save. Nothing else ever
+    // re-reads those buckets, so without the signal the vectors stay on disk
+    // and unreadable for the life of the store.
+    if (loaded.vectorRejected) live.restoreFrom(seeded(20));
+    await persistence.save();
+
+    const reopened = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reopened.vector!.size).toBe(20);
+  });
+});
+
+describe("IndexPersistence exclusive maintenance slot (#1372)", () => {
+  it("queues a save behind an in-flight rebuild instead of interleaving", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const rebuild = persistence.runExclusive(async () => {
+      order.push("rebuild-start");
+      await gate;
+      order.push("rebuild-end");
+    });
+    const save = persistence.save().then(() => order.push("save"));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The save must not run while the rebuild owns the indexes.
+    expect(order).toEqual(["rebuild-start"]);
+
+    release();
+    await Promise.all([rebuild, save]);
+    expect(order).toEqual(["rebuild-start", "rebuild-end", "save"]);
+  });
+
+  it("lets a pending save finish before the rebuild slot starts", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    const events: string[] = [];
+    const originalSet = kv.set;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      events.push("save-write");
+      return originalSet(scope, key, data);
+    };
+
+    const save = persistence.save();
+    const rebuild = persistence.runExclusive(async () => {
+      events.push("rebuild");
+    });
+
+    await Promise.all([save, rebuild]);
+    expect(events.filter((e) => e === "save-write").length).toBeGreaterThan(0);
+    expect(events.at(-1)).toBe("rebuild");
+  });
+});
+
+describe("rebuildIndex uses the persistence exclusive slot (#1372)", () => {
+  it("runs a rebuild through IndexPersistence.runExclusive without losing this", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+    const { rebuildIndex, setIndexPersistence, getSearchIndex } = await import(
+      "../src/functions/search.js"
+    );
+    getSearchIndex().clear();
+    setIndexPersistence(persistence as never);
+    try {
+      // Would throw "Cannot read properties of undefined (reading
+      // 'saveQueue')" if runExclusive were invoked unbound.
+      await expect(rebuildIndex(kv as never)).resolves.toBe(0);
+    } finally {
+      setIndexPersistence(null);
+    }
   });
 });
