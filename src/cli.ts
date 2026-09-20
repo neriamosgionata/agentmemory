@@ -1520,12 +1520,14 @@ function prepareEngineLaunch(configPath: string): {
 } {
   const home = homedir();
   const bundledConfig = isBundledConfig(configPath, __dirname);
-  const cwd = resolveEngineCwd(
-    configPath,
-    process.cwd(),
-    home,
-    bundledConfig,
-  );
+  // Engine 0.22 migrates the legacy `workers:` list into a configuration
+  // worker whose storage is cwd-relative (./config). Running every instance
+  // out of ~/.agentmemory made instance 1+ read instance 0's migrated
+  // ports/paths and bind the wrong REST port. Point the engine at its own
+  // data dir so ./config, ./data and friends are instance-scoped.
+  const cwd = bundledConfig
+    ? dataDirResolution.dataDir
+    : resolveEngineCwd(configPath, process.cwd(), home, bundledConfig);
   try {
     mkdirSync(cwd, { recursive: true });
   } catch {
@@ -1554,6 +1556,18 @@ function prepareEngineLaunch(configPath: string): {
     const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
     mkdirSync(dirname(runtimePath), { recursive: true });
     writeFileSync(runtimePath, rewritten, "utf-8");
+    if (bundledConfig) {
+      // The engine migrates the legacy worker list into ./config exactly
+      // once; afterwards that store shadows every freshly rendered port and
+      // path. agentmemory owns this directory (runtime overrides live in
+      // .env), so clear it and let the engine re-migrate from the file just
+      // written.
+      try {
+        rmSync(join(cwd, "config"), { recursive: true, force: true });
+      } catch (err) {
+        vlog(`config store reset failed: ${String(err)}`);
+      }
+    }
     if (selectedInstance === 0 && dataDirResolution.source === "default") {
       for (const m of legacyDataMigrations(
         process.cwd(),
