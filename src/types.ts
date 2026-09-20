@@ -4,6 +4,9 @@ export interface Session {
   cwd: string;
   startedAt: string;
   endedAt?: string;
+  /** Present on rows written by importers/external writers; not set by the
+   *  session lifecycle itself. */
+  updatedAt?: string;
   status: "active" | "completed" | "abandoned";
   observationCount: number;
   model?: string;
