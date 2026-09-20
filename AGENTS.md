@@ -123,4 +123,4 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 - 12 hooks, 17 skills
 - 260+ iii functions
 - Engine: iii v0.24.0 via `iii compose` (native); Docker path still v0.22.1
-- 1,596+ tests (this fork: 1,998 passing)
+- 1,596+ tests (this fork: 2,003 passing)

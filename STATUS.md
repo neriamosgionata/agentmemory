@@ -1,6 +1,8 @@
 # agentmemory — work status
 
-Last updated: 2026-09-20 · branch `main` (fork: `neriamosgionata/agentmemory`, pushed)
+Last updated: 2026-09-21 · branch `main` @ `6f9ff7a` (fork: `neriamosgionata/agentmemory`, pushed)
+`fix/major-bugs` was fully merged (merge commit `846aac0`, 0 unique commits) and
+deleted locally and on `origin`.
 
 ## Engine / runtime
 
@@ -28,10 +30,30 @@ systemctl --user start agentmemory.service
 Compose mode is automatic for engine >= 0.23, or force with `AGENTMEMORY_III_COMPOSE=true`.
 Generated per instance: `worker-compose.yaml` + `compose.env` in the data dir.
 
+## Harness wiring (this machine)
+
+- User service `agentmemory.service`: `ExecStart=/home/amos-neri/.bun/bin/bun
+  /home/amos-neri/Projects/agentmemory/dist/cli.mjs` (node-run unit backed up as
+  `agentmemory.service.bak-node`). Restart it after every `npm run build`.
+- Global CLI: `~/.bun/bin/agentmemory` is a Bun-global symlink to this repo's
+  `dist/cli.mjs`; the shebang is still `env node`, so run `bun dist/cli.mjs` for
+  a pure-Bun CLI process.
+- OpenCode: `~/.config/opencode/plugins/agentmemory-capture.ts` is a symlink to
+  `plugin/opencode/agentmemory-capture.ts` (backups `.bak-20260921`), and
+  `opencode.json` runs MCP as `["/home/amos-neri/.bun/bin/bun",
+  ".../dist/standalone.mjs"]` instead of `npx @agentmemory/mcp`. Capture
+  verified after restart: session observations 801 -> 830. Restart OpenCode
+  after changing either.
+- Hook runtime override: `AGENTMEMORY_HOOK_RUNTIME=bun` rewrites connect-written
+  hook commands for claude-code, codex, devin, droid, dsh and antigravity
+  (`feat(connect)` commit `6f9ff7a`). Static `plugin/hooks/*.json` and
+  `plugin/cursor/hooks.json` manifests stay `node` by design.
+
 ## Verification (all green)
 
-- `npm test`: **1998 passed / 1 skipped**.
-- `npm run build`: clean.
+- `npm test` (node): **2003 passed / 1 skipped**.
+- `bun run build`: clean; `bun dist/standalone.mjs` answers MCP `initialize`
+  and `tools/list`; all 14 hook scripts exit 0 under Bun.
 - Live on 0.24.0 compose: livez ~5 s, `remember` + `search` return data, state store lands in the configured data dir.
 - Live under Bun 1.4.3 (isolated instance and the user service): livez ~4 s,
   compose `state`/`cron`/`http`/`queue` workers up, `remember` + `search`
@@ -60,7 +82,11 @@ Top-8 blockers, plus ~100 issues total across four drain rounds. Highlights:
 
 ## Caveats / remaining
 
-- `agentmemory.service` (user systemd) is **stopped**; it runs old installed code and will fail against 0.24. Repoint `ExecStart` at `node /home/amos-neri/Projects/agentmemory/dist/cli.mjs` or leave stopped.
+- Tests stay a **node** tool: the suite under Bun fails 59/1963 (mostly
+  `vi.resetModules` env semantics and zod CJS/ESM interop), while node passes
+  2003/2004. The app runtime (daemon, worker, CLI, hooks, MCP shim) is Bun.
+- `onnxruntime` inference under Bun is untested (`@huggingface/transformers`
+  imports fine); affects local embeddings / CLIP / reranker only.
 - Docker/deploy templates need their own compose-model pass.
 - Open: #1240 `response_format` wire change; #1377 (not reproducible); #1124 legacy graph with no snapshot degrades but cannot be enumerated safely.
 - CLI foreground behavior: in compose mode the launcher stays attached to `iii compose`; background launches look "stuck" in wrappers that wait for process exit — the server is up within seconds.
@@ -72,3 +98,5 @@ Top-8 blockers, plus ~100 issues total across four drain rounds. Highlights:
 - `src/cli.ts` — engine pin, compose mode detection/launch.
 - `src/state/index-persistence.ts`, `src/functions/search.ts` — index durability.
 - `test/compose-config.test.ts` — compose schema/versions regression.
+- `src/cli/connect/util.ts` — `applyHookRuntime()` (`AGENTMEMORY_HOOK_RUNTIME`).
+- `plugin/opencode/agentmemory-capture.ts` — OpenCode capture plugin (22 hooks).
