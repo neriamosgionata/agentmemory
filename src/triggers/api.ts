@@ -314,6 +314,7 @@ export function registerApiTriggers(
           },
         };
       }
+      const agentId = asNonEmptyString(body.agentId);
       const payload: HookPayload = {
         hookType: hookType as HookPayload["hookType"],
         sessionId,
@@ -321,6 +322,7 @@ export function registerApiTriggers(
         cwd,
         timestamp,
         data: body.data,
+        ...(agentId ? { agentId } : {}),
       };
       const result = await sdk.trigger({ function_id: "mem::observe", payload });
       return { status_code: 201, body: result };

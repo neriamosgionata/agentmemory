@@ -197,18 +197,22 @@ export function registerObserveFunction(
           }
         }
 
-        // Existing session is the source of truth for agentId (even
-        // undefined). Env AGENT_ID only fires when no session row
-        // exists yet — otherwise an unscoped session would get
-        // retroactively scoped by a later AGENT_ID export.
         const existingSession = await kv.get<{
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
         }>(KV.sessions, payload.sessionId);
-        const inheritedAgentId = existingSession
-          ? existingSession.agentId
-          : getAgentId();
+        // Explicit per-call identity wins; otherwise an existing session's
+        // agentId, then the worker env. Env AGENT_ID only fires when no
+        // session row exists yet — otherwise an unscoped session would get
+        // retroactively scoped by a later AGENT_ID export.
+        const explicitAgentId =
+          typeof payload.agentId === "string" && payload.agentId.trim().length > 0
+            ? payload.agentId.trim()
+            : undefined;
+        const inheritedAgentId =
+          explicitAgentId ??
+          (existingSession ? existingSession.agentId : getAgentId());
         if (inheritedAgentId) {
           raw.agentId = inheritedAgentId;
         }

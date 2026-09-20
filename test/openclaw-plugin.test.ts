@@ -46,7 +46,7 @@ describe("openclaw plugin — memory capability registration (closes #286 follow
     expect(() => plugin.register(api)).not.toThrow();
     expect(api.on).toHaveBeenCalled();
     const events = (api.on as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
-    expect(events).toContain("before_agent_start");
+    expect(events).toContain("before_prompt_build");
     expect(events).toContain("agent_end");
   });
 

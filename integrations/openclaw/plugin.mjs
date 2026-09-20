@@ -3,7 +3,7 @@
  *
  * Deeper integration than raw MCP:
  * - claims the plugins.slots.memory slot via api.registerMemoryCapability({ promptBuilder })
- * - recalls relevant memories before the agent starts (before_agent_start hook)
+ * - recalls relevant memories before the agent starts (before_prompt_build hook)
  * - captures completed conversation turns after the agent finishes (agent_end hook)
  *
  * Requires the agentmemory server on localhost:3111.
@@ -64,6 +64,16 @@ function asNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
+// git-basename normalization: Claude Code writes projects as the repo
+// basename, so a raw cwd here fragments cross-agent recall (#1058).
+function normalizeProject(value) {
+  const text = asNonEmptyString(value);
+  if (!text) return "";
+  if (!text.includes("/") && !text.includes("\\")) return text;
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : text;
+}
+
 function deriveProject(event) {
   const candidates = [
     event?.project,
@@ -77,10 +87,14 @@ function deriveProject(event) {
     event?.workspace?.cwd,
   ];
   for (const value of candidates) {
-    const text = asNonEmptyString(value);
+    const text = normalizeProject(value);
     if (text) return text;
   }
   return "";
+}
+
+function deriveAgentId(ctx, event) {
+  return asNonEmptyString(ctx?.agentId) || asNonEmptyString(event?.agentId);
 }
 
 function formatResults(results) {
@@ -192,21 +206,26 @@ const plugin = {
           "Long-term memory provider: agentmemory (external REST service on " +
             client.baseUrl +
             ").",
-          "agentmemory recalls relevant prior observations before each turn via the before_agent_start hook and captures completed turns via agent_end.",
+          "agentmemory recalls relevant prior observations before each turn via the before_prompt_build hook and captures completed turns via agent_end.",
           "Treat recalled context as background, not authoritative — prefer current workspace state and explicit user instructions when they conflict.",
         ],
       });
     }
 
-    api.on("before_agent_start", async (event) => {
+    // OpenClaw's typed plugin hook is before_prompt_build (#1161);
+    // before_agent_start only exists in the extension runner and is ignored
+    // with "unknown typed hook" on current gateways.
+    api.on("before_prompt_build", async (event, ctx) => {
       if (!cfg.enabled) return;
       const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
       if (!prompt) return;
       const project = deriveProject(event);
+      const agentId = deriveAgentId(ctx, event);
       const result = await client.postJson("/agentmemory/smart-search", {
         query: prompt,
         limit: 5,
         ...(project ? { project } : {}),
+        ...(agentId ? { agentId } : {}),
       });
       const block = formatResults(result?.results || []);
       if (!block) return;
@@ -215,7 +234,7 @@ const plugin = {
       };
     });
 
-    api.on("agent_end", async (event) => {
+    api.on("agent_end", async (event, ctx) => {
       if (!cfg.enabled || !event?.success || !Array.isArray(event.messages)) return;
       const userText = latestUserText(event.messages);
       const assistantText = lastAssistantText(event.messages);
@@ -226,7 +245,8 @@ const plugin = {
         event.runId ||
         `openclaw-${Date.now()}`;
       const project = deriveProject(event);
-      await client.postJson("/agentmemory/observe", {
+      const agentId = deriveAgentId(ctx, event);
+      const payload = {
         hookType: "post_tool_use",
         sessionId,
         project: project || sessionId,
@@ -237,7 +257,17 @@ const plugin = {
           tool_input: userText.slice(0, 1000),
           tool_output: assistantText.slice(0, 4000),
         },
-      });
+        ...(agentId ? { agentId } : {}),
+      };
+      const captured = await client.postJson("/agentmemory/observe", payload);
+      // #1058: mem::observe opens an `active` session for a new id and the
+      // plugin had no close path, so active sessions accumulated forever on
+      // the dashboard. Close it once the turn is captured.
+      if (captured) {
+        await client
+          .postJson("/agentmemory/session/end", { sessionId })
+          .catch(() => null);
+      }
     });
   },
 };

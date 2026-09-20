@@ -50,7 +50,7 @@ describe("OpenClaw plugin project scoping", () => {
     mockFetch(calls);
     const handlers = registerPlugin();
 
-    await handlers.get("before_agent_start")?.({
+    await handlers.get("before_prompt_build")?.({
       prompt: "recall auth changes",
       project: "team-alpha",
     });
@@ -78,7 +78,9 @@ describe("OpenClaw plugin project scoping", () => {
       ],
     });
 
-    expect(calls).toHaveLength(1);
+    // observe + session/end: the plugin closes the session it opened so
+    // OpenClaw turns do not leave zombie `active` rows (#1058).
+    expect(calls).toHaveLength(2);
     expect(calls[0].url).toContain("/agentmemory/observe");
     expect(calls[0].body).toMatchObject({
       hookType: "post_tool_use",
@@ -86,6 +88,46 @@ describe("OpenClaw plugin project scoping", () => {
       project: "sess-123",
       cwd: "sess-123",
     });
+    expect(calls[1].url).toContain("/agentmemory/session/end");
+    expect(calls[1].body).toMatchObject({ sessionId: "sess-123" });
+  });
+
+  it("threads agentId from the hook context into recall and capture", async () => {
+    const calls: Array<{ url: string; body: any }> = [];
+    mockFetch(calls);
+    const handlers = registerPlugin();
+
+    await handlers.get("before_prompt_build")?.(
+      { prompt: "scoped recall" },
+      { agentId: "agent-7" },
+    );
+    await handlers.get("agent_end")?.(
+      {
+        success: true,
+        sessionKey: "sess-agent",
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "there" },
+        ],
+      },
+      { agentId: "agent-7" },
+    );
+
+    expect(calls[0].body).toMatchObject({ agentId: "agent-7" });
+    expect(calls[1].body).toMatchObject({ agentId: "agent-7" });
+  });
+
+  it("normalizes a raw cwd path to its git basename (#1058)", async () => {
+    const calls: Array<{ url: string; body: any }> = [];
+    mockFetch(calls);
+    const handlers = registerPlugin();
+
+    await handlers.get("before_prompt_build")?.({
+      prompt: "recall",
+      cwd: "/home/dev/repos/agentmemory",
+    });
+
+    expect(calls[0].body).toMatchObject({ project: "agentmemory" });
   });
 
   it("uses nested workspace project metadata when top-level project is absent", async () => {
@@ -93,7 +135,7 @@ describe("OpenClaw plugin project scoping", () => {
     mockFetch(calls);
     const handlers = registerPlugin();
 
-    await handlers.get("before_agent_start")?.({
+    await handlers.get("before_prompt_build")?.({
       prompt: "open memory",
       workspace: { project: "nested-proj" },
     });

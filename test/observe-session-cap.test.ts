@@ -8,6 +8,7 @@ const removedFromBm25: string[] = [];
 const removedFromVector: string[] = [];
 
 vi.mock("../src/functions/search.js", () => ({
+  scheduleIndexSave: () => {},
   getSearchIndex: () => ({
     remove: (id: string) => {
       removedFromBm25.push(id);
