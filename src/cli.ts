@@ -118,17 +118,17 @@ if (args.includes("--version") || args.includes("-V")) {
   process.exit(0);
 }
 
-// Pinned iii-engine version. Pin to v0.22.1 — the newest engine that runs
-// agentmemory's direct-registration worker model cleanly. Engine 0.23.0 is
-// the breaking Compose release: `iii compose` owns a worker-compose.yaml
-// with registry packages, and a direct config.yaml with worker entries stops
-// with UNSUPPORTED_CONFIG_WORKERS. agentmemory has not been refactored onto
-// that lifecycle yet. 0.22.1 carries the upstream fixes this project needed
-// (worker re-registration after reconnect, RSS/shutdown behavior).
-// Override env var AGENTMEMORY_III_VERSION lets users who have migrated to
-// the Compose model point at a newer engine without us cutting a release.
+// Pinned iii-engine version. Native installs run v0.24.0 through the
+// `iii compose` worker model (see COMPOSE_MODE below). The Docker path still
+// ships the legacy list-shaped iii-config.docker.yaml, which 0.23+ rejects,
+// so it stays on 0.22.1 unless the operator overrides the version.
+// Override env var AGENTMEMORY_III_VERSION points both paths at another pin.
+const USE_DOCKER_REQUESTED =
+  process.env["AGENTMEMORY_USE_DOCKER"] === "1" ||
+  process.env["AGENTMEMORY_USE_DOCKER"] === "true";
 const IIPINNED_VERSION =
-  process.env["AGENTMEMORY_III_VERSION"] || "0.22.1";
+  process.env["AGENTMEMORY_III_VERSION"] ||
+  (USE_DOCKER_REQUESTED ? "0.22.1" : "0.24.0");
 
 // Engine 0.23+ only runs the compose worker model. Auto-enable it for those
 // pins; the explicit env flag lets a 0.22 install test the path early.

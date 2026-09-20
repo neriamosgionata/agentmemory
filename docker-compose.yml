@@ -18,6 +18,8 @@ services:
     restart: "no"
 
   iii-engine:
+    # Legacy Docker path: 0.23+ rejects the list-shaped config this compose
+    # file feeds, so the image stays on the last legacy-compatible engine.
     # Pinned to v0.22.1 — the newest engine that runs agentmemory's current
     # direct-registration worker cleanly. 0.23.0 switches to the `iii
     # compose` worker-compose.yaml lifecycle that agentmemory has not been
