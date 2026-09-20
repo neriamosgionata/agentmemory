@@ -173,7 +173,10 @@ describe("session lifecycle API", () => {
 
     expect(response.status_code).toBe(200);
     expect(response.body.sessions).toEqual([valid]);
-    expect(harness.kv.get).toHaveBeenCalledWith(KV.summaries, valid.id);
+    // #1324 replaced the per-session kv.get fan-out with one summaries list;
+    // the regression this test guards is that no summary lookup ever runs
+    // with an undefined key for the malformed row.
+    expect(harness.kv.list).toHaveBeenCalledWith(KV.summaries);
     expect(harness.kv.get).not.toHaveBeenCalledWith(KV.summaries, undefined);
   });
 });
