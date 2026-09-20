@@ -2190,3 +2190,23 @@ describe("IndexPersistence exclusive maintenance slot (#1372)", () => {
     expect(events.at(-1)).toBe("rebuild");
   });
 });
+
+describe("rebuildIndex uses the persistence exclusive slot (#1372)", () => {
+  it("runs a rebuild through IndexPersistence.runExclusive without losing this", async () => {
+    const kv = mockKV();
+    const bm25 = new SearchIndex();
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+    const { rebuildIndex, setIndexPersistence, getSearchIndex } = await import(
+      "../src/functions/search.js"
+    );
+    getSearchIndex().clear();
+    setIndexPersistence(persistence as never);
+    try {
+      // Would throw "Cannot read properties of undefined (reading
+      // 'saveQueue')" if runExclusive were invoked unbound.
+      await expect(rebuildIndex(kv as never)).resolves.toBe(0);
+    } finally {
+      setIndexPersistence(null);
+    }
+  });
+});

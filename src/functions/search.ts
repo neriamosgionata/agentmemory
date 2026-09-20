@@ -339,9 +339,10 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
       indexPersistence?.scheduleSave();
     }
   };
-  const exclusive = indexPersistence?.runExclusive;
-  if (!exclusive) return run();
-  return exclusive(run);
+  // Call as a method so `this` is the persistence instance; a bare method
+  // reference throws on the first this.saveQueue access.
+  if (!indexPersistence?.runExclusive) return run();
+  return indexPersistence.runExclusive(run);
 }
 
 async function rebuildIndexUnlocked(kv: StateKV): Promise<number> {
