@@ -1759,11 +1759,23 @@ export function registerApiTriggers(
   // min) while the server-side loop kept burning LLM calls for hours. Each
   // call is now bounded by maxSessions AND a wall-clock budget, and reports
   // nextOffset/hasMore so callers can drain in resumable chunks.
+  //
+  // A batch that fails (thrown invocation, or graph-extract reporting
+  // success:false) keeps the cursor on that batch so the next call retries
+  // it, up to MAX_GRAPH_BATCH_ATTEMPTS consecutive failures; after that the
+  // batch is skipped and logged so one poison batch cannot stall the drain.
+  const MAX_GRAPH_BATCH_ATTEMPTS = 3;
+  const graphBatchFailures = new Map<string, number>();
   sdk.registerFunction("api::graph-build",
-    async (req: ApiRequest<{ batchSize?: number; maxSessions?: number; offset?: number }>): Promise<Response> => {
+    async (req: ApiRequest<{ batchSize?: number; maxSessions?: number; offset?: number; batchOffset?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const body = (req.body ?? {}) as { batchSize?: number; maxSessions?: number; offset?: number };
+      const body = (req.body ?? {}) as {
+        batchSize?: number;
+        maxSessions?: number;
+        offset?: number;
+        batchOffset?: number;
+      };
       const batchSize = Math.max(
         1,
         Math.min(100, Number(body.batchSize) || 25),
@@ -1773,6 +1785,7 @@ export function registerApiTriggers(
         Math.min(200, Number(body.maxSessions) || 25),
       );
       const offset = Math.max(0, Math.floor(Number(body.offset) || 0));
+      const batchOffset = Math.max(0, Math.floor(Number(body.batchOffset) || 0));
       const timeBudgetMs = 60_000;
       const startedAt = Date.now();
       try {
@@ -1783,45 +1796,95 @@ export function registerApiTriggers(
         let batchesRun = 0;
         let processedSessions = 0;
         let nextOffset = offset;
+        let nextBatchOffset = 0;
         let budgetExceeded = false;
-        for (const session of window) {
+        let interrupted = false;
+        let skippedBatches = 0;
+
+        for (let wi = 0; wi < window.length; wi++) {
           if (Date.now() - startedAt > timeBudgetMs) {
             budgetExceeded = true;
+            interrupted = true;
+            nextOffset = offset + wi;
+            nextBatchOffset = 0;
             break;
           }
+          const session = window[wi];
           const sid = session?.id;
           if (typeof sid !== "string" || sid.length === 0) {
-            nextOffset++;
             continue;
           }
           const observations = await kv.list<CompressedObservation>(KV.observations(sid));
           const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
-          if (compressed.length > 0) {
-            for (let i = 0; i < compressed.length; i += batchSize) {
-              const batch = compressed.slice(i, i + batchSize);
-              try {
-                const result = (await sdk.trigger({
-                  function_id: "mem::graph-extract",
-                  payload: { observations: batch },
-                })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
-                if (result?.success) {
-                  totalNodes += Number(result.nodesAdded) || 0;
-                  totalEdges += Number(result.edgesAdded) || 0;
-                }
-                batchesRun++;
-              } catch (err) {
-                logger.warn("graph-build batch failed", {
-                  sessionId: sid,
-                  batchIndex: Math.floor(i / batchSize),
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
+          // A single 1000-observation session can outlive the engine's 180s
+          // invocation ceiling, so the budget is enforced per batch and the
+          // caller resumes the same session via batchOffset (#1339 follow-up).
+          const startBatch = wi === 0 ? Math.min(batchOffset, compressed.length) : 0;
+          let resumeAt = startBatch;
+          for (let i = startBatch; i < compressed.length; i += batchSize) {
+            if (Date.now() - startedAt > timeBudgetMs) {
+              budgetExceeded = true;
+              interrupted = true;
+              nextOffset = offset + wi;
+              nextBatchOffset = resumeAt;
+              break;
             }
+            const batch = compressed.slice(i, i + batchSize);
+            const failKey = `${sid}:${i}`;
+            let batchError: string | undefined;
+            try {
+              const result = (await sdk.trigger({
+                function_id: "mem::graph-extract",
+                payload: { observations: batch },
+              })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number; error?: string };
+              if (result?.success) {
+                totalNodes += Number(result.nodesAdded) || 0;
+                totalEdges += Number(result.edgesAdded) || 0;
+              } else {
+                batchError = result?.error ?? "graph-extract returned success=false";
+              }
+              batchesRun++;
+            } catch (err) {
+              batchError = err instanceof Error ? err.message : String(err);
+            }
+            if (batchError === undefined) {
+              graphBatchFailures.delete(failKey);
+              resumeAt = i + batchSize;
+              continue;
+            }
+            const attempts = (graphBatchFailures.get(failKey) ?? 0) + 1;
+            if (attempts >= MAX_GRAPH_BATCH_ATTEMPTS) {
+              graphBatchFailures.delete(failKey);
+              skippedBatches++;
+              logger.error("graph-build batch skipped after repeated failures", {
+                sessionId: sid,
+                batchIndex: Math.floor(i / batchSize),
+                attempts,
+                error: batchError,
+              });
+              resumeAt = i + batchSize;
+              continue;
+            }
+            graphBatchFailures.set(failKey, attempts);
+            logger.warn("graph-build batch failed, retrying on next call", {
+              sessionId: sid,
+              batchIndex: Math.floor(i / batchSize),
+              attempt: attempts,
+              maxAttempts: MAX_GRAPH_BATCH_ATTEMPTS,
+              error: batchError,
+            });
+            interrupted = true;
+            nextOffset = offset + wi;
+            nextBatchOffset = i;
+            break;
           }
+          if (interrupted) break;
           processedSessions++;
-          nextOffset++;
+          nextOffset = offset + wi + 1;
+          nextBatchOffset = 0;
         }
-        const hasMore = nextOffset < sessions.length;
+
+        const hasMore = interrupted || nextOffset < sessions.length;
         return {
           status_code: 200,
           body: {
@@ -1830,18 +1893,25 @@ export function registerApiTriggers(
             processedSessions,
             offset,
             nextOffset,
+            nextBatchOffset,
             hasMore,
             budgetExceeded,
+            skippedBatches,
             batches: batchesRun,
             nodes: totalNodes,
             edges: totalEdges,
             hint: hasMore
-              ? `Call again with offset=${nextOffset} (and the same maxSessions) until hasMore is false.`
+              ? `Call again with offset=${nextOffset}&batchOffset=${nextBatchOffset} (and the same maxSessions) until hasMore is false.`
               : undefined,
           },
         };
-      } catch {
-        return graphDisabledResponse();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error("graph-build failed", { error: message });
+        return {
+          status_code: 500,
+          body: { success: false, error: message },
+        };
       }
     },
   );

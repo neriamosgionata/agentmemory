@@ -26,9 +26,10 @@ function mockKV() {
   };
 }
 
-function mockSdk() {
+function mockSdk(options: { failures?: number; mode?: "throw" | "success-false" } = {}) {
   const handlers = new Map<string, Function>();
   const extractCalls: Array<{ observations: unknown[] }> = [];
+  let failuresLeft = options.failures ?? 0;
   return {
     handlers,
     extractCalls,
@@ -38,6 +39,11 @@ function mockSdk() {
       trigger: async (input: { function_id: string; payload?: unknown }) => {
         if (input.function_id === "mem::graph-extract") {
           extractCalls.push(input.payload as { observations: unknown[] });
+          if (failuresLeft > 0) {
+            failuresLeft--;
+            if (options.mode === "throw") throw new Error("invocation timed out after 180000ms");
+            return { success: false, error: "LLM graph extraction failed" };
+          }
           return { success: true, nodesAdded: 1, edgesAdded: 0 };
         }
         return {};
@@ -126,5 +132,119 @@ describe("api::graph-build resumable windows (#1339)", () => {
 
     expect(res.body["batches"]).toBe(3);
     expect(extractCalls.map((c) => c.observations.length)).toEqual([2, 2, 1]);
+  });
+
+  it("resumes a partially processed session via batchOffset", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 5);
+    const { sdk, handlers, extractCalls } = mockSdk();
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+
+    const resume = await callBuild(handlers, {
+      batchSize: 2,
+      maxSessions: 1,
+      offset: 0,
+      batchOffset: 2,
+    });
+
+    expect(resume.body["batches"]).toBe(2);
+    expect(resume.body["nextOffset"]).toBe(1);
+    expect(resume.body["nextBatchOffset"]).toBe(0);
+    expect(resume.body["hasMore"]).toBe(false);
+    expect(extractCalls.map((c) => c.observations.length)).toEqual([2, 1]);
+  });
+
+  it("returns a mid-session resume point when the budget is exhausted", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 4);
+    const { sdk, handlers } = mockSdk();
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+
+    const realNow = Date.now;
+    let calls = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => {
+      calls++;
+      return calls <= 3 ? realNow() : realNow() + 120_000;
+    });
+    const res = await callBuild(handlers, {
+      batchSize: 1,
+      maxSessions: 1,
+      offset: 0,
+    });
+    spy.mockRestore();
+
+    expect(res.body["budgetExceeded"]).toBe(true);
+    expect(res.body["nextOffset"]).toBe(0);
+    expect(res.body["nextBatchOffset"]).toBe(1);
+    expect(res.body["hasMore"]).toBe(true);
+    expect(String(res.body["hint"])).toContain("batchOffset=1");
+  });
+
+  it("keeps the cursor on a failed batch so the next call retries it", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 4);
+    const { sdk, handlers, extractCalls } = mockSdk({ failures: 1 });
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+
+    const first = await callBuild(handlers, { batchSize: 2, maxSessions: 1 });
+    expect(first.body["nextOffset"]).toBe(0);
+    expect(first.body["nextBatchOffset"]).toBe(0);
+    expect(first.body["hasMore"]).toBe(true);
+    expect(first.body["skippedBatches"]).toBe(0);
+    expect(extractCalls).toHaveLength(1);
+
+    const second = await callBuild(handlers, {
+      batchSize: 2,
+      maxSessions: 1,
+      offset: 0,
+      batchOffset: 0,
+    });
+    expect(second.body["nextOffset"]).toBe(1);
+    expect(second.body["nextBatchOffset"]).toBe(0);
+    expect(second.body["hasMore"]).toBe(false);
+    expect(second.body["skippedBatches"]).toBe(0);
+    expect(extractCalls).toHaveLength(3);
+  });
+
+  it("skips a batch only after three consecutive failed attempts", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 2);
+    const { sdk, handlers, extractCalls } = mockSdk({ failures: 3, mode: "throw" });
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+
+    const first = await callBuild(handlers, { batchSize: 1, maxSessions: 1 });
+    expect(first.body["nextBatchOffset"]).toBe(0);
+    expect(first.body["hasMore"]).toBe(true);
+
+    const second = await callBuild(handlers, { batchSize: 1, maxSessions: 1 });
+    expect(second.body["nextBatchOffset"]).toBe(0);
+    expect(second.body["hasMore"]).toBe(true);
+    expect(second.body["skippedBatches"]).toBe(0);
+
+    const third = await callBuild(handlers, { batchSize: 1, maxSessions: 1 });
+    expect(third.body["skippedBatches"]).toBe(1);
+    expect(third.body["nextOffset"]).toBe(1);
+    expect(third.body["hasMore"]).toBe(false);
+    expect(extractCalls).toHaveLength(4);
+  });
+
+  it("returns a 500 error body instead of a completion-looking one when the build throws", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 1);
+    const broken = {
+      ...kv,
+      list: async () => {
+        throw new Error("state worker unavailable");
+      },
+    };
+    const { sdk, handlers } = mockSdk();
+    registerApiTriggers(sdk as never, broken as never, SECRET);
+
+    const res = await callBuild(handlers, { maxSessions: 1 });
+
+    expect(res.status_code).toBe(500);
+    expect(res.body["success"]).toBe(false);
+    expect(res.body["hasMore"]).toBeUndefined();
+    expect(res.body["nextOffset"]).toBeUndefined();
   });
 });
