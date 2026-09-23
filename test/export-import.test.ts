@@ -7,6 +7,7 @@ vi.mock("../src/logger.js", () => ({
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { VERSION } from "../src/version.js";
 import { getSearchIndex } from "../src/functions/search.js";
+import { KV } from "../src/state/schema.js";
 import type {
   Session,
   CompressedObservation,
@@ -317,6 +318,69 @@ describe("Export/Import Functions", () => {
     )) as ExportData;
     expect(reExported.sessions.length).toBe(exported.sessions.length);
     expect(reExported.memories.length).toBe(exported.memories.length);
+  });
+
+  it("export payload contains no derived-state scopes", async () => {
+    // R6: summary partials and graph-extraction watermarks are internal
+    // derived state. They must never travel in an export payload.
+    await kv.set(KV.summaryPartials, "ses_1", {
+      sessionId: "ses_1",
+      chunkSize: 10,
+      coveredCount: 1,
+      chunks: [],
+      updatedAt: "2026-02-01T00:00:00Z",
+    });
+    await kv.set(KV.graphExtractionWatermarks, "ses_1", {
+      sessionId: "ses_1",
+      extractedCount: 1,
+      boundaryObservationId: "obs_1",
+      updatedAt: "2026-02-01T00:00:00Z",
+    });
+
+    const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+    expect(Object.keys(result)).not.toContain("summaryPartials");
+    expect(Object.keys(result)).not.toContain("graphExtractionWatermarks");
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("mem:summary-partials");
+    expect(serialized).not.toContain("mem:graph:extraction-watermarks");
+  });
+
+  it("import of a full payload with replace leaves derived scopes empty", async () => {
+    await kv.set(KV.summaryPartials, "ses_1", {
+      sessionId: "ses_1",
+      chunkSize: 10,
+      coveredCount: 1,
+      chunks: [],
+      updatedAt: "2026-02-01T00:00:00Z",
+    });
+    await kv.set(KV.graphExtractionWatermarks, "ses_1", {
+      sessionId: "ses_1",
+      extractedCount: 1,
+      boundaryObservationId: "obs_1",
+      updatedAt: "2026-02-01T00:00:00Z",
+    });
+
+    const exported = (await sdk.trigger("mem::export", {})) as ExportData;
+    const freshKv = mockKV();
+    const freshSdk = mockSdk();
+    registerExportImportFunction(freshSdk as never, freshKv as never);
+    await freshKv.set(KV.summaryPartials, "ses_stale", {
+      sessionId: "ses_stale",
+      chunkSize: 10,
+      coveredCount: 1,
+      chunks: [],
+      updatedAt: "2026-02-01T00:00:00Z",
+    });
+
+    const result = (await freshSdk.trigger("mem::import", {
+      exportData: exported,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await freshKv.list(KV.summaryPartials)).toEqual([]);
+    expect(await freshKv.list(KV.graphExtractionWatermarks)).toEqual([]);
   });
 
   it("import rejects unsupported version", async () => {

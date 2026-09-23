@@ -10,6 +10,32 @@ export interface ObservationDeletion {
 }
 
 /**
+ * Derived per-session state (incremental summary partials, graph-extraction
+ * watermarks) is only valid for the exact observation rows it was computed
+ * from. Any delete or reorder invalidates the partial cache's chunk
+ * boundaries and the watermark's coverage, so both rows are dropped and the
+ * next summarize/extract recomputes from scratch. Missing rows are not an
+ * error: most sessions never had derived state to begin with.
+ */
+export async function clearSessionDerivedState(
+  kv: StateKV,
+  sessionId: string,
+): Promise<void> {
+  if (!sessionId) return;
+  for (const scope of [KV.summaryPartials, KV.graphExtractionWatermarks]) {
+    try {
+      await kv.delete(scope, sessionId);
+    } catch (err) {
+      logger.warn("derived-state cleanup failed", {
+        scope,
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/**
  * Every observation delete path (evict, auto-forget, the per-session capture
  * cap) removed the KV row and search entries but left two derived views
  * stale: the owning session's observationCount and the graph nodes/edges that
@@ -44,6 +70,13 @@ export async function reconcileObservationDeletions(
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  // A delete shifts the observation list, so any partial cache or
+  // extraction watermark computed against the old shape is stale even
+  // though the surviving rows are untouched. Force a full recompute.
+  for (const sessionId of perSession.keys()) {
+    await clearSessionDerivedState(kv, sessionId);
   }
 
   try {

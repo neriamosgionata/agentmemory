@@ -9,6 +9,7 @@ import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit, safeAudit, queryAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
+import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
 
@@ -30,6 +31,7 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
       let deleted = 0;
       let deletedObservations = 0;
       const notFound: string[] = [];
+      const deletedObsSessions = new Set<string>();
       const index = getSearchIndex();
       for (const id of data.memoryIds) {
         const mem = await kv.get<Memory>(KV.memories, id);
@@ -63,7 +65,12 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
         await deleteAccessLog(kv, id);
         index.remove(id);
         vectorIndexRemove(id);
+        deletedObsSessions.add(sessionId);
         deletedObservations++;
+      }
+
+      for (const sessionId of deletedObsSessions) {
+        await clearSessionDerivedState(kv, sessionId);
       }
 
       if (deleted + deletedObservations > 0) await flushIndexSave();

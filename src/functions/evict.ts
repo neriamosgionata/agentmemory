@@ -17,6 +17,7 @@ import {
   vectorIndexRemove,
 } from "./search.js";
 import {
+  clearSessionDerivedState,
   reconcileObservationDeletions,
   type ObservationDeletion,
 } from "./observation-lifecycle.js";
@@ -212,6 +213,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               vectorIndexRemove(o.id);
               indexMutations++;
             }
+            await clearSessionDerivedState(kv, session.id);
             await recordAudit(kv, "delete", "mem::evict", [session.id], {
               resource: "session",
               reason: recovered

@@ -23,9 +23,12 @@ import type {
   Insight,
   ExportPagination,
   AccessLogExport,
+  SummaryPartialCache,
+  GraphExtractionWatermark,
 } from "../types.js";
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
+import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
@@ -430,6 +433,23 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         await runChunked(obsDeletes, (d) =>
           kv.delete(KV.observations(d.sessionId), d.obsId),
         );
+        // Derived state is keyed by sessionId, so enumerating KV.sessions
+        // cannot reach rows orphaned by an earlier session delete. Sweep
+        // both scopes by their stored sessionId: a replace must leave no
+        // partial cache or extraction watermark behind. #R6
+        const [partialRows, watermarkRows] = await Promise.all([
+          kv.list<SummaryPartialCache>(KV.summaryPartials).catch(() => []),
+          kv
+            .list<GraphExtractionWatermark>(KV.graphExtractionWatermarks)
+            .catch(() => []),
+        ]);
+        const derivedSessions = new Set<string>([
+          ...partialRows.map((row) => row.sessionId),
+          ...watermarkRows.map((row) => row.sessionId),
+        ]);
+        for (const derivedSessionId of derivedSessions) {
+          await clearSessionDerivedState(kv, derivedSessionId);
+        }
         await runChunked(await kv.list<Memory>(KV.memories), (m) =>
           kv.delete(KV.memories, m.id),
         );

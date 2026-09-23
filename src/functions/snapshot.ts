@@ -19,6 +19,7 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { flushIndexSave, rebuildIndex } from "./search.js";
 import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
@@ -263,6 +264,7 @@ export function registerSnapshotFunction(
           for (const o of obs) {
             await kv.delete(KV.observations(session.id), o.id);
           }
+          await clearSessionDerivedState(kv, session.id);
         }
 
         if (state.sessions) {

@@ -8,6 +8,7 @@ import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
+import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { logger } from "../logger.js";
 
 // Slicing by UTF-16 code unit can cut an astral character (emoji, some CJK
@@ -291,6 +292,9 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           deletedObservationIds.push(obsId);
           deleted++;
         }
+        if (deletedObservationIds.length > 0) {
+          await clearSessionDerivedState(kv, data.sessionId);
+        }
       }
 
       if (
@@ -314,6 +318,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         }
         await kv.delete(KV.sessions, data.sessionId);
         await kv.delete(KV.summaries, data.sessionId);
+        await clearSessionDerivedState(kv, data.sessionId);
         deletedSession = true;
         deleted += 2;
       }
