@@ -42,6 +42,11 @@ export const KV = {
   graphNameIndex: "mem:graph:name-index",
   graphEdgeKey: "mem:graph:edge-key",
   graphNodeDegree: "mem:graph:node-degree",
+  // R4/R5: per-session graph-extraction watermark for the session-stop tail
+  // loop. Keyed by sessionId; the record carries sessionId so
+  // enumeration-based cleanup (mem::graph-reset) can recover the key
+  // (listing a scope returns values, not keys).
+  graphExtractionWatermarks: "mem:graph:extraction-watermarks",
   semantic: "mem:semantic",
   procedural: "mem:procedural",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,

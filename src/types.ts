@@ -157,6 +157,18 @@ export interface SummaryPartialCache {
   updatedAt: string;
 }
 
+// R4/R5: per-session graph-extraction watermark for the session-stop tail
+// loop. `extractedCount` counts the compressed observations already fed to
+// mem::graph-extract in KV.observations list order; `boundaryObservationId`
+// pins the last extracted one so a shifted list can be re-anchored.
+// Internal only: derived state, never exported, never a graph payload field.
+export interface GraphExtractionWatermark {
+  sessionId: string;
+  extractedCount: number;
+  boundaryObservationId: string;
+  updatedAt: string;
+}
+
 export type HookType =
   | "session_start"
   | "prompt_submit"

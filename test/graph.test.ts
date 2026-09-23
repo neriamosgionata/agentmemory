@@ -780,14 +780,16 @@ describe("Graph Functions", () => {
       expect(result.error).toMatch(/graph\/reset|force/);
     });
 
-    it("graph-reset is enumeration-free (does not call kv.list)", async () => {
-      // Wrap the mock kv.list with a counter; assert it stays at 0
-      // across a full reset cycle.
+    it("graph-reset never enumerates graph rows (does not kv.list nodes/edges)", async () => {
+      // Reset must stay enumeration-free on the two scopes that
+      // heartbeat-crash the worker on legacy 75K-node corpora. It does list
+      // the small per-session watermark scope to clear it (R5), so filter
+      // by scope instead of counting every list call.
       const localKv = mockKV();
-      let listCalls = 0;
+      const listScopes: string[] = [];
       const baseList = localKv.list;
       localKv.list = async <T,>(scope: string): Promise<T[]> => {
-        listCalls += 1;
+        listScopes.push(scope);
         return baseList.call(localKv, scope) as Promise<T[]>;
       };
       const localSdk = mockSdk();
@@ -797,7 +799,8 @@ describe("Graph Functions", () => {
         success: boolean;
       };
       expect(result.success).toBe(true);
-      expect(listCalls).toBe(0);
+      expect(listScopes).not.toContain("mem:graph:nodes");
+      expect(listScopes).not.toContain("mem:graph:edges");
     });
   });
 });

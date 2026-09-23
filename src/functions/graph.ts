@@ -5,6 +5,7 @@ import type {
   GraphQueryResult,
   GraphSnapshot,
   CompressedObservation,
+  GraphExtractionWatermark,
   MemoryProvider,
   Session,
 } from "../types.js";
@@ -849,7 +850,7 @@ export function registerGraphFunction(
 
       if (nodes.length === 0 && edges.length === 0) {
         return llmError
-          ? { success: false, error: llmError }
+          ? { success: false, error: llmError, llmFailed: true }
           : { success: true, nodesAdded: 0, edgesAdded: 0 };
       }
 
@@ -877,6 +878,10 @@ export function registerGraphFunction(
           success: true,
           nodesAdded: nodes.length,
           edgesAdded: edges.length,
+          // R4/R5: the structural delta above persisted, but the LLM leg
+          // failed. Callers that track coverage (session-stop watermark)
+          // must not count this batch as fully extracted.
+          ...(llmError ? { llmFailed: true, error: llmError } : {}),
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1259,6 +1264,21 @@ export function registerGraphFunction(
     maxRecords?: number;
   }) => {
     const started = Date.now();
+    // R5: a reset invalidates every per-session extraction watermark, on
+    // both the snapshot-only and the confirm path. Otherwise the next
+    // session stop would resume past the wiped range and the graph would
+    // stay empty. Enumerate-and-delete by the stored sessionId because
+    // state::list returns values, not keys.
+    const watermarkEntries = await kv
+      .list<GraphExtractionWatermark>(KV.graphExtractionWatermarks)
+      .catch(() => [] as GraphExtractionWatermark[]);
+    await Promise.all(
+      watermarkEntries
+        .filter(
+          (w) => w && typeof w.sessionId === "string" && w.sessionId.length > 0,
+        )
+        .map((w) => kv.delete(KV.graphExtractionWatermarks, w.sessionId)),
+    );
     // Stamp resetAt=now on the empty snapshot. Future
     // mem::graph-extract calls compare each name-index lookup's
     // existing node `createdAt` against this timestamp; anything
@@ -1274,6 +1294,7 @@ export function registerGraphFunction(
       await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
       const counts: Record<string, number> = {
         [KV.graphSnapshot]: 1,
+        [KV.graphExtractionWatermarks]: watermarkEntries.length,
       };
       const tookMs = Date.now() - started;
       logger.info("Graph state reset (snapshot only)", { counts, tookMs });
@@ -1340,6 +1361,7 @@ export function registerGraphFunction(
       [KV.graphNodes]: nodes.length,
       [KV.graphEdges]: edges.length,
       [KV.graphSnapshot]: 1,
+      [KV.graphExtractionWatermarks]: watermarkEntries.length,
     };
 
     for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
@@ -1360,6 +1382,7 @@ export function registerGraphFunction(
       KV.graphNodes,
       KV.graphEdges,
       KV.graphSnapshot,
+      KV.graphExtractionWatermarks,
     ], { counts, tookMs }).catch(() => undefined);
     return {
       success: true,

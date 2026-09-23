@@ -1,11 +1,18 @@
 import { TriggerAction, type ISdk } from "../iii.js";
-import type { CompressedObservation, HookPayload, Session } from "../types.js";
+import type {
+  CompressedObservation,
+  GraphExtractionWatermark,
+  HookPayload,
+  Session,
+} from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
   getAgentId,
   getConsolidationCooldownMs,
+  getGraphBatchSize,
   isConsolidationEnabled,
   isGraphExtractionEnabled,
 } from "../config.js";
@@ -39,6 +46,103 @@ function consolidationDue(kv: StateKV): Promise<boolean> {
   );
   consolidationCheckChain = result.catch(() => false);
   return result;
+}
+
+// R4/R5: session-stop graph extraction is tail-only and resumable. The
+// per-session watermark counts the compressed observations already fed to
+// mem::graph-extract; each stop processes only what lies past it, in
+// batches. The watermark advances only after a batch reports success with a
+// healthy LLM leg (success:true AND not llmFailed), so a failed or partial
+// batch is retried on the next stop instead of being skipped. The wall-clock
+// budget and consecutive-failure cap mirror api::graph-build's drain: a slow
+// or flapping provider stops the loop instead of holding the stop lifecycle
+// open.
+const GRAPH_EXTRACT_BUDGET_MS = 60_000;
+const GRAPH_EXTRACT_MAX_FAILURES = 3;
+const GRAPH_EXTRACT_MAX_BATCH = 100;
+
+async function extractGraphSessionTail(
+  sdk: ISdk,
+  kv: StateKV,
+  sessionId: string,
+): Promise<void> {
+  await withKeyedLock(`graph-extract:${sessionId}`, async () => {
+    const observations = await kv.list<CompressedObservation>(
+      KV.observations(sessionId),
+    );
+    const compressed = observations.filter((o) => o.title);
+    if (compressed.length === 0) return;
+
+    const watermark = await kv
+      .get<GraphExtractionWatermark>(KV.graphExtractionWatermarks, sessionId)
+      .catch(() => null);
+    let start = Math.max(
+      0,
+      Math.min(watermark?.extractedCount ?? 0, compressed.length),
+    );
+    // Re-anchor if the observation list shifted under the recorded count.
+    const boundary = watermark?.boundaryObservationId;
+    if (boundary && start > 0 && compressed[start - 1]?.id !== boundary) {
+      const anchor = compressed.findIndex((o) => o.id === boundary);
+      start = anchor >= 0 ? anchor + 1 : 0;
+    }
+    if (start >= compressed.length) return;
+
+    const batchSize = Math.max(
+      1,
+      Math.min(GRAPH_EXTRACT_MAX_BATCH, getGraphBatchSize()),
+    );
+    const startedAt = Date.now();
+    for (let i = start; i < compressed.length; ) {
+      const batch = compressed.slice(i, i + batchSize);
+      let consecutiveFailures = 0;
+      for (;;) {
+        if (Date.now() - startedAt > GRAPH_EXTRACT_BUDGET_MS) {
+          logger.warn("session-stop graph-extract budget exceeded", {
+            sessionId,
+            batchStart: i,
+            remaining: compressed.length - i,
+          });
+          return;
+        }
+        let result:
+          | { success?: boolean; llmFailed?: boolean; error?: string }
+          | undefined;
+        let invocationError: string | undefined;
+        try {
+          result = (await sdk.trigger({
+            function_id: "mem::graph-extract",
+            payload: { observations: batch },
+          })) as typeof result;
+        } catch (err) {
+          invocationError = err instanceof Error ? err.message : String(err);
+        }
+        if (result?.success === true && result.llmFailed !== true) {
+          const last = batch[batch.length - 1];
+          if (last) {
+            await kv.set(KV.graphExtractionWatermarks, sessionId, {
+              sessionId,
+              extractedCount: i + batch.length,
+              boundaryObservationId: last.id,
+              updatedAt: new Date().toISOString(),
+            } satisfies GraphExtractionWatermark);
+          }
+          break;
+        }
+        consecutiveFailures += 1;
+        logger.warn("session-stop graph-extract batch failed", {
+          sessionId,
+          batchStart: i,
+          attempt: consecutiveFailures,
+          maxAttempts: GRAPH_EXTRACT_MAX_FAILURES,
+          llmFailed: result?.llmFailed === true,
+          error: invocationError ?? result?.error,
+        });
+        if (consecutiveFailures >= GRAPH_EXTRACT_MAX_FAILURES) return;
+      }
+      i += batch.length;
+    }
+  });
 }
 
 export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
@@ -115,13 +219,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     // operators who want a one-off import.
     if (isGraphExtractionEnabled()) {
       try {
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(data.sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
-        if (compressed.length > 0) {
-          fireVoid("mem::graph-extract", { observations: compressed });
-        }
+        await extractGraphSessionTail(sdk, kv, data.sessionId);
       } catch (err) {
         logger.warn("graph-extract trigger failed", {
           sessionId: data.sessionId,
