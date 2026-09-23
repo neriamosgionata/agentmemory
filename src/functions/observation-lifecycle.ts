@@ -22,17 +22,17 @@ export async function clearSessionDerivedState(
   sessionId: string,
 ): Promise<void> {
   if (!sessionId) return;
-  for (const scope of [KV.summaryPartials, KV.graphExtractionWatermarks]) {
-    try {
-      await kv.delete(scope, sessionId);
-    } catch (err) {
-      logger.warn("derived-state cleanup failed", {
-        scope,
-        sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  await Promise.all(
+    [KV.summaryPartials, KV.graphExtractionWatermarks].map((scope) =>
+      kv.delete(scope, sessionId).catch((err: unknown) => {
+        logger.warn("derived-state cleanup failed", {
+          scope,
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }),
+    ),
+  );
 }
 
 /**
@@ -75,9 +75,11 @@ export async function reconcileObservationDeletions(
   // A delete shifts the observation list, so any partial cache or
   // extraction watermark computed against the old shape is stale even
   // though the surviving rows are untouched. Force a full recompute.
-  for (const sessionId of perSession.keys()) {
-    await clearSessionDerivedState(kv, sessionId);
-  }
+  await Promise.all(
+    [...perSession.keys()].map((sessionId) =>
+      clearSessionDerivedState(kv, sessionId),
+    ),
+  );
 
   try {
     const view = await getGraphView(kv);

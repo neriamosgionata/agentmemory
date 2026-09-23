@@ -38,30 +38,32 @@ const CHUNK_CONCURRENCY_DEFAULT = 6;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
-// R2: minimum uncovered observations before a refresh rewrites the stored
+// Minimum uncovered observations before a refresh rewrites the stored
 // summary. Per-turn Stop events otherwise re-summarize a growing session for
 // a handful of new observations, paying cost proportional to session size.
 const MIN_NEW_OBSERVATIONS_DEFAULT = 10;
 
+function readIntEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= min ? Math.floor(n) : fallback;
+}
+
 function getMinNewObservations(): number {
-  const raw = process.env.SUMMARIZE_MIN_NEW_OBSERVATIONS;
-  if (!raw) return MIN_NEW_OBSERVATIONS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 0 ? n : MIN_NEW_OBSERVATIONS_DEFAULT;
+  return readIntEnv(
+    "SUMMARIZE_MIN_NEW_OBSERVATIONS",
+    MIN_NEW_OBSERVATIONS_DEFAULT,
+    0,
+  );
 }
 
 function getChunkSize(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_SIZE;
-  if (!raw) return CHUNK_SIZE_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_SIZE_DEFAULT;
+  return readIntEnv("SUMMARIZE_CHUNK_SIZE", CHUNK_SIZE_DEFAULT, 1);
 }
 
 function getChunkConcurrency(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_CONCURRENCY;
-  if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
+  return readIntEnv("SUMMARIZE_CHUNK_CONCURRENCY", CHUNK_CONCURRENCY_DEFAULT, 1);
 }
 
 type ReducePartialInput = {
@@ -78,7 +80,6 @@ type ProduceSummaryResult = {
   response: string;
   mode: "single" | "chunked" | "incremental";
   chunks: number;
-  skipped?: number;
   partialConcepts?: string[];
   chunkSize: number;
   entries: SummaryChunkPartial[];
@@ -198,7 +199,10 @@ async function produceSummaryXml(
     validated && validated.length > 0
       ? validated[validated.length - 1].rangeEnd
       : 0;
-  const canReuse = reuseCount > 0 && reuseCount < compressed.length;
+  // A fully covered cache is only reachable on a retry after the reduce
+  // response failed validation; the chunk calls are already done, so the
+  // retry runs the reduce alone instead of re-summarizing the session.
+  const canReuse = reuseCount > 0 && reuseCount <= compressed.length;
 
   if (!canReuse && compressed.length <= chunkSize) {
     const response = await provider.summarize(
@@ -327,7 +331,7 @@ async function produceSummaryXml(
     response,
     mode: canReuse ? "incremental" : "chunked",
     chunks: chunkRanges.length,
-    skipped,
+
     partialConcepts,
     chunkSize,
     entries: [...reusedChunks, ...newEntries],
@@ -526,6 +530,7 @@ export function registerSummarizeFunction(
           // markdown-wrapped or otherwise wrapped response gets a
           // second roll-of-the-dice instead of dropping the summary.
           let summary: SessionSummary | null = null;
+          let validatedOutput: ReturnType<typeof validateOutput> | null = null;
           let response = "";
           let mode: "single" | "chunked" | "incremental" = "single";
           let chunks = 1;
@@ -533,6 +538,9 @@ export function registerSummarizeFunction(
           let producedEntries: SummaryChunkPartial[] = [];
           let producedCoveredCount = 0;
           let producedChunkSize = 0;
+          // Attempt 2 reuses the chunk partials attempt 1 already paid for,
+          // so a reduce-only failure does not re-summarize the session.
+          let retryCache: SummaryPartialCache | null = partialCache ?? null;
           for (let attempt = 1; attempt <= 2; attempt++) {
             const produced = await produceSummaryXml(
               provider,
@@ -540,7 +548,7 @@ export function registerSummarizeFunction(
               sessionId,
               session.project,
               priorSummary,
-              partialCache,
+              retryCache,
             );
             response = produced.response;
             mode = produced.mode;
@@ -549,6 +557,15 @@ export function registerSummarizeFunction(
             producedEntries = produced.entries;
             producedCoveredCount = produced.coveredCount;
             producedChunkSize = produced.chunkSize;
+            if (producedEntries.length > 0) {
+              retryCache = {
+                sessionId,
+                chunkSize: producedChunkSize,
+                coveredCount: producedCoveredCount,
+                chunks: producedEntries,
+                updatedAt: new Date().toISOString(),
+              };
+            }
             if (!response || !response.trim()) {
               logger.warn("Empty provider response on summarize", {
                 sessionId,
@@ -589,7 +606,10 @@ export function registerSummarizeFunction(
                 candidate,
                 "mem::summarize",
               );
-              if (attemptValidation.valid) break;
+              if (attemptValidation.valid) {
+                validatedOutput = attemptValidation;
+                break;
+              }
               logger.warn("Summary validation failed", {
                 sessionId,
                 attempt,
@@ -624,11 +644,8 @@ export function registerSummarizeFunction(
             filesModified: summary.filesModified,
             concepts: summary.concepts,
           };
-          const validation = validateOutput(
-            SummaryOutputSchema,
-            summaryForValidation,
-            "mem::summarize",
-          );
+          // summary is non-null only when a loop attempt validated it.
+          const validation = validatedOutput!;
 
           if (!validation.valid) {
             const latencyMs = Date.now() - startMs;

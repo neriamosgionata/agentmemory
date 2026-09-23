@@ -1264,21 +1264,30 @@ export function registerGraphFunction(
     maxRecords?: number;
   }) => {
     const started = Date.now();
-    // R5: a reset invalidates every per-session extraction watermark, on
-    // both the snapshot-only and the confirm path. Otherwise the next
-    // session stop would resume past the wiped range and the graph would
-    // stay empty. Enumerate-and-delete by the stored sessionId because
+    // A reset invalidates every per-session extraction watermark, so the
+    // wipe runs only on a reset that actually succeeds; a refused reset must
+    // not destroy coverage against an intact graph. Deletes are batched like
+    // the node/edge deletes below, and keyed by the stored sessionId because
     // state::list returns values, not keys.
-    const watermarkEntries = await kv
-      .list<GraphExtractionWatermark>(KV.graphExtractionWatermarks)
-      .catch(() => [] as GraphExtractionWatermark[]);
-    await Promise.all(
-      watermarkEntries
+    const clearWatermarks = async (): Promise<number> => {
+      const entries = await kv
+        .list<GraphExtractionWatermark>(KV.graphExtractionWatermarks)
+        .catch(() => [] as GraphExtractionWatermark[]);
+      const sessionIds = entries
+        .map((w) => w?.sessionId)
         .filter(
-          (w) => w && typeof w.sessionId === "string" && w.sessionId.length > 0,
-        )
-        .map((w) => kv.delete(KV.graphExtractionWatermarks, w.sessionId)),
-    );
+          (id): id is string => typeof id === "string" && id.length > 0,
+        );
+      for (let i = 0; i < sessionIds.length; i += GRAPH_RESET_BATCH) {
+        const batch = sessionIds.slice(i, i + GRAPH_RESET_BATCH);
+        await Promise.all(
+          batch.map((sessionId) =>
+            kv.delete(KV.graphExtractionWatermarks, sessionId),
+          ),
+        );
+      }
+      return sessionIds.length;
+    };
     // Stamp resetAt=now on the empty snapshot. Future
     // mem::graph-extract calls compare each name-index lookup's
     // existing node `createdAt` against this timestamp; anything
@@ -1292,9 +1301,10 @@ export function registerGraphFunction(
 
     if (data?.confirm !== true) {
       await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+      const watermarksCleared = await clearWatermarks();
       const counts: Record<string, number> = {
         [KV.graphSnapshot]: 1,
-        [KV.graphExtractionWatermarks]: watermarkEntries.length,
+        [KV.graphExtractionWatermarks]: watermarksCleared,
       };
       const tookMs = Date.now() - started;
       logger.info("Graph state reset (snapshot only)", { counts, tookMs });
@@ -1361,7 +1371,6 @@ export function registerGraphFunction(
       [KV.graphNodes]: nodes.length,
       [KV.graphEdges]: edges.length,
       [KV.graphSnapshot]: 1,
-      [KV.graphExtractionWatermarks]: watermarkEntries.length,
     };
 
     for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
@@ -1376,6 +1385,7 @@ export function registerGraphFunction(
     }
 
     await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+    counts[KV.graphExtractionWatermarks] = await clearWatermarks();
     const tookMs = Date.now() - started;
     logger.info("Graph state reset (rows deleted)", { counts, tookMs });
     await recordAudit(kv, "reset", "mem::graph-reset", [

@@ -8,6 +8,11 @@ import type {
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import {
+  isLlmActivityTrackingActive,
+  llmIdleMaxWaitMs,
+  waitForLlmIdle,
+} from "../providers/llm-activity.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
   getAgentId,
@@ -48,15 +53,15 @@ function consolidationDue(kv: StateKV): Promise<boolean> {
   return result;
 }
 
-// R4/R5: session-stop graph extraction is tail-only and resumable. The
+// Session-stop graph extraction is tail-only and resumable. The
 // per-session watermark counts the compressed observations already fed to
 // mem::graph-extract; each stop processes only what lies past it, in
 // batches. The watermark advances only after a batch reports success with a
 // healthy LLM leg (success:true AND not llmFailed), so a failed or partial
 // batch is retried on the next stop instead of being skipped. The wall-clock
-// budget and consecutive-failure cap mirror api::graph-build's drain: a slow
-// or flapping provider stops the loop instead of holding the stop lifecycle
-// open.
+// budget and consecutive-failure cap mirror api::graph-build's drain, and
+// batches park in LLM idle windows for the same reason: this is background
+// work against the same single-slot endpoint interactive calls use.
 const GRAPH_EXTRACT_BUDGET_MS = 60_000;
 const GRAPH_EXTRACT_MAX_FAILURES = 3;
 const GRAPH_EXTRACT_MAX_BATCH = 100;
@@ -105,6 +110,20 @@ async function extractGraphSessionTail(
           });
           return;
         }
+        const budgetLeft = GRAPH_EXTRACT_BUDGET_MS - (Date.now() - startedAt);
+        const idle = isLlmActivityTrackingActive()
+          ? await waitForLlmIdle(
+              Math.min(budgetLeft, llmIdleMaxWaitMs()),
+            )
+          : true;
+        if (!idle) {
+          logger.info("session-stop graph-extract parked for LLM idle", {
+            sessionId,
+            batchStart: i,
+            remaining: compressed.length - i,
+          });
+          return;
+        }
         let result:
           | { success?: boolean; llmFailed?: boolean; error?: string }
           | undefined;
@@ -129,13 +148,23 @@ async function extractGraphSessionTail(
           }
           break;
         }
+        // An LLM-leg failure is a park, not an in-stop retry: the provider
+        // already ran its own retry ladder, and the watermark's resumability
+        // makes the next stop the natural retry point.
+        if (result?.llmFailed === true) {
+          logger.warn("session-stop graph-extract LLM leg failed; parked", {
+            sessionId,
+            batchStart: i,
+            error: result.error,
+          });
+          return;
+        }
         consecutiveFailures += 1;
         logger.warn("session-stop graph-extract batch failed", {
           sessionId,
           batchStart: i,
           attempt: consecutiveFailures,
           maxAttempts: GRAPH_EXTRACT_MAX_FAILURES,
-          llmFailed: result?.llmFailed === true,
           error: invocationError ?? result?.error,
         });
         if (consecutiveFailures >= GRAPH_EXTRACT_MAX_FAILURES) return;

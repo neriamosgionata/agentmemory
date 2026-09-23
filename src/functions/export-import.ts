@@ -436,7 +436,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         // Derived state is keyed by sessionId, so enumerating KV.sessions
         // cannot reach rows orphaned by an earlier session delete. Sweep
         // both scopes by their stored sessionId: a replace must leave no
-        // partial cache or extraction watermark behind. #R6
+        // partial cache or extraction watermark behind.
         const [partialRows, watermarkRows] = await Promise.all([
           kv.list<SummaryPartialCache>(KV.summaryPartials).catch(() => []),
           kv
@@ -447,9 +447,9 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           ...partialRows.map((row) => row.sessionId),
           ...watermarkRows.map((row) => row.sessionId),
         ]);
-        for (const derivedSessionId of derivedSessions) {
-          await clearSessionDerivedState(kv, derivedSessionId);
-        }
+        await runChunked([...derivedSessions], (derivedSessionId) =>
+          clearSessionDerivedState(kv, derivedSessionId),
+        );
         await runChunked(await kv.list<Memory>(KV.memories), (m) =>
           kv.delete(KV.memories, m.id),
         );
