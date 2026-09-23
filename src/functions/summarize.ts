@@ -2,11 +2,14 @@ import type { ISdk } from "../iii.js";
 import type {
   CompressedObservation,
   SessionSummary,
+  SummaryChunkPartial,
+  SummaryPartialCache,
   MemoryProvider,
   Session,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   SUMMARY_SYSTEM,
   buildSummaryPrompt,
@@ -50,6 +53,79 @@ function getChunkConcurrency(): number {
   return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
 }
 
+type ReducePartialInput = {
+  title: string;
+  narrative: string;
+  keyDecisions: string[];
+  filesModified: string[];
+  concepts: string[];
+  obsRangeStart: number;
+  obsRangeEnd: number;
+};
+
+type ProduceSummaryResult = {
+  response: string;
+  mode: "single" | "chunked" | "incremental";
+  chunks: number;
+  skipped?: number;
+  partialConcepts?: string[];
+  chunkSize: number;
+  entries: SummaryChunkPartial[];
+  coveredCount: number;
+};
+
+// R7: the cache is derived state — anything unrecognized or inconsistent with
+// the current observation list discards it and forces a full recompute. A
+// boundary mismatch means observations were deleted or reordered, so every
+// range after the shift is untrustworthy; reject the whole record rather than
+// silently reusing prefix entries.
+function validatePartialCache(
+  cache: SummaryPartialCache | null | undefined,
+  compressed: CompressedObservation[],
+  chunkSize: number,
+  sessionId: string,
+): SummaryChunkPartial[] | null {
+  if (!cache || typeof cache !== "object") return null;
+  if (cache.sessionId !== sessionId) return null;
+  if (cache.chunkSize !== chunkSize) return null;
+  if (!Number.isInteger(cache.coveredCount) || cache.coveredCount <= 0) {
+    return null;
+  }
+  if (cache.coveredCount > compressed.length) return null;
+  if (!Array.isArray(cache.chunks) || cache.chunks.length === 0) return null;
+  let expectedStart = 1;
+  for (const entry of cache.chunks) {
+    if (!entry || typeof entry !== "object") return null;
+    if (entry.rangeStart !== expectedStart) return null;
+    if (!Number.isInteger(entry.rangeEnd) || entry.rangeEnd < entry.rangeStart) {
+      return null;
+    }
+    if (entry.rangeEnd > cache.coveredCount) return null;
+    if (!entry.partial || typeof entry.partial !== "object") return null;
+    const boundary = compressed[entry.rangeEnd - 1];
+    if (!boundary || boundary.id !== entry.boundaryObservationId) return null;
+    expectedStart = entry.rangeEnd + 1;
+  }
+  if (cache.coveredCount !== expectedStart - 1) return null;
+  return cache.chunks;
+}
+
+function toReduceInput(
+  summary: SessionSummary,
+  obsRangeStart: number,
+  obsRangeEnd: number,
+): ReducePartialInput {
+  return {
+    title: summary.title,
+    narrative: summary.narrative,
+    keyDecisions: summary.keyDecisions ?? [],
+    filesModified: summary.filesModified ?? [],
+    concepts: dedupeConcepts(summary.concepts ?? []),
+    obsRangeStart,
+    obsRangeEnd,
+  };
+}
+
 // One chunk call with retry-once. Returns null when both attempts fail —
 // whether by parse failure, provider 4xx (content rejected by upstream
 // filters), or transient network/5xx errors that didn't recover on retry.
@@ -90,111 +166,161 @@ async function summarizeChunkWithRetry(
   return null;
 }
 
-// Returns the final summary XML string. For sessions ≤ chunk size, this is
-// a single LLM call (legacy behavior). For larger sessions, observations
-// are split into chunks processed in parallel batches, each chunk retried
-// once on parse failure, persistently-bad chunks skipped, and remaining
-// partials merged via a reduce call.
+// Returns the final summary XML string. Sessions with a valid partial cache
+// reuse every covered chunk and send only the uncovered tail to the LLM, then
+// fold the prior stored summary with the new partials (KTD2). Sessions with no
+// reusable derived state take the legacy paths: one call when the session fits
+// in a chunk, otherwise a parallel map-reduce over all chunks.
 async function produceSummaryXml(
   provider: MemoryProvider,
   compressed: CompressedObservation[],
   sessionId: string,
   project: string,
-): Promise<{
-  response: string;
-  mode: "single" | "chunked";
-  chunks: number;
-  skipped?: number;
-  partialConcepts?: string[];
-}> {
+  priorSummary: SessionSummary | null,
+  partialCache: SummaryPartialCache | null | undefined,
+): Promise<ProduceSummaryResult> {
   const chunkSize = getChunkSize();
-  if (compressed.length <= chunkSize) {
+  const validated = priorSummary
+    ? validatePartialCache(partialCache, compressed, chunkSize, sessionId)
+    : null;
+  const reuseCount =
+    validated && validated.length > 0
+      ? validated[validated.length - 1].rangeEnd
+      : 0;
+  const canReuse = reuseCount > 0 && reuseCount < compressed.length;
+
+  if (!canReuse && compressed.length <= chunkSize) {
     const response = await provider.summarize(
       SUMMARY_SYSTEM,
       buildSummaryPrompt(compressed),
     );
-    return { response, mode: "single", chunks: 1 };
+    return {
+      response,
+      mode: "single",
+      chunks: 1,
+      chunkSize,
+      entries: [],
+      coveredCount: 0,
+    };
   }
 
-  const chunks: CompressedObservation[][] = [];
-  for (let i = 0; i < compressed.length; i += chunkSize) {
-    chunks.push(compressed.slice(i, i + chunkSize));
+  const reusedChunks = canReuse ? validated! : [];
+  const tailStart = canReuse ? reuseCount : 0;
+  const chunkRanges: Array<{ start: number; end: number }> = [];
+  for (let i = tailStart; i < compressed.length; i += chunkSize) {
+    chunkRanges.push({
+      start: i + 1,
+      end: Math.min(i + chunkSize, compressed.length),
+    });
   }
   const concurrency = getChunkConcurrency();
-  logger.info("Summarize chunking session", {
-    sessionId,
-    chunks: chunks.length,
-    chunkSize,
-    concurrency,
-    totalObservations: compressed.length,
-  });
+  logger.info(
+    canReuse
+      ? "Summarize reusing chunk partials"
+      : "Summarize chunking session",
+    {
+      sessionId,
+      chunks: chunkRanges.length,
+      chunkSize,
+      concurrency,
+      totalObservations: compressed.length,
+      reusedChunks: reusedChunks.length,
+      coveredCount: tailStart,
+    },
+  );
 
   // Sparse array preserves chunk → index mapping after parallel resolution,
   // so the reduce step sees partials in chronological order even when some
   // were skipped.
-  const partialByIdx: Array<SessionSummary | null> = new Array(chunks.length).fill(null);
-  for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
-    const batch = chunks.slice(batchStart, batchStart + concurrency);
+  const partialByIdx: Array<SessionSummary | null> = new Array(
+    chunkRanges.length,
+  ).fill(null);
+  for (
+    let batchStart = 0;
+    batchStart < chunkRanges.length;
+    batchStart += concurrency
+  ) {
+    const batch = chunkRanges.slice(batchStart, batchStart + concurrency);
     await Promise.all(
-      batch.map(async (chunk, j) => {
+      batch.map(async (range, j) => {
         const idx = batchStart + j;
         partialByIdx[idx] = await summarizeChunkWithRetry(
           provider,
-          chunk,
+          compressed.slice(range.start - 1, range.end),
           sessionId,
           project,
           idx,
-          chunks.length,
+          chunkRanges.length,
         );
       }),
     );
   }
 
   const skipped = partialByIdx.filter((p) => p === null).length;
-  const partials = partialByIdx.filter((p): p is SessionSummary => p !== null);
 
-  if (skipped > Math.floor(chunks.length * MAX_SKIP_RATIO)) {
+  if (skipped > Math.floor(chunkRanges.length * MAX_SKIP_RATIO)) {
     throw new Error(
-      `too_many_chunks_skipped: ${skipped}/${chunks.length} chunks failed to parse after retry`,
+      `too_many_chunks_skipped: ${skipped}/${chunkRanges.length} chunks failed to parse after retry`,
     );
   }
   if (skipped > 0) {
     logger.warn("Summarize chunks partially skipped", {
       sessionId,
       skipped,
-      total: chunks.length,
+      total: chunkRanges.length,
     });
   }
 
-  // #1114: the reduce prompt used to carry each chunk's concepts verbatim, so
-  // duplicates across chunks survived into the merged summary and an LLM that
-  // emitted an empty <concepts> block silently erased them. Dedupe the input
-  // and keep the union as a fallback for the parsed result.
+  // Truncate the cache at the first skipped chunk: without a partial for that
+  // range, later ranges cannot be marked covered without leaving a gap.
+  const newEntries: SummaryChunkPartial[] = [];
+  for (let idx = 0; idx < chunkRanges.length; idx++) {
+    const partial = partialByIdx[idx];
+    if (!partial) break;
+    const range = chunkRanges[idx];
+    newEntries.push({
+      rangeStart: range.start,
+      rangeEnd: range.end,
+      boundaryObservationId: compressed[range.end - 1].id,
+      partial,
+    });
+  }
+  const coveredCount =
+    newEntries.length > 0
+      ? newEntries[newEntries.length - 1].rangeEnd
+      : tailStart;
+
+  // KTD2: fold the previous stored summary with only the new tail partials so
+  // per-refresh reduce input stays bounded by the tail, not the session size.
+  const reduceInputs: ReducePartialInput[] = [];
+  if (canReuse && priorSummary) {
+    reduceInputs.push(toReduceInput(priorSummary, 1, reuseCount));
+  }
+  for (let idx = 0; idx < chunkRanges.length; idx++) {
+    const partial = partialByIdx[idx];
+    if (!partial) continue;
+    const range = chunkRanges[idx];
+    reduceInputs.push(toReduceInput(partial, range.start, range.end));
+  }
+
+  // #1114: dedupe the union of concepts across the fold inputs and keep it as
+  // a fallback for a reduce pass that emits an empty <concepts> block.
   const partialConcepts = dedupeConcepts(
-    partials.flatMap((p) => p.concepts ?? []),
+    reduceInputs.flatMap((p) => p.concepts),
   );
-  const reduceInput = partials.map((p) => {
-    const originalIdx = partialByIdx.indexOf(p);
-    return {
-      title: p.title,
-      narrative: p.narrative,
-      keyDecisions: p.keyDecisions,
-      filesModified: p.filesModified,
-      concepts: dedupeConcepts(p.concepts ?? []),
-      obsRangeStart: originalIdx * chunkSize + 1,
-      obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
-    };
-  });
   const response = await provider.summarize(
     REDUCE_SYSTEM,
-    buildReducePrompt(reduceInput),
+    buildReducePrompt(reduceInputs),
   );
   return {
     response,
-    mode: "chunked",
-    chunks: chunks.length,
+    mode: canReuse ? "incremental" : "chunked",
+    chunks: chunkRanges.length,
     skipped,
     partialConcepts,
+    chunkSize,
+    entries: [...reusedChunks, ...newEntries],
+    coveredCount,
   };
 }
 
@@ -260,7 +386,8 @@ export function registerSummarizeFunction(
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
 ): void {
-  sdk.registerFunction("mem::summarize", 
+  sdk.registerFunction(
+    "mem::summarize",
     async (data: { sessionId: string; force?: boolean } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
@@ -268,221 +395,285 @@ export function registerSummarizeFunction(
       }
       const sessionId = data.sessionId.trim();
 
-      const session = await kv.get<Session>(KV.sessions, sessionId);
-      if (!session) {
-        logger.warn("Session not found for summarize", {
-          sessionId,
-        });
-        return { success: false, error: "session_not_found" };
-      }
+      // KTD6: duplicate Stop events for one session arrive concurrently. The
+      // lock makes read → summarize → write atomic so the second caller sees
+      // the first caller's stored summary and skips, instead of double-running
+      // the provider or interleaving partial-cache writes.
+      return withKeyedLock(`summarize:${sessionId}`, async () => {
+        const session = await kv.get<Session>(KV.sessions, sessionId);
+        if (!session) {
+          logger.warn("Session not found for summarize", {
+            sessionId,
+          });
+          return { success: false, error: "session_not_found" };
+        }
 
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(sessionId),
-      );
-      const compressed = observations.filter((o) => o.title);
+        const observations = await kv.list<CompressedObservation>(
+          KV.observations(sessionId),
+        );
+        const compressed = observations.filter((o) => o.title);
 
-      if (compressed.length === 0) {
-        logger.info("No observations to summarize", {
-          sessionId,
-        });
-        return { success: false, error: "no_observations" };
-      }
+        if (compressed.length === 0) {
+          logger.info("No observations to summarize", {
+            sessionId,
+          });
+          return { success: false, error: "no_observations" };
+        }
 
-      // #1244: session stop fires on every turn, so the same session was
-      // re-summarised hundreds of times (954x on one reported session) for
-      // no new material. Skip when a summary already covers the current
-      // observation count; `force: true` re-runs on demand.
-      if (data.force !== true) {
+        const force = data.force === true;
         const existing = await kv
           .get<SessionSummary>(KV.summaries, sessionId)
           .catch(() => null);
-        if (
-          existing &&
-          typeof existing.title === "string" &&
-          existing.title.length > 0 &&
-          (existing.observationCount ?? 0) >= compressed.length
-        ) {
-          logger.info("Summarize skipped — summary already covers session", {
+
+        // #1244: session stop fires on every turn, so the same session was
+        // re-summarised hundreds of times (954x on one reported session) for
+        // no new material. Skip when a summary already covers the current
+        // observation count; `force: true` re-runs on demand.
+        if (!force) {
+          if (
+            existing &&
+            typeof existing.title === "string" &&
+            existing.title.length > 0 &&
+            (existing.observationCount ?? 0) >= compressed.length
+          ) {
+            logger.info("Summarize skipped — summary already covers session", {
+              sessionId,
+              summarizedObservations: existing.observationCount,
+              currentObservations: compressed.length,
+            });
+            return {
+              success: true,
+              skipped: "already_summarized",
+              summary: existing,
+            };
+          }
+        }
+
+        // createProvider() wraps every base provider ("resilient(noop)"), so
+        // an exact name match never fires; match by substring as graph.ts does.
+        if (provider.name.includes("noop")) {
+          logger.info("Summarize skipped — no LLM provider configured", {
             sessionId,
-            summarizedObservations: existing.observationCount,
-            currentObservations: compressed.length,
           });
           return {
-            success: true,
-            skipped: "already_summarized",
-            summary: existing,
+            success: false,
+            error: "no_provider",
+            reason:
+              "No LLM provider key set; Summarize is a no-op. Set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env to enable.",
           };
         }
-      }
 
-      // createProvider() wraps every base provider ("resilient(noop)"), so
-      // an exact name match never fires; match by substring as graph.ts does.
-      if (provider.name.includes("noop")) {
-        logger.info("Summarize skipped — no LLM provider configured", {
-          sessionId,
-        });
-        return {
-          success: false,
-          error: "no_provider",
-          reason:
-            "No LLM provider key set; Summarize is a no-op. Set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env to enable.",
-        };
-      }
+        const priorSummary =
+          existing &&
+          typeof existing.title === "string" &&
+          existing.title.length > 0
+            ? existing
+            : null;
+        // R7: a forced refresh recomputes everything and never reuses the
+        // derived cache.
+        const partialCache = force
+          ? null
+          : await kv
+              .get<SummaryPartialCache>(KV.summaryPartials, sessionId)
+              .catch(() => null);
 
-      try {
-        // #783: chunk-level produceSummaryXml retries internally, but
-        // the final merge used to parse once and bail. Wrap the
-        // produce-and-parse pair in the same 2-attempt loop so a
-        // markdown-wrapped or otherwise wrapped response gets a
-        // second roll-of-the-dice instead of dropping the summary.
-        let summary: SessionSummary | null = null;
-        let response = "";
-        let mode = "single";
-        let chunks = 1;
-        let partialConcepts: string[] = [];
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          const produced = await produceSummaryXml(
-            provider,
-            compressed,
-            sessionId,
-            session.project,
-          );
-          response = produced.response;
-          mode = produced.mode;
-          chunks = produced.chunks;
-          partialConcepts = produced.partialConcepts ?? [];
-          if (!response || !response.trim()) {
-            logger.warn("Empty provider response on summarize", {
+        try {
+          // #783: chunk-level produceSummaryXml retries internally, but
+          // the final merge used to parse once and bail. Wrap the
+          // produce-and-parse pair in the same 2-attempt loop so a
+          // markdown-wrapped or otherwise wrapped response gets a
+          // second roll-of-the-dice instead of dropping the summary.
+          let summary: SessionSummary | null = null;
+          let response = "";
+          let mode: "single" | "chunked" | "incremental" = "single";
+          let chunks = 1;
+          let partialConcepts: string[] = [];
+          let producedEntries: SummaryChunkPartial[] = [];
+          let producedCoveredCount = 0;
+          let producedChunkSize = 0;
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            const produced = await produceSummaryXml(
+              provider,
+              compressed,
               sessionId,
-              provider: provider.name,
-              mode,
-              chunks,
-              observationCount: compressed.length,
-              attempt,
-            });
-            continue;
-          }
-          summary = parseSummaryXml(
-            response,
-            sessionId,
-            session.project,
-            compressed.length,
-          );
-          if (summary) {
-            // #1114: keep the union of chunk concepts so a reduce pass that
-            // emitted an empty <concepts> block (or dropped some) cannot
-            // erase them, and duplicates never reach the stored summary.
-            summary.concepts = dedupeConcepts([
-              ...summary.concepts,
-              ...partialConcepts,
-            ]);
-            // #1240: a schema failure (e.g. narrative under the length floor)
-            // used to end the call after one attempt, so the retry loop never
-            // saw it. Validate inside the loop and let attempt 2 fix it.
-            const candidate = {
-              title: summary.title,
-              narrative: summary.narrative,
-              keyDecisions: summary.keyDecisions,
-              filesModified: summary.filesModified,
-              concepts: summary.concepts,
-            };
-            const attemptValidation = validateOutput(
-              SummaryOutputSchema,
-              candidate,
-              "mem::summarize",
+              session.project,
+              priorSummary,
+              partialCache,
             );
-            if (attemptValidation.valid) break;
+            response = produced.response;
+            mode = produced.mode;
+            chunks = produced.chunks;
+            partialConcepts = produced.partialConcepts ?? [];
+            producedEntries = produced.entries;
+            producedCoveredCount = produced.coveredCount;
+            producedChunkSize = produced.chunkSize;
+            if (!response || !response.trim()) {
+              logger.warn("Empty provider response on summarize", {
+                sessionId,
+                provider: provider.name,
+                mode,
+                chunks,
+                observationCount: compressed.length,
+                attempt,
+              });
+              continue;
+            }
+            summary = parseSummaryXml(
+              response,
+              sessionId,
+              session.project,
+              compressed.length,
+            );
+            if (summary) {
+              // #1114: keep the union of chunk concepts so a reduce pass that
+              // emitted an empty <concepts> block (or dropped some) cannot
+              // erase them, and duplicates never reach the stored summary.
+              summary.concepts = dedupeConcepts([
+                ...summary.concepts,
+                ...partialConcepts,
+              ]);
+              // #1240: a schema failure (e.g. narrative under the length floor)
+              // used to end the call after one attempt, so the retry loop never
+              // saw it. Validate inside the loop and let attempt 2 fix it.
+              const candidate = {
+                title: summary.title,
+                narrative: summary.narrative,
+                keyDecisions: summary.keyDecisions,
+                filesModified: summary.filesModified,
+                concepts: summary.concepts,
+              };
+              const attemptValidation = validateOutput(
+                SummaryOutputSchema,
+                candidate,
+                "mem::summarize",
+              );
+              if (attemptValidation.valid) break;
+              logger.warn("Summary validation failed", {
+                sessionId,
+                attempt,
+                errors: attemptValidation.result.errors,
+              });
+              summary = null;
+              continue;
+            }
+            logger.warn("Failed to parse summary XML", { sessionId, attempt });
+          }
+
+          if (!response || !response.trim()) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, false);
+            }
+            return { success: false, error: "empty_provider_response" };
+          }
+
+          if (!summary) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, false);
+            }
+            return { success: false, error: "parse_failed" };
+          }
+
+          const summaryForValidation = {
+            title: summary.title,
+            narrative: summary.narrative,
+            keyDecisions: summary.keyDecisions,
+            filesModified: summary.filesModified,
+            concepts: summary.concepts,
+          };
+          const validation = validateOutput(
+            SummaryOutputSchema,
+            summaryForValidation,
+            "mem::summarize",
+          );
+
+          if (!validation.valid) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, false);
+            }
             logger.warn("Summary validation failed", {
               sessionId,
-              attempt,
-              errors: attemptValidation.result.errors,
+              errors: validation.result.errors,
             });
-            summary = null;
-            continue;
+            return { success: false, error: "validation_failed" };
           }
-          logger.warn("Failed to parse summary XML", { sessionId, attempt });
-        }
 
-        if (!response || !response.trim()) {
-          const latencyMs = Date.now() - startMs;
-          if (metricsStore) {
-            await metricsStore.record("mem::summarize", latencyMs, false);
+          const qualityScore = scoreSummary(summaryForValidation);
+
+          // R3: the stored summary is replaced only after a fully validated
+          // refresh; the derived partial cache follows it. Any failure above
+          // leaves both the prior summary and the prior cache untouched.
+          await kv.set(KV.summaries, sessionId, summary);
+
+          const cacheEntries: SummaryChunkPartial[] =
+            mode === "single"
+              ? [
+                  {
+                    rangeStart: 1,
+                    rangeEnd: compressed.length,
+                    boundaryObservationId:
+                      compressed[compressed.length - 1].id,
+                    partial: summary,
+                  },
+                ]
+              : producedEntries;
+          const cacheCovered =
+            mode === "single" ? compressed.length : producedCoveredCount;
+          if (cacheEntries.length > 0) {
+            const partialsRecord: SummaryPartialCache = {
+              sessionId,
+              chunkSize: producedChunkSize,
+              coveredCount: cacheCovered,
+              chunks: cacheEntries,
+              updatedAt: new Date().toISOString(),
+            };
+            await kv.set(KV.summaryPartials, sessionId, partialsRecord);
+          } else {
+            // No contiguous prefix could be cached (an early chunk was
+            // skipped); drop any stale record rather than let it claim
+            // coverage the new summary does not match.
+            await kv.delete(KV.summaryPartials, sessionId);
           }
-          return { success: false, error: "empty_provider_response" };
-        }
 
-        if (!summary) {
-          const latencyMs = Date.now() - startMs;
-          if (metricsStore) {
-            await metricsStore.record("mem::summarize", latencyMs, false);
-          }
-          return { success: false, error: "parse_failed" };
-        }
-
-        const summaryForValidation = {
-          title: summary.title,
-          narrative: summary.narrative,
-          keyDecisions: summary.keyDecisions,
-          filesModified: summary.filesModified,
-          concepts: summary.concepts,
-        };
-        const validation = validateOutput(
-          SummaryOutputSchema,
-          summaryForValidation,
-          "mem::summarize",
-        );
-
-        if (!validation.valid) {
-          const latencyMs = Date.now() - startMs;
-          if (metricsStore) {
-            await metricsStore.record("mem::summarize", latencyMs, false);
-          }
-          logger.warn("Summary validation failed", {
-            sessionId,
-            errors: validation.result.errors,
+          await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
+            title: summary.title,
+            observationCount: compressed.length,
           });
-          return { success: false, error: "validation_failed" };
-        }
 
-        const qualityScore = scoreSummary(summaryForValidation);
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record(
+              "mem::summarize",
+              latencyMs,
+              true,
+              qualityScore,
+            );
+          }
 
-        await kv.set(KV.summaries, sessionId, summary);
-        await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
-          title: summary.title,
-          observationCount: compressed.length,
-        });
-
-        const latencyMs = Date.now() - startMs;
-        if (metricsStore) {
-          await metricsStore.record(
-            "mem::summarize",
-            latencyMs,
-            true,
+          logger.info("Session summarized", {
+            sessionId,
+            title: summary.title,
+            decisions: summary.keyDecisions.length,
             qualityScore,
-          );
-        }
+            valid: validation.valid,
+          });
 
-        logger.info("Session summarized", {
-          sessionId,
-          title: summary.title,
-          decisions: summary.keyDecisions.length,
-          qualityScore,
-          valid: validation.valid,
-        });
-
-        return { success: true, summary, qualityScore };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const latencyMs = Date.now() - startMs;
-        if (metricsStore) {
-          await metricsStore.record("mem::summarize", latencyMs, false);
+          return { success: true, summary, qualityScore };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::summarize", latencyMs, false);
+          }
+          logger.error("Summarize failed", {
+            sessionId,
+            error: msg,
+          });
+          return { success: false, error: msg };
         }
-        logger.error("Summarize failed", {
-          sessionId,
-          error: msg,
-        });
-        return { success: false, error: msg };
-      }
+      });
     },
   );
 }

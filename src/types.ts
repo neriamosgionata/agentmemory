@@ -139,6 +139,24 @@ export interface SessionSummary {
   observationCount: number;
 }
 
+// Incremental summarization derived state (KTD2). Per-chunk partial results
+// let a growing session re-summarize only the chunks the LLM has not seen.
+// Internal only: never exported, never a summary payload field.
+export interface SummaryChunkPartial {
+  rangeStart: number;
+  rangeEnd: number;
+  boundaryObservationId: string;
+  partial: SessionSummary;
+}
+
+export interface SummaryPartialCache {
+  sessionId: string;
+  chunkSize: number;
+  coveredCount: number;
+  chunks: SummaryChunkPartial[];
+  updatedAt: string;
+}
+
 export type HookType =
   | "session_start"
   | "prompt_submit"

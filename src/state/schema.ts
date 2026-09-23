@@ -6,6 +6,10 @@ export const KV = {
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
   memories: "mem:memories",
   summaries: "mem:summaries",
+  // KTD2: per-session derived cache of incremental summary chunk partials.
+  // Keyed by sessionId; the record carries sessionId so enumeration-based
+  // cleanup can recover the key (listing a scope returns values, not keys).
+  summaryPartials: "mem:summary-partials",
   config: "mem:config",
   metrics: "mem:metrics",
   health: "mem:health",

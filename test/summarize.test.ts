@@ -8,6 +8,7 @@ vi.mock("../src/state/schema.js", () => ({
   KV: {
     sessions: "sessions",
     summaries: "summaries",
+    summaryPartials: "summary-partials",
     observations: (sessionId: string) => `obs:${sessionId}`,
     audit: "audit",
   },
