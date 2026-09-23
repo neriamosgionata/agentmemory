@@ -254,6 +254,61 @@ describe("mem::summarize refresh floor", () => {
     expect(stored.observationCount).toBe(7);
   });
 
+  it("force:true with a valid partial cache recomputes every chunk from the first observation", async () => {
+    const { provider, calls } = makeProvider();
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_force_recompute",
+      obsCount: 150,
+      provider,
+    });
+
+    const first: any = await handler({ sessionId: "ses_force_recompute" });
+    expect(first.success).toBe(true);
+    expect(calls).toHaveLength(3); // 2 chunks + reduce
+    const cache: any = await kv.get("summary-partials", "ses_force_recompute");
+    expect(cache.coveredCount).toBe(150);
+    expect(cache.chunks).toHaveLength(2);
+
+    calls.length = 0;
+    for (let i = 150; i < 152; i++) await addObs(kv, "ses_force_recompute", i);
+
+    // The 2-observation tail is below the default floor of 10, but force
+    // bypasses both the floor AND the partial cache: the whole session is
+    // re-chunked from obs 0 instead of folding the cached coverage.
+    const forced: any = await handler({
+      sessionId: "ses_force_recompute",
+      force: true,
+    });
+
+    expect(forced.success).toBe(true);
+    expect(forced.skipped).toBeUndefined();
+    expect(calls).toHaveLength(3);
+    expect(calls[0].user).toContain("Session observations (100 total)");
+    expect(calls[0].user).toContain("obs 0");
+    expect(calls[0].user).not.toContain("obs 150");
+    expect(calls[2].system).toContain("merging multiple partial summaries");
+    expect(calls[2].user).toContain("Partial summaries (2 chunks");
+    expect(calls[2].user).toContain("obs 1-100");
+    expect(calls[2].user).toContain("obs 101-152");
+
+    const stored: any = await kv.get("summaries", "ses_force_recompute");
+    expect(stored.observationCount).toBe(152);
+
+    // The recompute rewrites the cache to match the fresh chunks; a stale
+    // 150-observation cache would mislead the next incremental refresh.
+    const rewritten: any = await kv.get(
+      "summary-partials",
+      "ses_force_recompute",
+    );
+    expect(rewritten.coveredCount).toBe(152);
+    expect(
+      rewritten.chunks.map((c: any) => [c.rangeStart, c.rangeEnd]),
+    ).toEqual([
+      [1, 100],
+      [101, 152],
+    ]);
+  });
+
   it("completed session with a below-floor tail still refreshes via a bounded tail call", async () => {
     const { provider, calls } = makeProvider();
     const { handler, kv } = await setupHandler({

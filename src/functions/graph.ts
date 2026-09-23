@@ -1270,9 +1270,9 @@ export function registerGraphFunction(
     // the node/edge deletes below, and keyed by the stored sessionId because
     // state::list returns values, not keys.
     const clearWatermarks = async (): Promise<number> => {
-      const entries = await kv
-        .list<GraphExtractionWatermark>(KV.graphExtractionWatermarks)
-        .catch(() => [] as GraphExtractionWatermark[]);
+      const entries = await kv.list<GraphExtractionWatermark>(
+        KV.graphExtractionWatermarks,
+      );
       const sessionIds = entries
         .map((w) => w?.sessionId)
         .filter(
@@ -1373,19 +1373,30 @@ export function registerGraphFunction(
       [KV.graphSnapshot]: 1,
     };
 
-    for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
-      const batch = nodes.slice(i, i + GRAPH_RESET_BATCH);
-      await Promise.all(batch.map((node) => kv.delete(KV.graphNodes, node.id)));
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    // A delete failure mid-way still invalidates coverage: the finally clears
+    // watermarks so the next extraction repairs the partially wiped graph,
+    // while the original error still propagates to the caller.
+    try {
+      for (let i = 0; i < nodes.length; i += GRAPH_RESET_BATCH) {
+        const batch = nodes.slice(i, i + GRAPH_RESET_BATCH);
+        await Promise.all(
+          batch.map((node) => kv.delete(KV.graphNodes, node.id)),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      for (let i = 0; i < edges.length; i += GRAPH_RESET_BATCH) {
+        const batch = edges.slice(i, i + GRAPH_RESET_BATCH);
+        await Promise.all(
+          batch.map((edge) => kv.delete(KV.graphEdges, edge.id)),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+    } finally {
+      counts[KV.graphExtractionWatermarks] = await clearWatermarks().catch(
+        () => 0,
+      );
     }
-    for (let i = 0; i < edges.length; i += GRAPH_RESET_BATCH) {
-      const batch = edges.slice(i, i + GRAPH_RESET_BATCH);
-      await Promise.all(batch.map((edge) => kv.delete(KV.graphEdges, edge.id)));
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
-    counts[KV.graphExtractionWatermarks] = await clearWatermarks();
     const tookMs = Date.now() - started;
     logger.info("Graph state reset (rows deleted)", { counts, tookMs });
     await recordAudit(kv, "reset", "mem::graph-reset", [

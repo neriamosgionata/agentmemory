@@ -305,11 +305,26 @@ async function produceSummaryXml(
       ? newEntries[newEntries.length - 1].rangeEnd
       : tailStart;
 
-  // KTD2: fold the previous stored summary with only the new tail partials so
-  // per-refresh reduce input stays bounded by the tail, not the session size.
+  // KTD2: fold the previous stored summary plus any cached chunk the stored
+  // summary does not cover (a failed reduce can leave such chunks) with the
+  // new tail partials, so per-refresh reduce input stays bounded by the tail
+  // rather than the whole session.
   const reduceInputs: ReducePartialInput[] = [];
   if (canReuse && priorSummary) {
-    reduceInputs.push(toReduceInput(priorSummary, 1, reuseCount));
+    const priorCoverage = Math.min(
+      priorSummary.observationCount ?? reuseCount,
+      reuseCount,
+    );
+    reduceInputs.push(
+      toReduceInput(priorSummary, 1, Math.max(priorCoverage, 1)),
+    );
+    for (const entry of reusedChunks) {
+      if (entry.rangeEnd > priorCoverage) {
+        reduceInputs.push(
+          toReduceInput(entry.partial, entry.rangeStart, entry.rangeEnd),
+        );
+      }
+    }
   }
   for (let idx = 0; idx < chunkRanges.length; idx++) {
     const partial = partialByIdx[idx];
@@ -530,7 +545,6 @@ export function registerSummarizeFunction(
           // markdown-wrapped or otherwise wrapped response gets a
           // second roll-of-the-dice instead of dropping the summary.
           let summary: SessionSummary | null = null;
-          let validatedOutput: ReturnType<typeof validateOutput> | null = null;
           let response = "";
           let mode: "single" | "chunked" | "incremental" = "single";
           let chunks = 1;
@@ -607,7 +621,7 @@ export function registerSummarizeFunction(
                 "mem::summarize",
               );
               if (attemptValidation.valid) {
-                validatedOutput = attemptValidation;
+
                 break;
               }
               logger.warn("Summary validation failed", {
@@ -645,19 +659,6 @@ export function registerSummarizeFunction(
             concepts: summary.concepts,
           };
           // summary is non-null only when a loop attempt validated it.
-          const validation = validatedOutput!;
-
-          if (!validation.valid) {
-            const latencyMs = Date.now() - startMs;
-            if (metricsStore) {
-              await metricsStore.record("mem::summarize", latencyMs, false);
-            }
-            logger.warn("Summary validation failed", {
-              sessionId,
-              errors: validation.result.errors,
-            });
-            return { success: false, error: "validation_failed" };
-          }
 
           const qualityScore = scoreSummary(summaryForValidation);
 
@@ -716,7 +717,7 @@ export function registerSummarizeFunction(
             title: summary.title,
             decisions: summary.keyDecisions.length,
             qualityScore,
-            valid: validation.valid,
+            valid: true,
           });
 
           return { success: true, summary, qualityScore };

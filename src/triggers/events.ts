@@ -2,6 +2,7 @@ import { TriggerAction, type ISdk } from "../iii.js";
 import type {
   CompressedObservation,
   GraphExtractionWatermark,
+  GraphSnapshot,
   HookPayload,
   Session,
 } from "../types.js";
@@ -65,6 +66,9 @@ function consolidationDue(kv: StateKV): Promise<boolean> {
 const GRAPH_EXTRACT_BUDGET_MS = 60_000;
 const GRAPH_EXTRACT_MAX_FAILURES = 3;
 const GRAPH_EXTRACT_MAX_BATCH = 100;
+// Same fixed snapshot key mem::graph-reset writes; a reset mid-run changes
+// resetAt, which invalidates any in-flight extraction coverage.
+const GRAPH_SNAPSHOT_KEY = "current";
 
 async function extractGraphSessionTail(
   sdk: ISdk,
@@ -86,10 +90,14 @@ async function extractGraphSessionTail(
       Math.min(watermark?.extractedCount ?? 0, compressed.length),
     );
     // Re-anchor if the observation list shifted under the recorded count.
+    // Only a boundary that moved earlier (observations inserted or
+    // re-compressed before it) is trusted; a vanished or later boundary means
+    // deletions, which invalidate this watermark elsewhere, so restart from
+    // the beginning rather than skipping newly compressed rows.
     const boundary = watermark?.boundaryObservationId;
     if (boundary && start > 0 && compressed[start - 1]?.id !== boundary) {
       const anchor = compressed.findIndex((o) => o.id === boundary);
-      start = anchor >= 0 ? anchor + 1 : 0;
+      start = anchor >= 0 && anchor < start - 1 ? anchor + 1 : 0;
     }
     if (start >= compressed.length) return;
 
@@ -97,6 +105,10 @@ async function extractGraphSessionTail(
       1,
       Math.min(GRAPH_EXTRACT_MAX_BATCH, getGraphBatchSize()),
     );
+    const snapshotAtStart = await kv
+      .get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY)
+      .catch(() => null);
+    const resetAtAtStart = snapshotAtStart?.resetAt ?? null;
     const startedAt = Date.now();
     for (let i = start; i < compressed.length; ) {
       const batch = compressed.slice(i, i + batchSize);
@@ -138,6 +150,16 @@ async function extractGraphSessionTail(
         }
         if (result?.success === true && result.llmFailed !== true) {
           const last = batch[batch.length - 1];
+          const snapshotNow = await kv
+            .get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY)
+            .catch(() => null);
+          if ((snapshotNow?.resetAt ?? null) !== resetAtAtStart) {
+            logger.info(
+              "session-stop graph-extract parked: graph reset mid-run",
+              { sessionId, batchStart: i },
+            );
+            return;
+          }
           if (last) {
             await kv.set(KV.graphExtractionWatermarks, sessionId, {
               sessionId,
@@ -246,7 +268,10 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     // graph kept growing on session stop even with the flag off. Explicit
     // calls to mem::graph-extract / api::graph-extract still work for
     // operators who want a one-off import.
-    if (isGraphExtractionEnabled()) {
+    // skipConsolidation marks eviction's stale-session recovery, which
+    // deletes the session right after this handler returns; extracting first
+    // would spend the whole budget on graph rows for data being removed.
+    if (isGraphExtractionEnabled() && !data.skipConsolidation) {
       try {
         await extractGraphSessionTail(sdk, kv, data.sessionId);
       } catch (err) {

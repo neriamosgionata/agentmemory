@@ -608,6 +608,19 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         stats.summaries++;
       });
 
+      // A merge import overwrites observation rows and summaries in place,
+      // so any partial cache or extraction watermark computed from the
+      // previous content is stale even though ids and boundaries match.
+      if (strategy !== "skip") {
+        const touchedSessions = new Set<string>([
+          ...Object.keys(importData.observations),
+          ...importData.summaries.map((summary) => summary.sessionId),
+        ]);
+        await runChunked([...touchedSessions], (sessionId) =>
+          clearSessionDerivedState(kv, sessionId),
+        );
+      }
+
       if (importData.graphNodes) {
         await runChunked(importData.graphNodes, async (node) => {
           if (strategy === "skip") {

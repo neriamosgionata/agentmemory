@@ -88,6 +88,21 @@ async function seedObservations(
   }
 }
 
+async function insertObservationBefore(
+  kv: KV,
+  sessionId: string,
+  beforeId: string,
+  observation: CompressedObservation,
+): Promise<void> {
+  const scope = kv.store.get(KV.observations(sessionId))!;
+  const entries = [...scope.entries()];
+  scope.clear();
+  for (const [key, value] of entries) {
+    if (key === beforeId) scope.set(observation.id, observation);
+    scope.set(key, value);
+  }
+}
+
 async function readWatermark(
   kv: KV,
   sessionId: string,
@@ -216,6 +231,95 @@ describe("session-stop graph-extraction watermark (R4/R5)", () => {
     expect(watermark?.boundaryObservationId).toBe("o3");
   });
 
+  it("a boundary that moved later restarts extraction from 0 and re-covers the inserted observation", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2"), obs("o3")]);
+    await h.stopped({ sessionId: "ses_1" });
+    expect(h.extractCalls()).toHaveLength(1);
+    expect((await readWatermark(h.kv, "ses_1"))?.boundaryObservationId).toBe("o3");
+
+    // A newly compressed observation lands BEFORE the recorded boundary, so
+    // the boundary id moves from index 2 to index 3. The recorded position no
+    // longer matches: extraction must restart at 0 rather than skip o0.
+    await insertObservationBefore(h.kv, "ses_1", "o1", obs("o0"));
+    await h.stopped({ sessionId: "ses_1" });
+
+    const batches = h.extractCalls();
+    expect(batches).toHaveLength(2);
+    expect(batches[1].observations.map((o) => o.id)).toEqual([
+      "o0",
+      "o1",
+      "o2",
+      "o3",
+    ]);
+    const watermark = await readWatermark(h.kv, "ses_1");
+    expect(watermark?.extractedCount).toBe(4);
+    expect(watermark?.boundaryObservationId).toBe("o3");
+  });
+
+  it("re-anchors a boundary that moved earlier without re-extracting the covered prefix", async () => {
+    vi.mocked(getGraphBatchSize).mockReturnValue(2);
+    let failSecondBatch = true;
+    const h = createEventsHarness(async (payload) => {
+      if (failSecondBatch && payload.observations[0]?.id === "o3") {
+        return { success: false, error: "llm exploded" };
+      }
+      return { success: true };
+    });
+    await seedObservations(h.kv, "ses_1", [
+      obs("o1"),
+      obs("o2"),
+      obs("o3"),
+      obs("o4"),
+      obs("o5"),
+    ]);
+
+    await h.stopped({ sessionId: "ses_1" });
+    const parked = await readWatermark(h.kv, "ses_1");
+    expect(parked?.extractedCount).toBe(2);
+    expect(parked?.boundaryObservationId).toBe("o2");
+
+    // o1 is deleted before the boundary: the boundary id now sits at an index
+    // EARLIER than the recorded position. That is the trusted re-anchor case —
+    // extraction resumes just after the boundary (o3), not from 0, so the
+    // already covered o2 is not re-extracted.
+    h.kv.store.get(KV.observations("ses_1"))!.delete("o1");
+    failSecondBatch = false;
+    const callsBefore = h.extractCalls().length;
+    await h.stopped({ sessionId: "ses_1" });
+
+    const resumed = h
+      .extractCalls()
+      .slice(callsBefore)
+      .map((b) => b.observations.map((o) => o.id));
+    expect(resumed).toEqual([
+      ["o3", "o4"],
+      ["o5"],
+    ]);
+    expect(resumed.flat()).not.toContain("o2");
+  });
+
+  it("restarts from 0 when the recorded boundary observation no longer exists", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2"), obs("o3")]);
+    await h.stopped({ sessionId: "ses_1" });
+    expect((await readWatermark(h.kv, "ses_1"))?.boundaryObservationId).toBe("o3");
+
+    // The boundary row is gone, so the recorded count cannot be trusted:
+    // extraction must re-cover the surviving rows instead of resuming past
+    // them at the recorded offset.
+    h.kv.store.get(KV.observations("ses_1"))!.delete("o3");
+    await seedObservations(h.kv, "ses_1", [obs("o4")]);
+    await h.stopped({ sessionId: "ses_1" });
+
+    const batches = h.extractCalls();
+    expect(batches).toHaveLength(2);
+    expect(batches[1].observations.map((o) => o.id)).toEqual(["o1", "o2", "o4"]);
+    const watermark = await readWatermark(h.kv, "ses_1");
+    expect(watermark?.extractedCount).toBe(3);
+    expect(watermark?.boundaryObservationId).toBe("o4");
+  });
+
   it("an LLM-leg failure leaves the watermark unchanged and retries on the next stop", async () => {
     let llmDown = true;
     const h = createEventsHarness(async () => {
@@ -326,6 +430,140 @@ describe("session-stop graph-extraction watermark (R4/R5)", () => {
     expect(finalWatermark?.boundaryObservationId).toBe("o5");
   });
 
+  it("retries a throwing batch exactly 3 times in one stop and resumes from it next stop", async () => {
+    vi.mocked(getGraphBatchSize).mockReturnValue(2);
+    let throwOnFirstBatch = true;
+    const h = createEventsHarness(async (payload) => {
+      if (throwOnFirstBatch && payload.observations[0]?.id === "o1") {
+        throw new Error("graph-extract unreachable");
+      }
+      return { success: true };
+    });
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2"), obs("o3"), obs("o4")]);
+
+    await h.stopped({ sessionId: "ses_1" });
+
+    // Invocation errors retry per batch, capped at GRAPH_EXTRACT_MAX_FAILURES.
+    expect(h.extractCalls()).toHaveLength(3);
+    expect(h.extractCalls().every((b) => b.observations[0]?.id === "o1")).toBe(
+      true,
+    );
+    expect(await readWatermark(h.kv, "ses_1")).toBeNull();
+
+    throwOnFirstBatch = false;
+    await h.stopped({ sessionId: "ses_1" });
+
+    const batches = h.extractCalls();
+    expect(batches).toHaveLength(5);
+    expect(batches[3].observations.map((o) => o.id)).toEqual(["o1", "o2"]);
+    expect(batches[4].observations.map((o) => o.id)).toEqual(["o3", "o4"]);
+    const watermark = await readWatermark(h.kv, "ses_1");
+    expect(watermark?.extractedCount).toBe(4);
+    expect(watermark?.boundaryObservationId).toBe("o4");
+  });
+
+  it("counts failures per batch so a recovered batch does not spend the next batch's budget", async () => {
+    vi.mocked(getGraphBatchSize).mockReturnValue(2);
+    let firstBatchAttempts = 0;
+    let throwSecondBatch = true;
+    const h = createEventsHarness(async (payload) => {
+      const head = payload.observations[0]?.id;
+      if (head === "o1") {
+        firstBatchAttempts += 1;
+        if (firstBatchAttempts <= 2) {
+          return { success: false, error: "transient" };
+        }
+        return { success: true };
+      }
+      if (throwSecondBatch && head === "o3") {
+        throw new Error("graph-extract unreachable");
+      }
+      return { success: true };
+    });
+    await seedObservations(h.kv, "ses_1", [
+      obs("o1"),
+      obs("o2"),
+      obs("o3"),
+      obs("o4"),
+      obs("o5"),
+      obs("o6"),
+    ]);
+
+    await h.stopped({ sessionId: "ses_1" });
+
+    const firstStop = h
+      .extractCalls()
+      .map((b) => b.observations.map((o) => o.id));
+    expect(firstStop).toEqual([
+      ["o1", "o2"],
+      ["o1", "o2"],
+      ["o1", "o2"],
+      ["o3", "o4"],
+      ["o3", "o4"],
+      ["o3", "o4"],
+    ]);
+    expect(await readWatermark(h.kv, "ses_1")).toMatchObject({
+      extractedCount: 2,
+      boundaryObservationId: "o2",
+    });
+
+    throwSecondBatch = false;
+    await h.stopped({ sessionId: "ses_1" });
+
+    const secondStop = h
+      .extractCalls()
+      .slice(firstStop.length)
+      .map((b) => b.observations.map((o) => o.id));
+    expect(secondStop).toEqual([
+      ["o3", "o4"],
+      ["o5", "o6"],
+    ]);
+    const watermark = await readWatermark(h.kv, "ses_1");
+    expect(watermark?.extractedCount).toBe(6);
+    expect(watermark?.boundaryObservationId).toBe("o6");
+  });
+
+  it("skipConsolidation skips graph extraction entirely", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2")]);
+
+    await h.stopped({ sessionId: "ses_1", skipConsolidation: true });
+
+    expect(h.extractCalls()).toHaveLength(0);
+    expect(await readWatermark(h.kv, "ses_1")).toBeNull();
+  });
+
+  it("parks without advancing the watermark when the graph snapshot resets mid-run", async () => {
+    vi.mocked(getGraphBatchSize).mockReturnValue(1);
+    let h!: ReturnType<typeof createEventsHarness>;
+    h = createEventsHarness(async () => {
+      await h.kv.set(KV.graphSnapshot, "current", {
+        version: 1,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: {
+          totalNodes: 0,
+          totalEdges: 0,
+          nodesByType: {},
+          edgesByType: {},
+        },
+        updatedAt: "2026-02-01T10:00:00.000Z",
+        dirty: false,
+        resetAt: "2026-02-01T10:00:00.000Z",
+      });
+      return { success: true };
+    });
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2")]);
+
+    await h.stopped({ sessionId: "ses_1" });
+
+    // The reset landed between the snapshot read at start and the batch
+    // completion check; the run parks before recording coverage.
+    expect(h.extractCalls()).toHaveLength(1);
+    expect(await readWatermark(h.kv, "ses_1")).toBeNull();
+  });
+
   it("duplicate concurrent stops for one session serialize through the keyed lock", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -416,5 +654,40 @@ describe("mem::graph-reset clears extraction watermarks", () => {
     expect(result.success).toBe(true);
     expect(await readWatermark(kv, "ses_1")).toBeNull();
     expect(await readWatermark(kv, "ses_2")).toBeNull();
+  });
+
+  it("a refused reset (graph_too_large) leaves every watermark intact", async () => {
+    const { kv, handlers } = createGraphHarness();
+    await seedWatermarks(kv);
+    await kv.set(KV.graphNodes, "n1", { id: "n1" });
+    await kv.set(KV.graphNodes, "n2", { id: "n2" });
+
+    const result = (await handlers.get("mem::graph-reset")!({
+      confirm: true,
+      maxRecords: 1,
+    })) as {
+      success: boolean;
+      error?: string;
+      totalRecords?: number;
+      ceiling?: number;
+    };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("graph_too_large");
+    expect(result.totalRecords).toBe(2);
+    expect(result.ceiling).toBe(1);
+    // The refusal is non-destructive: the graph rows survive alongside the
+    // watermarks, so a later successful reset is still the only thing that
+    // invalidates coverage.
+    expect(await kv.get(KV.graphNodes, "n1")).toMatchObject({ id: "n1" });
+    expect(await kv.get(KV.graphNodes, "n2")).toMatchObject({ id: "n2" });
+    expect(await readWatermark(kv, "ses_1")).toMatchObject({
+      extractedCount: 2,
+      boundaryObservationId: "o2",
+    });
+    expect(await readWatermark(kv, "ses_2")).toMatchObject({
+      extractedCount: 1,
+      boundaryObservationId: "a1",
+    });
   });
 });

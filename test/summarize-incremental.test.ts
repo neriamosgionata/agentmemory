@@ -275,9 +275,8 @@ describe("mem::summarize incremental chunk partial cache", () => {
     ]);
   });
 
-  // U1 adaptation: the refresh floor (U2) does not exist yet, so this exercises
-  // the same cache path with appended observations that cross a chunk boundary.
-  // The cached partial stays valid; only the uncovered tail is summarized.
+  // Appends cross a chunk boundary, exercising the cache path directly: the
+  // cached partial stays valid; only the uncovered tail is summarized.
   it("appending into an incomplete tail chunk reuses covered chunks and summarizes only the uncovered tail", async () => {
     const { provider, calls } = makeProvider();
     const { handler, kv } = await setupHandler({
@@ -423,6 +422,128 @@ describe("mem::summarize incremental chunk partial cache", () => {
     const cacheAfter: any = await kv.get("summary-partials", "ses_fail_keep");
     expect(summaryAfter).toEqual(summaryBefore);
     expect(cacheAfter).toEqual(cacheBefore);
+  });
+
+  it("a reduce parse failure on attempt 2 reuses attempt-1 chunk partials without re-summarizing", async () => {
+    const calls: Array<{ system: string; user: string }> = [];
+    let reduceCalls = 0;
+    const provider: MemoryProvider = {
+      name: "test",
+      compress: async () => "",
+      summarize: async (system: string, user: string) => {
+        calls.push({ system, user });
+        if (system.includes(REDUCE_MARKER)) {
+          reduceCalls += 1;
+          return reduceCalls === 1
+            ? "not xml at all"
+            : summaryXml({
+                title: "Merged retry",
+                narrative: "A retried merged narrative that is long enough.",
+              });
+        }
+        return summaryXml({
+          title: `chunk-${calls.length}`,
+          narrative: "A chunk narrative that is long enough.",
+        });
+      },
+    };
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_reduce_retry",
+      obsCount: 100,
+      provider,
+    });
+
+    const first: any = await handler({ sessionId: "ses_reduce_retry" });
+    expect(first.success).toBe(true);
+    expect(calls).toHaveLength(1); // 100 obs == chunk size, single call
+
+    calls.length = 0;
+    reduceCalls = 0;
+    for (let i = 100; i < 150; i++) await addObs(kv, "ses_reduce_retry", i);
+
+    const second: any = await handler({ sessionId: "ses_reduce_retry" });
+
+    expect(second.success).toBe(true);
+    const chunkCalls = calls.filter((c) => !c.system.includes(REDUCE_MARKER));
+    const reduceCallList = calls.filter((c) => c.system.includes(REDUCE_MARKER));
+    // Attempt 1 pays for the 101-150 tail chunk and fails the reduce; attempt
+    // 2 must reuse that partial and run the reduce alone.
+    expect(chunkCalls).toHaveLength(1);
+    expect(chunkCalls[0].user).toContain("Session observations (50 total)");
+    expect(reduceCallList).toHaveLength(2);
+    const firstReduceIdx = calls.findIndex((c) =>
+      c.system.includes(REDUCE_MARKER),
+    );
+    expect(
+      calls.slice(firstReduceIdx).every((c) => c.system.includes(REDUCE_MARKER)),
+    ).toBe(true);
+    expect(reduceCallList[1].user).toContain("Partial summaries (2 chunks");
+    expect(reduceCallList[1].user).toContain("obs 1-100");
+    expect(reduceCallList[1].user).toContain("obs 101-150");
+
+    const stored: any = await kv.get("summaries", "ses_reduce_retry");
+    expect(stored.title).toBe("Merged retry");
+
+    // Attempt 2's reduce-only run persists the attempt-1 partials: the cache
+    // covers the whole session instead of dropping the tail chunk the retry
+    // never re-summarized.
+    const cache: any = await kv.get("summary-partials", "ses_reduce_retry");
+    expect(cache.coveredCount).toBe(150);
+    expect(cache.chunks.map((c: any) => [c.rangeStart, c.rangeEnd])).toEqual([
+      [1, 100],
+      [101, 150],
+    ]);
+  });
+
+  it("truncates the cache at the first skipped chunk and reports the contiguous end", async () => {
+    const calls: Array<{ system: string; user: string }> = [];
+    const provider: MemoryProvider = {
+      name: "test",
+      compress: async () => "",
+      summarize: async (system: string, user: string) => {
+        calls.push({ system, user });
+        if (system.includes(REDUCE_MARKER)) {
+          return summaryXml({
+            title: "Merged",
+            narrative: "A merged narrative that is long enough.",
+          });
+        }
+        if (user.includes("obs 100")) return "garbage, no xml";
+        return summaryXml({
+          title: `chunk-${calls.length}`,
+          narrative: "A chunk narrative that is long enough.",
+        });
+      },
+    };
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_skip_middle",
+      obsCount: 250,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_skip_middle" });
+
+    expect(result.success).toBe(true);
+    // 3 chunks; chunk 2 (obs 100-199) fails both attempts. One skip is at the
+    // 50% bailout threshold (floor(3 * 0.5) = 1), so the reduce still runs.
+    const chunkCalls = calls.filter((c) => !c.system.includes(REDUCE_MARKER));
+    expect(chunkCalls).toHaveLength(4); // chunks 1+3 once, chunk 2 twice
+    const reduceCalls = calls.filter((c) => c.system.includes(REDUCE_MARKER));
+    expect(reduceCalls).toHaveLength(1);
+    const reduceCall = reduceCalls[0];
+    expect(reduceCall.user).toContain("Partial summaries (2 chunks");
+
+    const stored: any = await kv.get("summaries", "ses_skip_middle");
+    expect(stored.observationCount).toBe(250);
+
+    // The cache must not claim coverage past the failed range: it ends at the
+    // last contiguous chunk end (obs 100), not at the session end.
+    const cache: any = await kv.get("summary-partials", "ses_skip_middle");
+    expect(cache.coveredCount).toBe(100);
+    expect(cache.chunks.map((c: any) => [c.rangeStart, c.rangeEnd])).toEqual([
+      [1, 100],
+    ]);
+    expect(cache.chunks[0].boundaryObservationId).toBe("obs_99");
   });
 
   it("duplicate concurrent summarize calls serialize into one provider run", async () => {
