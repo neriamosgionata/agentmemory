@@ -38,6 +38,17 @@ const CHUNK_CONCURRENCY_DEFAULT = 6;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
+// R2: minimum uncovered observations before a refresh rewrites the stored
+// summary. Per-turn Stop events otherwise re-summarize a growing session for
+// a handful of new observations, paying cost proportional to session size.
+const MIN_NEW_OBSERVATIONS_DEFAULT = 10;
+
+function getMinNewObservations(): number {
+  const raw = process.env.SUMMARIZE_MIN_NEW_OBSERVATIONS;
+  if (!raw) return MIN_NEW_OBSERVATIONS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : MIN_NEW_OBSERVATIONS_DEFAULT;
+}
 
 function getChunkSize(): number {
   const raw = process.env.SUMMARIZE_CHUNK_SIZE;
@@ -469,6 +480,37 @@ export function registerSummarizeFunction(
           existing.title.length > 0
             ? existing
             : null;
+
+        // R2: refresh floor. A refresh only replaces the stored summary once
+        // the uncovered tail reaches the configured minimum, so per-turn Stop
+        // events don't re-summarize the whole session for a few observations.
+        // `force: true` bypasses the floor; the already-covered skip above
+        // still wins at floor 0. A session whose row is `completed` bypasses
+        // the floor so the final tail is summarized: a host that re-arms a
+        // session per turn pays one bounded tail call per end rather than a
+        // full re-summarization.
+        const minNewObservations = getMinNewObservations();
+        const uncoveredCount =
+          compressed.length - (priorSummary?.observationCount ?? 0);
+        if (
+          !force &&
+          priorSummary &&
+          session.status !== "completed" &&
+          uncoveredCount < minNewObservations
+        ) {
+          logger.info("Summarize skipped — below refresh floor", {
+            sessionId,
+            summarizedObservations: priorSummary.observationCount,
+            currentObservations: compressed.length,
+            minNewObservations,
+          });
+          return {
+            success: true,
+            skipped: "below_refresh_floor",
+            summary: priorSummary,
+          };
+        }
+
         // R7: a forced refresh recomputes everything and never reuses the
         // derived cache.
         const partialCache = force
