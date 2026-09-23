@@ -11,6 +11,10 @@ import { OpenAIProvider } from "./openai.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
+import {
+  enableLlmActivityGateFor,
+  wrapProviderWithActivity,
+} from "./llm-activity.js";
 import { getEnvVar } from "../config.js";
 
 export { createEmbeddingProvider, createImageEmbeddingProvider } from "./embedding/index.js";
@@ -53,7 +57,14 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
 }
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
-  return new ResilientProvider(createBaseProvider(config));
+  return gatedProvider(createBaseProvider(config), config);
+}
+
+function gatedProvider(inner: MemoryProvider, config: ProviderConfig): ResilientProvider {
+  if (!enableLlmActivityGateFor(config.baseURL)) {
+    return new ResilientProvider(inner);
+  }
+  return new ResilientProvider(wrapProviderWithActivity(inner));
 }
 
 export function createFallbackProvider(
@@ -85,9 +96,9 @@ export function createFallbackProvider(
   }
 
   if (providers.length > 1) {
-    return new ResilientProvider(new FallbackChainProvider(providers));
+    return gatedProvider(new FallbackChainProvider(providers), config);
   }
-  return new ResilientProvider(providers[0]);
+  return gatedProvider(providers[0], config);
 }
 
 function createBaseProvider(config: ProviderConfig): MemoryProvider {

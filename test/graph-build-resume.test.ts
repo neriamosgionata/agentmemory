@@ -6,6 +6,11 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { KV } from "../src/state/schema.js";
+import {
+  enableLlmActivityGateFor,
+  trackLlmCall,
+  __resetLlmActivity,
+} from "../src/providers/llm-activity.js";
 
 const SECRET = "graph-build-secret";
 
@@ -226,6 +231,58 @@ describe("api::graph-build resumable windows (#1339)", () => {
     expect(third.body["nextOffset"]).toBe(1);
     expect(third.body["hasMore"]).toBe(false);
     expect(extractCalls).toHaveLength(4);
+  });
+
+  it("parks the drain with an unchanged cursor while interactive LLM work keeps the endpoint busy", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 2);
+    const { sdk, handlers, extractCalls } = mockSdk();
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+    process.env["AGENTMEMORY_LLM_IDLE_GAP_MS"] = "5000";
+    process.env["AGENTMEMORY_LLM_IDLE_MAX_WAIT_MS"] = "120";
+    enableLlmActivityGateFor("http://127.0.0.1:11434/v1");
+    let release!: () => void;
+    const inFlight = trackLlmCall(
+      () => new Promise<void>((r) => { release = r; }),
+    );
+    try {
+      const res = await callBuild(handlers, { batchSize: 1, maxSessions: 1 });
+
+      expect(res.body["batches"]).toBe(0);
+      expect(res.body["budgetExceeded"]).toBe(false);
+      expect(res.body["pausedForLlmIdle"]).toBe(true);
+      expect(res.body["hasMore"]).toBe(true);
+      expect(res.body["nextOffset"]).toBe(0);
+      expect(res.body["nextBatchOffset"]).toBe(0);
+      expect(extractCalls).toHaveLength(0);
+    } finally {
+      release();
+      await inFlight;
+      delete process.env["AGENTMEMORY_LLM_IDLE_GAP_MS"];
+      delete process.env["AGENTMEMORY_LLM_IDLE_MAX_WAIT_MS"];
+      __resetLlmActivity();
+    }
+  });
+
+  it("resumes the drain once the endpoint is idle again", async () => {
+    const kv = mockKV();
+    await seed(kv, 1, 2);
+    const { sdk, handlers, extractCalls } = mockSdk();
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+    process.env["AGENTMEMORY_LLM_IDLE_GAP_MS"] = "0";
+    process.env["AGENTMEMORY_LLM_IDLE_MAX_WAIT_MS"] = "120";
+    enableLlmActivityGateFor("http://127.0.0.1:11434/v1");
+    try {
+      const res = await callBuild(handlers, { batchSize: 1, maxSessions: 1 });
+
+      expect(res.body["batches"]).toBe(2);
+      expect(res.body["hasMore"]).toBe(false);
+      expect(extractCalls).toHaveLength(2);
+    } finally {
+      delete process.env["AGENTMEMORY_LLM_IDLE_GAP_MS"];
+      delete process.env["AGENTMEMORY_LLM_IDLE_MAX_WAIT_MS"];
+      __resetLlmActivity();
+    }
   });
 
   it("returns a 500 error body instead of a completion-looking one when the build throws", async () => {

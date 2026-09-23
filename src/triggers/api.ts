@@ -25,6 +25,7 @@ import {
   isAgentScopeIsolated,
   loadConfig,
 } from "../config.js";
+import { llmIdleMaxWaitMs, waitForLlmIdle } from "../providers/llm-activity.js";
 
 type Response = {
   status_code: number;
@@ -1798,6 +1799,7 @@ export function registerApiTriggers(
         let nextOffset = offset;
         let nextBatchOffset = 0;
         let budgetExceeded = false;
+        let pausedForLlmIdle = false;
         let interrupted = false;
         let skippedBatches = 0;
 
@@ -1820,13 +1822,25 @@ export function registerApiTriggers(
           // invocation ceiling, so the budget is enforced per batch and the
           // caller resumes the same session via batchOffset (#1339 follow-up).
           const startBatch = wi === 0 ? Math.min(batchOffset, compressed.length) : 0;
-          let resumeAt = startBatch;
           for (let i = startBatch; i < compressed.length; i += batchSize) {
             if (Date.now() - startedAt > timeBudgetMs) {
               budgetExceeded = true;
               interrupted = true;
               nextOffset = offset + wi;
-              nextBatchOffset = resumeAt;
+              nextBatchOffset = i;
+              break;
+            }
+            // Background drain runs only in LLM idle windows. Parking returns
+            // the last completed batch boundary within this call's budget
+            // instead of holding the HTTP call open until the caller's own
+            // timeout (the 165s empty-response churn).
+            const budgetLeft = timeBudgetMs - (Date.now() - startedAt);
+            const idle = await waitForLlmIdle(Math.min(budgetLeft, llmIdleMaxWaitMs()));
+            if (!idle) {
+              pausedForLlmIdle = true;
+              interrupted = true;
+              nextOffset = offset + wi;
+              nextBatchOffset = i;
               break;
             }
             const batch = compressed.slice(i, i + batchSize);
@@ -1849,7 +1863,6 @@ export function registerApiTriggers(
             }
             if (batchError === undefined) {
               graphBatchFailures.delete(failKey);
-              resumeAt = i + batchSize;
               continue;
             }
             const attempts = (graphBatchFailures.get(failKey) ?? 0) + 1;
@@ -1862,7 +1875,6 @@ export function registerApiTriggers(
                 attempts,
                 error: batchError,
               });
-              resumeAt = i + batchSize;
               continue;
             }
             graphBatchFailures.set(failKey, attempts);
@@ -1879,6 +1891,9 @@ export function registerApiTriggers(
             break;
           }
           if (interrupted) break;
+          for (const key of graphBatchFailures.keys()) {
+            if (key.startsWith(`${sid}:`)) graphBatchFailures.delete(key);
+          }
           processedSessions++;
           nextOffset = offset + wi + 1;
           nextBatchOffset = 0;
@@ -1896,6 +1911,7 @@ export function registerApiTriggers(
             nextBatchOffset,
             hasMore,
             budgetExceeded,
+            pausedForLlmIdle,
             skippedBatches,
             batches: batchesRun,
             nodes: totalNodes,
