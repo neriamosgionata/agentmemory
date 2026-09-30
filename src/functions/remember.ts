@@ -252,7 +252,11 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       observationIds?: string[];
       memoryId?: string;
     }) => {
+<<<<<<< HEAD
       type ObservationRef = { id?: string; imageData?: string; imageRef?: string; captureKey?: string };
+=======
+      type ObservationRef = { id?: string; imageData?: string; imageRef?: string };
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
       let deleted = 0;
       const deletedMemoryIds: string[] = [];
       const deletedObservationIds: string[] = [];
@@ -271,6 +275,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         failures.push({ id, error: "delete_failed" });
       };
 
+<<<<<<< HEAD
       const cleanupFailures: Array<{ id: string; error: string }> = [];
       const cleanup = async (id: string, steps: () => Promise<void>) => {
         try {
@@ -293,6 +298,17 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         }
       };
 
+=======
+      const attempt = async (id: string, remove: () => Promise<boolean>) => {
+        try {
+          if (await remove()) deleted++;
+          else notFound.push(id);
+        } catch (err) {
+          recordFailure(id, err);
+        }
+      };
+
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
       const forgetObservation = async (
         sessionId: string,
         obsId: string,
@@ -302,6 +318,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           known ??
           (await kv.get<ObservationRef>(KV.observations(sessionId), obsId));
         if (!obs) return false;
+<<<<<<< HEAD
         await markCaptureEventDeleted(kv, { ...obs, id: obsId, sessionId });
         await kv.delete(KV.observations(sessionId), obsId);
         deletedObservationIds.push(obsId);
@@ -309,11 +326,25 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         vectorIndexRemove(obsId);
         indexCleaned = true;
         await cleanup(obsId, async () => {
+=======
+        await kv.delete(KV.observations(sessionId), obsId);
+        await unindexObservationSession(kv, obsId).catch(() => {});
+        try {
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
           if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs.imageRef && obs.imageRef !== obs.imageData) {
             await decrementImageRef(kv, sdk, obs.imageRef);
           }
+<<<<<<< HEAD
         });
+=======
+        } finally {
+          getSearchIndex().remove(obsId);
+          vectorIndexRemove(obsId);
+          indexCleaned = true;
+        }
+        deletedObservationIds.push(obsId);
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
         return true;
       };
 
@@ -323,6 +354,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           const mem = await kv.get<Memory>(KV.memories, memoryId);
           if (!mem) return false;
           await kv.delete(KV.memories, memoryId);
+<<<<<<< HEAD
           deletedMemoryIds.push(memoryId);
           getSearchIndex().remove(memoryId);
           vectorIndexRemove(memoryId);
@@ -331,6 +363,19 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             if (mem.imageRef) await decrementImageRef(kv, sdk, mem.imageRef);
             await deleteAccessLog(kv, memoryId);
           });
+=======
+          try {
+            if (mem.imageRef) {
+              await decrementImageRef(kv, sdk, mem.imageRef);
+            }
+          } finally {
+            getSearchIndex().remove(memoryId);
+            vectorIndexRemove(memoryId);
+            indexCleaned = true;
+          }
+          await deleteAccessLog(kv, memoryId);
+          deletedMemoryIds.push(memoryId);
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
           return true;
         });
       }
@@ -343,9 +388,12 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         const sessionId = data.sessionId;
         for (const obsId of data.observationIds) {
           await attempt(obsId, () => forgetObservation(sessionId, obsId));
+<<<<<<< HEAD
         }
         if (deletedObservationIds.length > 0) {
           await clearSessionDerivedState(kv, data.sessionId);
+=======
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
         }
       }
 
@@ -360,6 +408,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         );
         for (const obs of observations) {
           await attempt(obs.id, () => forgetObservation(sessionId, obs.id, obs));
+<<<<<<< HEAD
         }
         await attempt(sessionId, async () => {
           const session = await kv.get<Session>(KV.sessions, sessionId);
@@ -379,6 +428,31 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           recordFailure(`summary:${sessionId}`, err);
         }
         await clearSessionDerivedState(kv, data.sessionId);
+=======
+        }
+        await attempt(sessionId, async () => {
+          const session = await kv.get<Session>(KV.sessions, sessionId);
+          if (!session) return false;
+          await kv.delete(KV.sessions, sessionId);
+          await removeSessionFromProjectIndex(
+            kv,
+            session.project,
+            sessionId,
+          ).catch(() => {});
+          deletedSession = true;
+          return true;
+        });
+        try {
+          const summary = await kv.get(KV.summaries, sessionId);
+          if (summary) {
+            await kv.delete(KV.summaries, sessionId);
+            deletedSummary = true;
+            deleted++;
+          }
+        } catch (err) {
+          recordFailure(`summary:${sessionId}`, err);
+        }
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
       }
 
       if (deleted > 0 || indexCleaned) await flushIndexSave();
@@ -399,9 +473,12 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             notFound: notFound.length,
             failed: failures.length,
             failures: failures.length > 0 ? failures : undefined,
+<<<<<<< HEAD
             cleanupFailed: cleanupFailures.length,
             cleanupFailures:
               cleanupFailures.length > 0 ? cleanupFailures : undefined,
+=======
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
             reason: "user-initiated forget",
           },
         );
@@ -418,9 +495,12 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         notFound,
         failed: failures.length,
         failures: failures.length > 0 ? failures : undefined,
+<<<<<<< HEAD
         cleanupFailed: cleanupFailures.length,
         cleanupFailures:
           cleanupFailures.length > 0 ? cleanupFailures : undefined,
+=======
+>>>>>>> 63c54d9 (fix: release blockers for export, forget accounting and shutdown flush (#1449))
       };
     },
   );
