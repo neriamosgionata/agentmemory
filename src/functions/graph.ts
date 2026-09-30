@@ -187,9 +187,10 @@ function paginateFromSnapshot(
   const filteredNodes = filterType
     ? snap.topNodes.filter((n) => n.type === filterType)
     : snap.topNodes;
-  const total = filterType
+  const totalRaw = filterType
     ? snap.stats.nodesByType[filterType] ?? 0
     : snap.stats.totalNodes;
+  const total = Math.max(totalRaw, filteredNodes.length);
   const pageNodes = filteredNodes.slice(offset, offset + limit);
   const pageIds = new Set(pageNodes.map((n) => n.id));
   const pageEdges = snap.topEdges.filter(
