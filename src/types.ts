@@ -3,10 +3,10 @@ export interface Session {
   project: string;
   cwd: string;
   startedAt: string;
-  endedAt?: string;
   /** Present on rows written by importers/external writers; not set by the
    *  session lifecycle itself. */
   updatedAt?: string;
+  endedAt?: string;
   status: "active" | "completed" | "abandoned";
   observationCount: number;
   model?: string;
@@ -714,7 +714,8 @@ export interface AuditEntry {
     | "slot_replace"
     | "slot_create"
     | "slot_delete"
-    | "slot_reflect";
+    | "slot_reflect"
+    | "session_sweep";
   userId?: string;
   functionId: string;
   targetIds: string[];
