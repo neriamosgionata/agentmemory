@@ -1737,8 +1737,8 @@ export function registerApiTriggers(
       if (authErr) return authErr;
       const body = (req.body ?? {}) as Record<string, unknown>;
       const { scope, offset, limit } = body;
-      if (scope !== undefined && scope !== "nodes" && scope !== "edges" && scope !== "snapshot") {
-        return { status_code: 400, body: { error: "scope must be nodes, edges or snapshot" } };
+      if (scope !== undefined && !COMPACT_SCOPES.includes(scope as GraphCompactScope)) {
+        return { status_code: 400, body: { error: "scope must be nodes, edges, history or snapshot" } };
       }
       if (offset !== undefined && !(Number.isInteger(offset) && (offset as number) >= 0)) {
         return { status_code: 400, body: { error: "offset must be a non-negative integer" } };

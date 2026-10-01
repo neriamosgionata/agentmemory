@@ -821,21 +821,24 @@ export interface GraphCompactResult {
   nodesTrimmed: number;
   edgesScanned: number;
   edgesTrimmed: number;
+  historyScanned: number;
+  historyTrimmed: number;
   idsRemoved: number;
   snapshotTrimmed: boolean;
   total?: number;
   nextOffset: number | null;
 }
 
-export type GraphCompactScope = "nodes" | "edges" | "snapshot";
+export type GraphCompactScope = "nodes" | "edges" | "history" | "snapshot";
 
 export interface GraphCompactOptions {
   scope?: GraphCompactScope;
   offset?: number;
   limit?: number;
+  dryRun?: boolean;
 }
 
-const COMPACT_SCOPES: readonly GraphCompactScope[] = ["nodes", "edges", "snapshot"];
+export const COMPACT_SCOPES: readonly GraphCompactScope[] = ["nodes", "edges", "history", "snapshot"];
 
 export async function compactGraphProvenance(
   kv: StateKV,
@@ -847,6 +850,7 @@ export async function compactGraphProvenance(
     throw new Error(`unknown compact scope: ${String(scope)}`);
   }
   const offset = opts.offset ?? 0;
+  const dryRun = opts.dryRun === true;
   const limit = opts.limit ?? Number.POSITIVE_INFINITY;
   if (!Number.isInteger(offset) || offset < 0) {
     throw new Error(`compact offset must be a non-negative integer: ${String(opts.offset)}`);
@@ -860,16 +864,18 @@ export async function compactGraphProvenance(
     nodesTrimmed: 0,
     edgesScanned: 0,
     edgesTrimmed: 0,
+    historyScanned: 0,
+    historyTrimmed: 0,
     idsRemoved: 0,
     snapshotTrimmed: false,
     nextOffset: null,
   };
 
   const trimScope = async <R extends { sourceObservationIds: string[] }>(
-    indexScope: string,
+    listIds: () => Promise<unknown[]>,
     recordScope: string,
   ): Promise<{ scanned: number; trimmed: number }> => {
-    const allIds = [...new Set(await kv.list<string>(indexScope))]
+    const allIds = [...new Set(await listIds())]
       .filter((id): id is string => typeof id === "string")
       .sort();
     const end = Math.min(allIds.length, offset + limit);
@@ -886,7 +892,7 @@ export async function compactGraphProvenance(
         if (sources.length <= sourceCap) return;
         const bounded = boundSources([], sources);
         result.idsRemoved += sources.length - bounded.length;
-        await kv.set(recordScope, id, { ...record, sourceObservationIds: bounded });
+        if (!dryRun) await kv.set(recordScope, id, { ...record, sourceObservationIds: bounded });
         trimmed += 1;
       });
     }
@@ -906,20 +912,28 @@ export async function compactGraphProvenance(
         });
       const topNodes = trimList(snap.topNodes);
       const topEdges = trimList(snap.topEdges);
-      if (result.snapshotTrimmed) {
+      if (result.snapshotTrimmed && !dryRun) {
         await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...snap, topNodes, topEdges });
       }
     });
 
   if (scope === undefined || scope === "nodes") {
-    const n = await trimScope<GraphNode>(KV.graphNameIndex, KV.graphNodes);
+    const n = await trimScope<GraphNode>(() => kv.list<string>(KV.graphNameIndex), KV.graphNodes);
     result.nodesScanned = n.scanned;
     result.nodesTrimmed = n.trimmed;
   }
   if (scope === undefined || scope === "edges") {
-    const e = await trimScope<GraphEdge>(KV.graphEdgeKey, KV.graphEdges);
+    const e = await trimScope<GraphEdge>(() => kv.list<string>(KV.graphEdgeKey), KV.graphEdges);
     result.edgesScanned = e.scanned;
     result.edgesTrimmed = e.trimmed;
+  }
+  if (scope === undefined || scope === "history") {
+    const h = await trimScope<GraphEdge>(
+      async () => (await kv.list<GraphEdge>(KV.graphEdgeHistory)).map((r) => r?.id),
+      KV.graphEdgeHistory,
+    );
+    result.historyScanned = h.scanned;
+    result.historyTrimmed = h.trimmed;
   }
   if (scope === undefined || scope === "snapshot") {
     await trimSnapshot();
@@ -1405,6 +1419,7 @@ export function registerGraphFunction(
           limit: data?.limit,
           nodesTrimmed: result.nodesTrimmed,
           edgesTrimmed: result.edgesTrimmed,
+          historyTrimmed: result.historyTrimmed,
           idsRemoved: result.idsRemoved,
           snapshotTrimmed: result.snapshotTrimmed,
         });
