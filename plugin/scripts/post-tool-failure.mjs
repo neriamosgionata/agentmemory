@@ -1,45 +1,45 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
 import { execSync } from "node:child_process";
-//#region src/hooks/_env.ts
-function hookEnvPath() {
-	return join(homedir(), ".agentmemory", ".env");
+import { basename } from "node:path";
+//#region src/hooks/_capture-filter.ts
+const DEFAULT_DENY_PATTERNS = [
+	"memory_*",
+	"toolsearch",
+	"listmcpresources",
+	"fetchmcpresource"
+];
+function parseEnvList(raw) {
+	if (!raw?.trim()) return void 0;
+	return raw.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean);
 }
-function parseHookEnv(content) {
-	const vars = {};
-	for (const line of content.split(/\r?\n/)) {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-		const eqIdx = trimmed.indexOf("=");
-		if (eqIdx === -1) continue;
-		const key = trimmed.slice(0, eqIdx).trim();
-		if (!key) continue;
-		let val = trimmed.slice(eqIdx + 1).trim();
-		const quoteChar = val[0] === "\"" || val[0] === "'" ? val[0] : "";
-		if (quoteChar) {
-			const closeIdx = val.indexOf(quoteChar, 1);
-			if (closeIdx !== -1) val = val.slice(1, closeIdx);
-		} else {
-			const hashIdx = val.indexOf(" #");
-			if (hashIdx !== -1) val = val.slice(0, hashIdx).trim();
-		}
-		vars[key] = val;
+function bareToolName(toolName) {
+	const trimmed = toolName.trim();
+	if (/^mcp__/i.test(trimmed)) {
+		const parts = trimmed.split("__");
+		if (parts.length >= 3) return parts[parts.length - 1];
 	}
-	return vars;
+	return trimmed;
 }
-/** Copy unset vars from ~/.agentmemory/.env into process.env. Real process
-*  env always wins, matching config.ts's precedence. */
-function hydrateHookEnv(envPath = hookEnvPath()) {
-	if (!existsSync(envPath)) return;
-	let vars;
-	try {
-		vars = parseHookEnv(readFileSync(envPath, "utf-8"));
-	} catch {
-		return;
-	}
-	for (const [key, value] of Object.entries(vars)) if (process.env[key] === void 0) process.env[key] = value;
+function normalizePattern(pattern) {
+	return pattern.trim().toLowerCase();
+}
+function matchesPattern(toolName, pattern) {
+	const bare = bareToolName(toolName).toLowerCase();
+	const full = toolName.trim().toLowerCase();
+	const pat = normalizePattern(pattern);
+	if (!pat.includes("*")) return bare === pat || full === pat;
+	const escaped = pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`^${escaped.replace(/\*/g, ".*")}$`);
+	return re.test(bare) || re.test(full);
+}
+function matchesAny(toolName, patterns) {
+	return patterns.some((pattern) => matchesPattern(toolName, pattern));
+}
+function shouldCaptureTool(toolName) {
+	if (typeof toolName !== "string" || !toolName.trim()) return true;
+	const allow = parseEnvList(process.env["AGENTMEMORY_CAPTURE_ALLOW"]);
+	if (allow) return matchesAny(toolName, allow);
+	return !matchesAny(toolName, [...DEFAULT_DENY_PATTERNS, ...parseEnvList(process.env["AGENTMEMORY_CAPTURE_DENY"]) ?? []]);
 }
 //#endregion
 //#region src/hooks/_project.ts
@@ -72,21 +72,7 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
-//#region src/hooks/self-capture.ts
-const SELF_TOOL_PREFIXES = [
-	"mcp__agentmemory",
-	"agentmemory_",
-	"memory_"
-];
-function isSelfCaptureTool(toolName) {
-	if (typeof toolName !== "string") return false;
-	const name = toolName.trim().toLowerCase();
-	if (!name) return false;
-	return SELF_TOOL_PREFIXES.some((prefix) => name.startsWith(prefix));
-}
-//#endregion
 //#region src/hooks/post-tool-failure.ts
-hydrateHookEnv();
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
 	if (!payload || typeof payload !== "object") return false;
@@ -113,9 +99,9 @@ async function main() {
 	if (data.is_interrupt || data.isInterrupt) return;
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const toolName = data.tool_name ?? data.toolName;
+	if (!shouldCaptureTool(toolName)) return;
 	const toolInput = data.tool_input ?? data.toolArgs;
 	const error = data.error ?? data.errorMessage;
-	if (isSelfCaptureTool(toolName)) return;
 	const cwd = hookCwd(data) || process.cwd();
 	fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",

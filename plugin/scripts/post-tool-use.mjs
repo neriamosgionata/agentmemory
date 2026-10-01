@@ -1,45 +1,66 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
 import { execSync } from "node:child_process";
-//#region src/hooks/_env.ts
-function hookEnvPath() {
-	return join(homedir(), ".agentmemory", ".env");
+import { basename } from "node:path";
+//#region src/hooks/_capture-filter.ts
+const DEFAULT_DENY_PATTERNS = [
+	"memory_*",
+	"toolsearch",
+	"listmcpresources",
+	"fetchmcpresource"
+];
+function parseEnvList(raw) {
+	if (!raw?.trim()) return void 0;
+	return raw.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean);
 }
-function parseHookEnv(content) {
-	const vars = {};
-	for (const line of content.split(/\r?\n/)) {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-		const eqIdx = trimmed.indexOf("=");
-		if (eqIdx === -1) continue;
-		const key = trimmed.slice(0, eqIdx).trim();
-		if (!key) continue;
-		let val = trimmed.slice(eqIdx + 1).trim();
-		const quoteChar = val[0] === "\"" || val[0] === "'" ? val[0] : "";
-		if (quoteChar) {
-			const closeIdx = val.indexOf(quoteChar, 1);
-			if (closeIdx !== -1) val = val.slice(1, closeIdx);
-		} else {
-			const hashIdx = val.indexOf(" #");
-			if (hashIdx !== -1) val = val.slice(0, hashIdx).trim();
+function bareToolName(toolName) {
+	const trimmed = toolName.trim();
+	if (/^mcp__/i.test(trimmed)) {
+		const parts = trimmed.split("__");
+		if (parts.length >= 3) return parts[parts.length - 1];
+	}
+	return trimmed;
+}
+function normalizePattern(pattern) {
+	return pattern.trim().toLowerCase();
+}
+function matchesPattern(toolName, pattern) {
+	const bare = bareToolName(toolName).toLowerCase();
+	const full = toolName.trim().toLowerCase();
+	const pat = normalizePattern(pattern);
+	if (!pat.includes("*")) return bare === pat || full === pat;
+	const escaped = pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`^${escaped.replace(/\*/g, ".*")}$`);
+	return re.test(bare) || re.test(full);
+}
+function matchesAny(toolName, patterns) {
+	return patterns.some((pattern) => matchesPattern(toolName, pattern));
+}
+function shouldCaptureTool(toolName) {
+	if (typeof toolName !== "string" || !toolName.trim()) return true;
+	const allow = parseEnvList(process.env["AGENTMEMORY_CAPTURE_ALLOW"]);
+	if (allow) return matchesAny(toolName, allow);
+	return !matchesAny(toolName, [...DEFAULT_DENY_PATTERNS, ...parseEnvList(process.env["AGENTMEMORY_CAPTURE_DENY"]) ?? []]);
+}
+function captureOutputMax() {
+	const raw = process.env["AGENTMEMORY_CAPTURE_OUTPUT_MAX"];
+	if (!raw?.trim()) return 8e3;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 8e3;
+}
+function truncateCaptureOutput(value, max) {
+	if (typeof value === "string" && value.length > max) {
+		const suffix = "\n[...truncated]";
+		return max <= 15 ? suffix.slice(0, max) : value.slice(0, max - 15) + suffix;
+	}
+	if (typeof value === "object" && value !== null) {
+		const str = JSON.stringify(value);
+		if (str.length > max) {
+			const suffix = "...[truncated]";
+			return max <= 14 ? suffix.slice(0, max) : str.slice(0, max - 14) + suffix;
 		}
-		vars[key] = val;
+		return value;
 	}
-	return vars;
-}
-/** Copy unset vars from ~/.agentmemory/.env into process.env. Real process
-*  env always wins, matching config.ts's precedence. */
-function hydrateHookEnv(envPath = hookEnvPath()) {
-	if (!existsSync(envPath)) return;
-	let vars;
-	try {
-		vars = parseHookEnv(readFileSync(envPath, "utf-8"));
-	} catch {
-		return;
-	}
-	for (const [key, value] of Object.entries(vars)) if (process.env[key] === void 0) process.env[key] = value;
+	return value;
 }
 //#endregion
 //#region src/hooks/_project.ts
@@ -72,21 +93,7 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
-//#region src/hooks/self-capture.ts
-const SELF_TOOL_PREFIXES = [
-	"mcp__agentmemory",
-	"agentmemory_",
-	"memory_"
-];
-function isSelfCaptureTool(toolName) {
-	if (typeof toolName !== "string") return false;
-	const name = toolName.trim().toLowerCase();
-	if (!name) return false;
-	return SELF_TOOL_PREFIXES.some((prefix) => name.startsWith(prefix));
-}
-//#endregion
 //#region src/hooks/post-tool-use.ts
-hydrateHookEnv();
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
 	if (!payload || typeof payload !== "object") return false;
@@ -112,10 +119,11 @@ async function main() {
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const toolName = data.tool_name ?? data.toolName;
+	if (!shouldCaptureTool(toolName)) return;
 	const toolInput = data.tool_input ?? data.toolArgs;
-	if (isSelfCaptureTool(toolName)) return;
 	const { imageData, cleanOutput } = extractImageData(toolOutput(data));
 	const cwd = hookCwd(data) || process.cwd();
+	const outputMax = captureOutputMax();
 	fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
 		headers: authHeaders(),
@@ -128,7 +136,7 @@ async function main() {
 			data: {
 				tool_name: toolName,
 				tool_input: toolInput,
-				tool_output: truncate(cleanOutput, 8e3),
+				tool_output: truncateCaptureOutput(cleanOutput, outputMax),
 				...imageData ? { image_data: imageData } : {}
 			}
 		}),
@@ -171,15 +179,6 @@ function extractImageData(output) {
 		imageData: void 0,
 		cleanOutput: output
 	};
-}
-function truncate(value, max) {
-	if (typeof value === "string" && value.length > max) return value.slice(0, max) + "\n[...truncated]";
-	if (typeof value === "object" && value !== null) {
-		const str = JSON.stringify(value);
-		if (str.length > max) return str.slice(0, max) + "...[truncated]";
-		return value;
-	}
-	return value;
 }
 main().catch(() => process.exit(0));
 //#endregion
