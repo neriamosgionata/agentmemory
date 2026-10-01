@@ -44,6 +44,8 @@ import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
 import { logger } from "../logger.js";
 
+import { boundRecordSources } from "./graph.js";
+
 // Bounded-concurrency chunk size for the import delete/write loops. A
 // "replace" or "merge" of a large export (up to MAX_TOTAL_OBSERVATIONS,
 // ~500k) would otherwise issue hundreds of thousands of sequential state
@@ -627,7 +629,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             const existing = await kv.get(KV.graphNodes, node.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await kv.set(KV.graphNodes, node.id, node);
+          await kv.set(KV.graphNodes, node.id, boundRecordSources(node));
         });
       }
       if (importData.graphEdges) {
@@ -636,7 +638,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             const existing = await kv.get(KV.graphEdges, edge.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await kv.set(KV.graphEdges, edge.id, edge);
+          await kv.set(KV.graphEdges, edge.id, boundRecordSources(edge));
         });
       }
       if (importData.semanticMemories) {

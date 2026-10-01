@@ -23,6 +23,7 @@ import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { flushIndexSave, rebuildIndex } from "./search.js";
 import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
+import { boundRecordSources } from "./graph.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 
@@ -274,9 +275,11 @@ export function registerSnapshotFunction(
           await replaceScope(KV.memories, state.memories, (r) => String(r["id"]));
         }
         if (state.graphNodes) {
-          await replaceScope(KV.graphNodes, state.graphNodes, (r) =>
-            String(r["id"]),
-          );
+          for (const node of state.graphNodes) {
+            await withKeyedLock("graph:persist", () =>
+              kv.set(KV.graphNodes, node.id, boundRecordSources(node)),
+            );
+          }
         }
         if (state.observations) {
           for (const [sessionId, obs] of Object.entries(state.observations)) {

@@ -409,7 +409,7 @@ describe("TemporalGraph", () => {
     expect(edges[0].sourceObservationIds[19]).toBe("obs_25");
   });
 
-  it("caps sourceObservationIds at 20 on node merge in temporal-graph-extract", async () => {
+  it("keeps merged provenance at the configured cap in temporal-graph-extract", async () => {
     const { registerTemporalGraphFunctions } = await import(
       "../src/functions/temporal-graph.js"
     );
@@ -461,8 +461,8 @@ describe("TemporalGraph", () => {
     const nodes = await kv.list<GraphNode>("mem:graph:nodes");
     const aliceNode = nodes.find((n) => n.name === "Alice");
     expect(aliceNode).toBeDefined();
-    expect(aliceNode?.sourceObservationIds.length).toBe(20);
-    expect(aliceNode?.sourceObservationIds[0]).toBe("old_obs_6");
-    expect(aliceNode?.sourceObservationIds[19]).toBe("new_obs_10");
+    expect(aliceNode?.sourceObservationIds.length).toBe(10);
+    expect(aliceNode?.sourceObservationIds[0]).toBe("new_obs_1");
+    expect(aliceNode?.sourceObservationIds[9]).toBe("new_obs_10");
   });
 });
