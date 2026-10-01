@@ -3,6 +3,7 @@ import { hydrateHookEnv } from "./_env.js";
 hydrateHookEnv();
 
 import { resolveProject, hookCwd } from "./_project.js";
+import { resolveClientSecret } from "../secret-store.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -27,7 +28,7 @@ function isSdkChildContext(payload: unknown): boolean {
 const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+const SECRET = resolveClientSecret(REST_URL);
 
 // #1278: enrich measured 1.9-4.3s on real stores, so the old 2s abort
 // guaranteed the hook gave up before the context arrived. 8s is the default

@@ -1192,7 +1192,7 @@ Auto-starts on port `3113`. Live observation stream with a stream status indicat
 open http://localhost:3113
 ```
 
-The viewer server binds to `127.0.0.1` by default. The REST-served `/agentmemory/viewer` endpoint follows the normal `AGENTMEMORY_SECRET` bearer-token rules. CSP headers use a per-response script nonce and disable inline handler attributes (`script-src-attr 'none'`).
+The viewer server binds to `127.0.0.1` by default and attaches the server secret when it forwards requests to the REST API, so it needs no setup. The REST-served `/agentmemory/viewer` endpoint follows the normal bearer-token rules and redirects browsers without a token to the viewer port. CSP headers use a per-response script nonce and disable inline handler attributes (`script-src-attr 'none'`).
 
 ---
 
@@ -1542,8 +1542,10 @@ Create `~/.agentmemory/.env`:
 # VECTOR_WEIGHT=0.6
 # TOKEN_BUDGET=2000
 
-# Auth
+# Auth (generated into ~/.agentmemory/secret on first start when unset)
 # AGENTMEMORY_SECRET=your-secret
+# VIEWER_ALLOWED_ORIGINS=https://memory.example.com
+# AGENTMEMORY_IMPORT_ROOT=~/projects
 
 # Ports (defaults: 3111 API, 3113 viewer)
 # III_REST_PORT=3111

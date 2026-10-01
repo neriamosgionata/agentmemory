@@ -8,6 +8,7 @@ const writtenFiles = new Map<string, string>();
 const createdDirs = new Set<string>();
 
 vi.mock("node:fs/promises", () => ({
+  realpath: vi.fn(async (path: string) => path),
   mkdir: vi.fn(async (dir: string) => {
     createdDirs.add(dir);
   }),

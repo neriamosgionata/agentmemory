@@ -28,7 +28,7 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
-import { registerPrivacyFunction } from "./functions/privacy.js";
+import { registerPrivacyFunction, withWriteScrubbing } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
 import { registerVisionSearchFunctions } from "./functions/vision-search.js";
@@ -109,6 +109,7 @@ import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog, bootWarn } from "./logger.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
+import { ensureServerSecret, explicitSecret, secretFilePath } from "./secret-store.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -160,6 +161,22 @@ process.on("unhandledRejection", (reason) => {
   );
 });
 
+function resolveWorkerSecret(): string {
+  const configured = getEnvVar("AGENTMEMORY_SECRET")?.trim();
+  if (configured) return configured;
+  try {
+    const { secret, source } = ensureServerSecret();
+    if (source === "generated") {
+      bootLog(`Generated an API secret at ${secretFilePath()} (mode 0600). Local clients read it automatically.`);
+    }
+    return secret;
+  } catch (err) {
+    throw new Error(
+      `agentmemory could not create its API secret at ${secretFilePath()}: ${err instanceof Error ? err.message : String(err)}. Set AGENTMEMORY_SECRET explicitly or make the directory writable.`,
+    );
+  }
+}
+
 async function main() {
   // Fold ~/.agentmemory/.env into process.env before anything reads config
   // or raw process.env. Only-if-unset, so real process.env still wins.
@@ -199,7 +216,7 @@ async function main() {
   );
   bootLog(`Streams: ws://localhost:${config.streamsPort}`);
 
-  const sdk = registerWorker(config.engineUrl, {
+  const sdk = withWriteScrubbing(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -219,12 +236,12 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  });
+  }));
 
   writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
-  const secret = getEnvVar("AGENTMEMORY_SECRET");
+  const secret = resolveWorkerSecret();
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
@@ -320,7 +337,7 @@ async function main() {
   registerRoutinesFunction(sdk, kv);
   registerSignalsFunction(sdk, kv);
   registerCheckpointsFunction(sdk, kv);
-  registerMeshFunction(sdk, kv, secret);
+  registerMeshFunction(sdk, kv, explicitSecret() || undefined);
   registerBranchAwareFunction(sdk, kv);
   registerFlowCompressFunction(sdk, kv, provider);
   registerSentinelsFunction(sdk, kv);

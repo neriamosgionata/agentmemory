@@ -2,6 +2,8 @@ import { homedir } from "node:os";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { ISdk } from "../iii.js";
+import { allowedFileRoots, confinePath } from "./path-guard.js";
+import { scrubRecord } from "./privacy.js";
 import type {
   CompressedObservation,
   Crystal,
@@ -314,13 +316,18 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       const expanded = rawPath.startsWith("~")
         ? join(homedir(), rawPath.slice(1))
         : rawPath;
-      const abs = resolve(expanded);
-      if (isSensitive(abs)) {
+      const requested = resolve(expanded);
+      if (isSensitive(requested)) {
         return { success: false, error: "refusing to process sensitive-looking path" };
       }
-      if (await isSymlink(abs)) {
+      if (await isSymlink(requested)) {
         return { success: false, error: "symlinks are not supported" };
       }
+      const confined = await confinePath(requested, allowedFileRoots([defaultRoot]));
+      if (!confined.ok) {
+        return { success: false, error: confined.error };
+      }
+      const abs = confined.path;
 
       let stat;
       try {
@@ -388,6 +395,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
 
         const parsed = parseJsonlText(text, generateId("sess"));
         if (parsed.observations.length === 0) continue;
+        parsed.observations = parsed.observations.map((obs) => scrubRecord(obs));
 
         const firstPromptObs = parsed.observations.find(
           (o) => typeof o.userPrompt === "string" && o.userPrompt.trim().length > 0,

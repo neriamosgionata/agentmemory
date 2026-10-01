@@ -1,6 +1,8 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { execFileSync } from "node:child_process";
-import { basename } from "node:path";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 
 const API = process.env.AGENTMEMORY_URL || "http://localhost:3111";
 // OpenCode reports tool names in lowercase ("read", "edit", ...); matching is
@@ -11,7 +13,17 @@ const FILE_KEYS = ["filePath", "file_path", "path", "file", "pattern"];
 const MAX_STASHED_FILES = 20;
 
 const DEBUG = process.env.OPENCODE_AGENTMEMORY_DEBUG === "1";
-const SECRET = process.env.AGENTMEMORY_SECRET || "";
+function storedSecret(url: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host !== "localhost" && host !== "::1" && !/^127\./.test(host)) return "";
+    return readFileSync(join(homedir(), ".agentmemory", "secret"), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
+const SECRET = process.env.AGENTMEMORY_SECRET || storedSecret(API);
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };

@@ -23,6 +23,7 @@ import { compressWithRetry } from "../eval/self-correct.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { scrubRecord } from "./privacy.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -224,7 +225,7 @@ export function registerCompressFunction(
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
-          ...parsed,
+          ...scrubRecord(parsed),
           confidence: qualityScore / 100,
           ...(hasImage ? { modality: data.raw.modality } : {}),
           ...(imageDescription ? { imageDescription } : {}),

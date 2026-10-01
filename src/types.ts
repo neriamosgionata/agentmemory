@@ -64,6 +64,18 @@ export interface RawObservation {
   origin?: Origin;
 }
 
+export interface ObservationSource {
+  hookType: HookType;
+  originalBytes: number;
+  truncated: boolean;
+  toolName?: string;
+  toolInput?: unknown;
+  toolOutput?: unknown;
+  userPrompt?: string;
+  assistantResponse?: string;
+  payload?: unknown;
+}
+
 export interface CompressedObservation {
   id: string;
   sessionId: string;
@@ -77,6 +89,7 @@ export interface CompressedObservation {
   files: string[];
   importance: number;
   confidence?: number;
+  source?: ObservationSource;
   imageRef?: string;
   imageData?: string;
   imageDescription?: string;

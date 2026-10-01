@@ -9,6 +9,7 @@ const symlinkPaths = new Set<string>();
 const openEloopPaths = new Set<string>();
 
 vi.mock("node:fs/promises", () => ({
+  realpath: vi.fn(async (path: string) => path),
   lstat: vi.fn(async (path: string) => {
     if (symlinkPaths.has(path)) {
       return { isSymbolicLink: () => true };
@@ -93,6 +94,7 @@ describe("mem::compress-file", () => {
   let summarize: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    process.env.AGENTMEMORY_IMPORT_ROOT = "/tmp";
     fileStore.clear();
     symlinkPaths.clear();
     openEloopPaths.clear();

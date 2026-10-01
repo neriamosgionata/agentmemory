@@ -1,4 +1,18 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+export function resolveSecret(baseUrl: string, explicit?: string): string {
+  if (explicit) return explicit;
+  try {
+    if (!LOOPBACK_HOSTS.has(normalizedHostname(new URL(baseUrl).hostname))) return "";
+    return readFileSync(join(homedir(), ".agentmemory", "secret"), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
 
 function normalizedHostname(hostname: string): string {
   return hostname.replace(/^\[|\]$/g, "").toLowerCase();

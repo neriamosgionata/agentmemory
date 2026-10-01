@@ -5,6 +5,7 @@ import type { ISdk } from "../iii.js";
 import type { MemoryProvider } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import { confinePath, expandHome } from "./path-guard.js";
 
 const SENSITIVE_PATH_TERMS = [
   "secret",
@@ -104,9 +105,9 @@ export function registerCompressFileFunction(
         return { success: false, error: "filePath is required" };
       }
 
-      const absolutePath = resolve(data.filePath);
-      const lowerPath = absolutePath.toLowerCase();
-      if (extname(absolutePath).toLowerCase() !== ".md") {
+      const requestedPath = resolve(expandHome(data.filePath));
+      const lowerPath = requestedPath.toLowerCase();
+      if (extname(requestedPath).toLowerCase() !== ".md") {
         return { success: false, error: "filePath must point to a .md file" };
       }
       if (SENSITIVE_PATH_TERMS.some((term) => lowerPath.includes(term))) {
@@ -114,13 +115,19 @@ export function registerCompressFileFunction(
       }
 
       try {
-        const stat = await lstat(absolutePath);
+        const stat = await lstat(requestedPath);
         if (stat.isSymbolicLink()) {
           return { success: false, error: "symlinks are not supported" };
         }
       } catch {
         return { success: false, error: "file not found" };
       }
+
+      const confined = await confinePath(requestedPath);
+      if (!confined.ok) {
+        return { success: false, error: confined.error };
+      }
+      const absolutePath = confined.path;
 
       let original: string;
       try {

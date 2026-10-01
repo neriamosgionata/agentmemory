@@ -174,12 +174,22 @@ def _reset_plaintext_bearer_guard_for_tests() -> None:
     _plaintext_bearer_warned = False
 
 
+def _stored_secret(base: str) -> str:
+    try:
+        host = (urlparse(base).hostname or "").lower()
+        if host not in ("localhost", "::1") and not host.startswith("127."):
+            return ""
+        return (Path.home() / ".agentmemory" / "secret").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def _api(base: str, path: str, body: dict | None = None, method: str = "POST", secret: str = "") -> dict | None:
     if not _validate_url(base):
         return None
     url = f"{base}/agentmemory/{path}"
     headers = {"Content-Type": "application/json"}
-    auth = secret or os.environ.get("AGENTMEMORY_SECRET", "")
+    auth = secret or os.environ.get("AGENTMEMORY_SECRET", "") or _stored_secret(base)
     _check_plaintext_bearer_guard(base, auth)
     if auth:
         headers["Authorization"] = f"Bearer {auth}"

@@ -2,6 +2,7 @@ import type { ISdk } from "../iii.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import { scrubRecord } from "./privacy.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -55,7 +56,7 @@ export function registerCrystallizeFunction(
 
       try {
         const response = await provider.summarize(CRYSTALLIZE_SYSTEM, prompt);
-        const digest = parseDigest(response);
+        const digest = scrubRecord(parseDigest(response));
 
         const crystal: Crystal = {
           id: generateId("crys"),

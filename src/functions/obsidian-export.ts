@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { ISdk } from "../iii.js";
 import type { StateKV } from "../state/kv.js";
@@ -11,19 +11,17 @@ import type {
   Session,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { confinePath } from "./path-guard.js";
 const DEFAULT_EXPORT_ROOT = join(homedir(), ".agentmemory");
 
 function getExportRoot(): string {
   return resolve(process.env["AGENTMEMORY_EXPORT_ROOT"] || DEFAULT_EXPORT_ROOT);
 }
 
-function resolveVaultDir(vaultDir?: string): string | null {
+async function resolveVaultDir(vaultDir?: string): Promise<string | null> {
   const root = getExportRoot();
-  const resolved = resolve(vaultDir || join(root, "vault"));
-  if (resolved === root || resolved.startsWith(root + sep)) {
-    return resolved;
-  }
-  return null;
+  const confined = await confinePath(vaultDir || join(root, "vault"), [root]);
+  return confined.ok ? confined.path : null;
 }
 
 function sanitize(name: string): string {
@@ -262,7 +260,7 @@ export function registerObsidianExportFunction(
         }
       }
 
-      const vaultDir = resolveVaultDir(data.vaultDir);
+      const vaultDir = await resolveVaultDir(data.vaultDir);
       if (!vaultDir) {
         return {
           success: false,

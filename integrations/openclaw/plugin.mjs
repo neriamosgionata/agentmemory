@@ -10,6 +10,10 @@
  * Start it with: npx @agentmemory/agentmemory
  */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const DEFAULT_BASE_URL = "http://localhost:3111";
 const DEFAULT_TIMEOUT_MS = 5000;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -142,11 +146,21 @@ export function createPlaintextBearerAuthGuard(warn, env) {
   };
 }
 
+function storedSecret(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host !== "localhost" && host !== "::1" && !/^127\./.test(host)) return "";
+    return readFileSync(join(homedir(), ".agentmemory", "secret"), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
 function createClient(cfg, api) {
   const baseUrl = String(cfg.base_url || DEFAULT_BASE_URL).replace(/\/+$/, "");
   const timeoutMs = Number(cfg.timeout_ms || DEFAULT_TIMEOUT_MS);
   const fallbackOnError = cfg.fallback_on_error !== false;
-  const secret = process.env.AGENTMEMORY_SECRET;
+  const secret = process.env.AGENTMEMORY_SECRET || storedSecret(baseUrl);
   const guardPlaintextBearerAuth = createPlaintextBearerAuthGuard(
     (message) => api.logger.warn?.(message),
   );

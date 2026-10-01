@@ -24,6 +24,7 @@ import { flushIndexSave, rebuildIndex } from "./search.js";
 import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
 import { boundRecordSources } from "./graph.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 

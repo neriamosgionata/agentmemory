@@ -1,4 +1,5 @@
-import { watch, promises as fsp, statSync } from "node:fs";
+import { watch, promises as fsp, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve, relative, join, extname, sep, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -134,11 +135,21 @@ function redactSensitivePreview(preview) {
   return redactPemBlocks(preview).split("\n").map(redactSensitiveLine).join("\n");
 }
 
+function storedSecret(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host !== "localhost" && host !== "::1" && !/^127\./.test(host)) return "";
+    return readFileSync(join(homedir(), ".agentmemory", "secret"), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
 export class FilesystemWatcher {
   constructor(config = {}) {
     this.roots = (config.roots || []).map((r) => resolve(r));
     this.baseUrl = (config.baseUrl || "http://localhost:3111").replace(/\/+$/, "");
-    this.secret = config.secret;
+    this.secret = config.secret || storedSecret(this.baseUrl);
     this.project =
       config.project ||
       (this.roots[0] ? deriveProjectName(this.roots[0]) : "filesystem-watcher");
