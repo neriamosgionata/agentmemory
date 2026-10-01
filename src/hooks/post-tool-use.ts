@@ -70,7 +70,7 @@ async function main() {
     }),
     signal: AbortSignal.timeout(3000),
   }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
+  setTimeout(() => process.exit(0), 3000).unref();
 }
 
 function toolOutput(data: Record<string, unknown>): unknown {
