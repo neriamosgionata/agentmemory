@@ -137,7 +137,15 @@ describe("mem::forget audit coverage (issue #125)", () => {
       payload: { memoryId: "lsn_4f9cb07017a7c8ac" },
     });
 
-    expect(result).toEqual({ success: true, deleted: 0 });
+    expect(result).toEqual({
+      success: true,
+      deleted: 0,
+      notFound: ["lsn_4f9cb07017a7c8ac"],
+      failed: 0,
+      failures: undefined,
+      cleanupFailed: 0,
+      cleanupFailures: undefined,
+    });
     // No-op path must not touch the memories keyspace or search index.
     expect(deleteSpy).not.toHaveBeenCalled();
     expect(getSearchIndex().has("lsn_4f9cb07017a7c8ac")).toBe(false);

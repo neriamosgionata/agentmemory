@@ -1,4 +1,7 @@
+import { markCaptureEventDeleted } from "../capture/event-record.js";
+
 import type { ISdk } from "../iii.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import type {
   Session,
   CompressedObservation,
@@ -543,6 +546,106 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       // ones the "skip" strategy declined to write.
       const indexObs: CompressedObservation[] = [];
       const indexMems: Memory[] = [];
+
+        if (strategy === "replace") {
+          const existing = await kv.list<Session>(KV.sessions);
+          // Collect observation deletes across all sessions, then run them in
+          // one bounded pass: a runChunked nested inside a runChunked callback
+          // multiplies in-flight deletes to chunk-size squared.
+          const obsDeletes: Array<{ sessionId: string; obsId: string; captureKey?: string }> = [];
+          await runChunked(existing, async (session) => {
+            await kv.delete(KV.sessions, session.id);
+            const obs = await kv
+              .list<CompressedObservation>(KV.observations(session.id))
+              .catch(() => []);
+            for (const o of obs) {
+              obsDeletes.push({ sessionId: session.id, obsId: o.id, captureKey: o.captureKey });
+            }
+          });
+          await runChunked(obsDeletes, async (d) => {
+            await markCaptureEventDeleted(kv, { id: d.obsId, sessionId: d.sessionId, captureKey: d.captureKey });
+            await kv.delete(KV.observations(d.sessionId), d.obsId);
+          });
+          await runChunked(await kv.list<Memory>(KV.memories), (m) =>
+            kv.delete(KV.memories, m.id),
+          );
+          await runChunked(
+            await kv.list<SessionSummary>(KV.summaries),
+            (s) => kv.delete(KV.summaries, s.sessionId),
+          );
+          await runChunked(await kv.list<Action>(KV.actions).catch(() => []), (a) =>
+            kv.delete(KV.actions, a.id),
+          );
+          await runChunked(
+            await kv.list<ActionEdge>(KV.actionEdges).catch(() => []),
+            (e) => kv.delete(KV.actionEdges, e.id),
+          );
+          await runChunked(
+            await kv.list<Routine>(KV.routines).catch(() => []),
+            (r) => kv.delete(KV.routines, r.id),
+          );
+          await runChunked(
+            await kv.list<Signal>(KV.signals).catch(() => []),
+            (s) => kv.delete(KV.signals, s.id),
+          );
+          await runChunked(
+            await kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
+            (c) => kv.delete(KV.checkpoints, c.id),
+          );
+          await runChunked(
+            await kv.list<Sentinel>(KV.sentinels).catch(() => []),
+            (s) => kv.delete(KV.sentinels, s.id),
+          );
+          await runChunked(
+            await kv.list<Sketch>(KV.sketches).catch(() => []),
+            (s) => kv.delete(KV.sketches, s.id),
+          );
+          await runChunked(
+            await kv.list<Crystal>(KV.crystals).catch(() => []),
+            (c) => kv.delete(KV.crystals, c.id),
+          );
+          await runChunked(
+            await kv.list<Facet>(KV.facets).catch(() => []),
+            (f) => kv.delete(KV.facets, f.id),
+          );
+          await runChunked(
+            await kv.list<Lesson>(KV.lessons).catch(() => []),
+            (l) => kv.delete(KV.lessons, l.id),
+          );
+          resetLessonIndex();
+          await runChunked(
+            await kv.list<Insight>(KV.insights).catch(() => []),
+            (i) => kv.delete(KV.insights, i.id),
+          );
+          await withKeyedLock("graph:persist", async () =>
+            runChunked(
+              await kv.list<{ id: string }>(KV.graphNodes).catch(() => []),
+              (n) => kv.delete(KV.graphNodes, n.id),
+            ),
+          );
+          await withKeyedLock("graph:persist", async () =>
+            runChunked(
+              await kv.list<{ id: string }>(KV.graphEdges).catch(() => []),
+              (e) => kv.delete(KV.graphEdges, e.id),
+            ),
+          );
+          await runChunked(
+            await kv.list<{ id: string }>(KV.semantic).catch(() => []),
+            (s) => kv.delete(KV.semantic, s.id),
+          );
+          await runChunked(
+            await kv.list<{ id: string }>(KV.procedural).catch(() => []),
+            (p) => kv.delete(KV.procedural, p.id),
+          );
+          await runChunked(
+            await kv.list<ProjectProfile>(KV.profiles).catch(() => []),
+            (profile) => kv.delete(KV.profiles, profile.project),
+          );
+          await runChunked(
+            await kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
+            (a) => kv.delete(KV.accessLog, a.memoryId),
+          );
+        }
 
       await runChunked(importData.sessions, async (session) => {
         if (strategy === "skip") {

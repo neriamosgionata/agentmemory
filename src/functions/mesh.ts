@@ -389,7 +389,7 @@ export function registerMeshFunction(
         }
       }
       accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
-      accepted += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+      accepted += await lwwMergeGraphEdges(kv, data.graphEdges);
       await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
         action: "mesh.receive",
         accepted,

@@ -1613,7 +1613,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-133 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+136 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1623,7 +1623,10 @@ Create `~/.agentmemory/.env`:
 | `GET` | `/agentmemory/health` | Health check (always public) |
 | `POST` | `/agentmemory/session/start` | Start session + get context |
 | `POST` | `/agentmemory/session/end` | End session |
-| `POST` | `/agentmemory/observe` | Capture observation |
+| `POST` | `/agentmemory/observe` | Capture observation (see capture delivery below) |
+| `GET` | `/agentmemory/capture` | Capture inbox, dead letters and offline spool |
+| `POST` | `/agentmemory/capture/retry` | Retry dead-letter captures |
+| `POST` | `/agentmemory/capture/drain` | Send the local offline spool now |
 | `POST` | `/agentmemory/smart-search` | Hybrid search |
 | `POST` | `/agentmemory/context` | Generate context |
 | `POST` | `/agentmemory/remember` | Save to long-term memory |
@@ -1640,6 +1643,20 @@ Create `~/.agentmemory/.env`:
 Full endpoint list: [`src/triggers/api.ts`](src/triggers/api.ts)
 
 </details>
+
+**Capture delivery.** Hooks send each observation once to `POST /agentmemory/observe` with an `eventId`. It is the host's own id for the call when the payload has one (for example Claude Code's `tool_use_id`), otherwise a hash of the session, hook type, tool name, input, output and host timestamp. The server writes the event to a capture inbox in the state store, stores the observation, then removes the inbox entry. The status code says what happened:
+
+| Status | `status` field | Meaning |
+|---|---|---|
+| `201` | `accepted` | Stored. `observationId` is the new observation. |
+| `202` | `accepted` (`state: "retrying"`) | Accepted, but storing failed. The server retries it, also after a restart. |
+| `200` | `duplicate` | This `eventId` was already accepted. `observationId` is the existing observation; nothing new is stored. |
+| `400` / `422` | `rejected` | Invalid payload, or storing failed for good (the event is kept as a dead letter). |
+| `503` | `rejected` (`retryable: true`) | The inbox is full (`AGENTMEMORY_CAPTURE_INBOX_MAX`). Hooks spool the event and send it later. |
+
+Failed events are retried every `AGENTMEMORY_CAPTURE_RETRY_INTERVAL_MS` (10 s) with doubling backoff, up to `AGENTMEMORY_CAPTURE_MAX_ATTEMPTS` (5). Events that still fail stay in the inbox as dead letters, are listed on `/agentmemory/status` and the viewer Health page, and can be retried with `POST /agentmemory/capture/retry` (`{"eventId": "..."}` or `{"all": true}`). Accepted event ids are remembered for `AGENTMEMORY_CAPTURE_DEDUP_HOURS` (168 hours, at most `AGENTMEMORY_CAPTURE_EVENTS_MAX` ids), so a hook replayed after a timeout or a restart is stored once, while two separate tool calls with their own host ids are stored twice even when their content is identical. When an observation is deleted (forget, session delete, eviction, auto-forget or an import that replaces the store), its event is marked as deleted before the observation is removed, so a replay of that event inside the same window is answered as a duplicate and stores nothing. The state store writes to disk every 2 seconds, so an answered event can still be only in memory for a moment. To cover that, every `2xx` answer also carries the server's `bootId` (new at every start), `acceptedAt` and `durableAfterMs` (the save interval plus 1.5 s on the file store, 1.5 s on redis, where persistence is the operator's setting). Hooks keep the event in the local spool until that window has passed and delete it on a later call without another request. If the `bootId` has changed by then, the server restarted, so the hook sends the event again with the same `eventId`; an event that did reach the disk is not stored twice. The server also sends such events itself at start and every retry interval, so a restart loses nothing even when no hook runs afterwards. Older hooks ignore the extra fields, and new hooks against an older server discard the event on `2xx` as before.
+
+When the server is down, does not answer in time or returns a 5xx, the hook appends the observation to a local spool file, `<data dir>/capture-spool/<host>-<port>.jsonl` (override the folder with `AGENTMEMORY_CAPTURE_SPOOL_DIR`). The file is private to your user (mode 600), secrets are redacted the same way the server redacts them, it holds at most `AGENTMEMORY_CAPTURE_SPOOL_MAX_BYTES` (5 MiB) and drops entries older than `AGENTMEMORY_CAPTURE_SPOOL_MAX_AGE_HOURS` (168). When it is full, new entries are dropped and counted, and `/agentmemory/status` reports it. The hook still exits 0 within its time limit and adds no request when the server is healthy. The spool is sent at the next start and by the first hook that reaches the server again, in a background process so the agent does not wait. Event ids make this safe: an observation that did arrive before a timeout is not stored twice. `npx @agentmemory/agentmemory capture` shows the spool and the server inbox, `--drain` sends the spool now, and `GET /agentmemory/capture` returns the same as JSON. Set `AGENTMEMORY_CAPTURE_SPOOL=false` to turn the spool off.
 
 **Compacting graph provenance.** Each knowledge graph node and edge keeps the ids of the newest 32 observations it came from. Stores written before that cap can hold thousands of ids per hot node, which makes graph search and the viewer slow or drops the worker. agentmemory fixes this by itself: on the first start after upgrading it trims every node, edge, superseded edge (the temporal graph history) and the cached snapshot to the cap in the background, in small slices with a pause between them, so search, capture and the viewer keep working. It saves its progress, resumes after a restart and never runs again once it has finished. `/agentmemory/status` and the viewer Health page show it as pending, running (with the current scope and position), done or failed. Set `AGENTMEMORY_GRAPH_COMPACT_ON_BOOT=false` to turn it off.
 

@@ -232,6 +232,7 @@ export function registerCompressFunction(
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
+          ...(data.raw.captureKey ? { captureKey: data.raw.captureKey } : {}),
         };
 
         await kv.set(

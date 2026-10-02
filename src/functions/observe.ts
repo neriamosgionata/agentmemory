@@ -5,7 +5,7 @@ const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"
 import { KV, STREAM, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
-import { DedupMap } from "./dedup.js";
+import { DedupMap, recordDedupSkip } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
@@ -15,6 +15,8 @@ import {
   vectorIndexAddGuarded,
   vectorIndexRemove,
 } from "./search.js";
+import { isCaptureKey } from "../capture/event-record.js";
+import { getVectorIndex } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
@@ -49,6 +51,22 @@ export function extractImage(d: unknown): string | undefined {
   return undefined;
 }
 
+export async function restoreIndexEntries(obs: CompressedObservation): Promise<void> {
+  if (typeof obs.title !== "string" || !obs.sessionId) return;
+  const search = getSearchIndex();
+  if (!search.has(obs.id)) {
+    search.add(obs);
+    scheduleIndexSave();
+  }
+  const vectors = getVectorIndex();
+  if (vectors && !vectors.has(obs.id)) {
+    await vectorIndexAddGuarded(obs.id, obs.sessionId, obs.title + " " + (obs.narrative || ""), {
+      kind: "synthetic",
+      logId: obs.id,
+    });
+  }
+}
+
 export function registerObserveFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -73,10 +91,12 @@ export function registerObserveFunction(
         };
       }
 
-      const obsId = generateId("obs");
+      const durable =
+        typeof payload.observationId === "string" && /^obs_[A-Za-z0-9_]{8,80}$/.test(payload.observationId);
+      const obsId = durable ? payload.observationId! : generateId("obs");
 
       let dedupHash: string | undefined;
-      if (dedupMap) {
+      if (dedupMap && typeof payload.eventId !== "string") {
         const dataIsObject =
           typeof payload.data === "object" && payload.data !== null;
         const d = dataIsObject
@@ -91,12 +111,18 @@ export function registerObserveFunction(
             : dataIsObject
               ? d
               : payload.data;
+        const dedupOutput =
+          d["tool_input"] !== undefined
+            ? d["tool_response"] ?? d["tool_output"] ?? d["output"] ?? d["error"]
+            : undefined;
         dedupHash = dedupMap.computeHash(
           payload.sessionId,
           toolName,
           dedupInput,
+          dedupOutput,
         );
         if (dedupMap.isDuplicate(dedupHash)) {
+          recordDedupSkip();
           return { deduplicated: true, sessionId: payload.sessionId };
         }
       }
@@ -123,6 +149,8 @@ export function registerObserveFunction(
           channel: originChannel,
           capturedAt: payload.timestamp,
         },
+        ...(typeof payload.eventId === "string" ? { eventId: payload.eventId } : {}),
+        ...(isCaptureKey(payload.captureKey) ? { captureKey: payload.captureKey } : {}),
       };
 
       let extractedImage: string | undefined;
@@ -156,6 +184,12 @@ export function registerObserveFunction(
       const pendingImageData = extractedImage;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+        const existing = await kv.list<CompressedObservation>(KV.observations(payload.sessionId));
+        const stored = durable ? existing.find((o) => o?.id === obsId) : undefined;
+        if (stored) {
+          await restoreIndexEntries(stored);
+          return { observationId: obsId, deduplicated: true, existing: true };
+        }
         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
           const existing = await kv.list<RawObservation & { importance?: number }>(
             KV.observations(payload.sessionId),

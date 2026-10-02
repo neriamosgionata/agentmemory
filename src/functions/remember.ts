@@ -1,5 +1,6 @@
 import { TriggerAction, type ISdk } from "../iii.js";
-import type { Memory } from "../types.js";
+import { markCaptureEventDeleted } from "../capture/event-record.js";
+import type { Memory, Session } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -251,25 +252,87 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       observationIds?: string[];
       memoryId?: string;
     }) => {
+      type ObservationRef = { id?: string; imageData?: string; imageRef?: string; captureKey?: string };
       let deleted = 0;
       const deletedMemoryIds: string[] = [];
       const deletedObservationIds: string[] = [];
+      const notFound: string[] = [];
+      const failures: Array<{ id: string; error: string }> = [];
       let deletedSession = false;
+      let deletedSummary = false;
+      let indexCleaned = false;
       const { decrementImageRef } = await import("./image-refs.js");
 
-      if (data.memoryId) {
-        const mem = await kv.get<Memory>(KV.memories, data.memoryId);
-        if (mem) {
-          await kv.delete(KV.memories, data.memoryId);
-          if (mem.imageRef) {
-            await decrementImageRef(kv, sdk, mem.imageRef);
-          }
-          await deleteAccessLog(kv, data.memoryId);
-          getSearchIndex().remove(data.memoryId);
-          vectorIndexRemove(data.memoryId);
-          deletedMemoryIds.push(data.memoryId);
-          deleted++;
+      const recordFailure = (id: string, err: unknown) => {
+        logger.warn("Forget failed", {
+          id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        failures.push({ id, error: "delete_failed" });
+      };
+
+      const cleanupFailures: Array<{ id: string; error: string }> = [];
+      const cleanup = async (id: string, steps: () => Promise<void>) => {
+        try {
+          await steps();
+        } catch (err) {
+          logger.warn("Forget cleanup failed", {
+            id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          cleanupFailures.push({ id, error: "cleanup_failed" });
         }
+      };
+
+      const attempt = async (id: string, remove: () => Promise<boolean>) => {
+        try {
+          if (await remove()) deleted++;
+          else notFound.push(id);
+        } catch (err) {
+          recordFailure(id, err);
+        }
+      };
+
+      const forgetObservation = async (
+        sessionId: string,
+        obsId: string,
+        known?: ObservationRef,
+      ): Promise<boolean> => {
+        const obs =
+          known ??
+          (await kv.get<ObservationRef>(KV.observations(sessionId), obsId));
+        if (!obs) return false;
+        await markCaptureEventDeleted(kv, { ...obs, id: obsId, sessionId });
+        await kv.delete(KV.observations(sessionId), obsId);
+        deletedObservationIds.push(obsId);
+        getSearchIndex().remove(obsId);
+        vectorIndexRemove(obsId);
+        indexCleaned = true;
+        await cleanup(obsId, async () => {
+          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+          if (obs.imageRef && obs.imageRef !== obs.imageData) {
+            await decrementImageRef(kv, sdk, obs.imageRef);
+          }
+        });
+        return true;
+      };
+
+      if (data.memoryId) {
+        const memoryId = data.memoryId;
+        await attempt(memoryId, async () => {
+          const mem = await kv.get<Memory>(KV.memories, memoryId);
+          if (!mem) return false;
+          await kv.delete(KV.memories, memoryId);
+          deletedMemoryIds.push(memoryId);
+          getSearchIndex().remove(memoryId);
+          vectorIndexRemove(memoryId);
+          indexCleaned = true;
+          await cleanup(memoryId, async () => {
+            if (mem.imageRef) await decrementImageRef(kv, sdk, mem.imageRef);
+            await deleteAccessLog(kv, memoryId);
+          });
+          return true;
+        });
       }
 
       if (
@@ -277,20 +340,9 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         data.observationIds &&
         data.observationIds.length > 0
       ) {
+        const sessionId = data.sessionId;
         for (const obsId of data.observationIds) {
-          const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
-            KV.observations(data.sessionId),
-            obsId,
-          );
-          await kv.delete(KV.observations(data.sessionId), obsId);
-          if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs?.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obsId);
-          vectorIndexRemove(obsId);
-          deletedObservationIds.push(obsId);
-          deleted++;
+          await attempt(obsId, () => forgetObservation(sessionId, obsId));
         }
         if (deletedObservationIds.length > 0) {
           await clearSessionDerivedState(kv, data.sessionId);
@@ -302,29 +354,36 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         (!data.observationIds || data.observationIds.length === 0) &&
         !data.memoryId
       ) {
-        const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
-          KV.observations(data.sessionId),
+        const sessionId = data.sessionId;
+        const observations = await kv.list<ObservationRef & { id: string }>(
+          KV.observations(sessionId),
         );
         for (const obs of observations) {
-          await kv.delete(KV.observations(data.sessionId), obs.id);
-          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obs.id);
-          vectorIndexRemove(obs.id);
-          deletedObservationIds.push(obs.id);
-          deleted++;
+          await attempt(obs.id, () => forgetObservation(sessionId, obs.id, obs));
         }
-        await kv.delete(KV.sessions, data.sessionId);
-        await kv.delete(KV.summaries, data.sessionId);
+        await attempt(sessionId, async () => {
+          const session = await kv.get<Session>(KV.sessions, sessionId);
+          if (!session) return false;
+          await kv.delete(KV.sessions, sessionId);
+          deletedSession = true;
+          return true;
+        });
+        try {
+          const summary = await kv.get(KV.summaries, sessionId);
+          if (summary) {
+            await kv.delete(KV.summaries, sessionId);
+            deletedSummary = true;
+            deleted++;
+          }
+        } catch (err) {
+          recordFailure(`summary:${sessionId}`, err);
+        }
         await clearSessionDerivedState(kv, data.sessionId);
-        deletedSession = true;
-        deleted += 2;
       }
 
-      if (deleted > 0) {
-        await flushIndexSave();
+      if (deleted > 0 || indexCleaned) await flushIndexSave();
+
+      if (deleted > 0 || failures.length > 0) {
         await recordAudit(
           kv,
           "forget",
@@ -336,13 +395,33 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             memoriesDeleted: deletedMemoryIds.length,
             observationsDeleted: deletedObservationIds.length,
             sessionDeleted: deletedSession,
+            summaryDeleted: deletedSummary,
+            notFound: notFound.length,
+            failed: failures.length,
+            failures: failures.length > 0 ? failures : undefined,
+            cleanupFailed: cleanupFailures.length,
+            cleanupFailures:
+              cleanupFailures.length > 0 ? cleanupFailures : undefined,
             reason: "user-initiated forget",
           },
         );
       }
 
-      logger.info("Memory forgotten", { deleted });
-      return { success: true, deleted };
+      logger.info("Memory forgotten", {
+        deleted,
+        notFound: notFound.length,
+        failed: failures.length,
+      });
+      return {
+        success: failures.length === 0,
+        deleted,
+        notFound,
+        failed: failures.length,
+        failures: failures.length > 0 ? failures : undefined,
+        cleanupFailed: cleanupFailures.length,
+        cleanupFailures:
+          cleanupFailures.length > 0 ? cleanupFailures : undefined,
+      };
     },
   );
 }

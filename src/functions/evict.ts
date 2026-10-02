@@ -1,4 +1,5 @@
 import type { ISdk } from "../iii.js";
+import { markCaptureEventDeleted } from "../capture/event-record.js";
 import type {
   Session,
   CompressedObservation,
@@ -249,6 +250,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               stats.lowImportanceObs++;
             } else {
               try {
+                await markCaptureEventDeleted(kv, o);
                 await kv.delete(KV.observations(session.id), o.id);
                 deletedObs.push({ sessionId: session.id, obsId: o.id });
                 stats.lowImportanceObs++;
@@ -296,6 +298,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           } else {
             for (const o of toEvict) {
               try {
+                await markCaptureEventDeleted(kv, o);
                 await kv.delete(KV.observations(o.sessionId), o.id);
                 deletedObs.push({ sessionId: o.sessionId, obsId: o.id });
                 stats.capEvictions++;

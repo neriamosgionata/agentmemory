@@ -3774,6 +3774,285 @@
           html += '<div class="audit-detail" id="audit-detail-' + idx + '"><pre>' + esc(JSON.stringify(a.details || {}, null, 2)) + '</pre></div>';
           html += '</div>';
         });
+        state.health.error = 'The check did not answer. The server may be restarting.';
+      }
+    }
+
+    var BM25_EXPLAINER = 'The keyword index holds observations, memories and lessons, so its total is larger than the observation count.';
+    var LLM_KEY_FIX = 'Add one LLM provider key (for example ANTHROPIC_API_KEY or OPENAI_API_KEY) to ~/.agentmemory/.env and restart.';
+
+    function hrow(label, valueHtml, helpKey, note) {
+      return '<div class="detail-row"><div class="dl">' + esc(label) + (helpKey ? ' ' + help(helpKey) : '') + '</div><div class="dv">' + valueHtml + (note ? '<div class="hnote">' + note + '</div>' : '') + '</div></div>';
+    }
+
+    function durationText(ms) {
+      var mins = Math.round(ms / 60000);
+      if (mins < 1) return Math.round(ms / 1000) + ' seconds';
+      if (mins < 120) return mins + ' minute' + (mins === 1 ? '' : 's');
+      return Math.round(mins / 60) + ' hours';
+    }
+
+    function flagHowText(f) {
+      if (!f.enabled) return f.enableHow || ('Set ' + f.key + '=true and restart.');
+      if (f.inactiveReason) return LLM_KEY_FIX;
+      return 'Set ' + f.key + '=false and restart to turn it off.';
+    }
+
+    function healthStaleHtml(r) {
+      var last = store.lastHealthAt ? new Date(store.lastHealthAt).toLocaleTimeString() : '';
+      if (conn.state === 'reconnecting' || conn.state === 'offline') {
+        return '<div class="hstale offline" id="health-live-state"><strong>Offline: live updates are paused.</strong> The viewer lost its connection to agentmemory' + (conn.lostAt ? ' at ' + esc(new Date(conn.lostAt).toLocaleTimeString()) : '') + '. Everything on this page is the last report' + (last ? ' from ' + esc(last) : '') + ' and may be out of date. It refreshes by itself when the connection returns.' +
+          '<div style="margin-top:6px;">Check that the server is running:</div>' + cmdBlock('npx @agentmemory/agentmemory status') +
+          '<button class="btn" data-action="reconnect-now" style="margin-top:6px;">Reconnect now</button></div>';
+      }
+      if (store.lastHealthAt && Date.now() - store.lastHealthAt > HEALTH_STALE_MS) {
+        var secs = Math.round((Date.now() - store.lastHealthAt) / 1000);
+        return '<div class="hstale" id="health-live-state"><strong>Stale: no health report for ' + secs + 's.</strong> Reports normally arrive every 30 seconds. The stream is connected, so the worker is busy or the iii engine is paused' + (r && r.service && r.service.stateBackend === 'redis' ? ', or Redis restarted: the engine stops relaying live events after a Redis restart until agentmemory restarts' : '') + '. The numbers below are from ' + esc(last) + '.' +
+          '<div style="margin-top:6px;">Fix: wait a minute; if it stays stale, press Re-check now for the full report, check the server log and restart agentmemory.</div></div>';
+      }
+      return '';
+    }
+
+    function problemHtml(p) {
+      return '<div class="problem"><div><span class="badge ' + (HEALTH_LEVEL_BADGES[p.level] || 'badge-muted') + '">' + esc(p.level) + '</span></div><div>' +
+        '<div class="pm">' + esc(p.message) + '</div>' +
+        (p.fix ? '<div class="pf">' + esc(p.fix) + '</div>' : '') + '</div></div>';
+    }
+
+    function healthVerdictHtml(r) {
+      var level = r ? r.status : 'unknown';
+      var text = r ? (r.headline || (r.status === 'ok' ? 'Every check passed.' : 'Some checks need attention.')) : 'Waiting for the first health report from the server.';
+      var html = '<div class="card" style="margin-top:0;">';
+      var badgeText = level === 'unknown' ? 'waiting' : level;
+      var paused = conn.state === 'reconnecting' || conn.state === 'offline';
+      var quiet = !paused && store.lastHealthAt && Date.now() - store.lastHealthAt > HEALTH_STALE_MS;
+      if (r && (paused || quiet)) {
+        badgeText = paused ? 'offline' : 'stale';
+        level = 'unknown';
+        text = 'Last known state: ' + text;
+      }
+      html += '<div class="verdict"><span class="verdict-badge ' + esc(level) + '">' + esc(badgeText) + '</span><div style="min-width:0;flex:1;">' +
+        '<div class="verdict-text">' + esc(text) + '</div>' +
+        '<div class="verdict-meta">' + (r ? 'Report ' + relTime(r.checkedAt) + ' · ' : '') + 'updates every 30 s over the live stream, no refresh needed ' + help('live') + '</div></div></div>';
+      html += healthStaleHtml(r);
+      if (state.health.error) html += '<div class="mem-note err" style="margin-top:10px;">' + esc(state.health.error) + '</div>';
+      if (r && r.problems.length) {
+        html += '<div style="margin-top:12px;">' + r.problems.map(problemHtml).join('') + '</div>';
+      } else if (r) {
+        html += '<p class="hnote" style="margin-top:10px;font-size:12px;">No problems found: the engine is connected, the search index matches the stored observations and no function is failing.</p>';
+      }
+      html += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;font-size:11px;color:var(--ink-faint);font-family:var(--font-ui);">' +
+        '<button class="btn" data-action="refresh-health"' + (state.health.checking ? ' disabled' : '') + '>' + (state.health.checking ? 'Checking…' : 'Re-check now') + '</button>' +
+        '<span>Machine checks (keys, engine binary, pid files):</span>' + cmdBlock((customPort() ? 'AGENTMEMORY_URL=' + agentUrl() + ' ' : '') + 'npx @agentmemory/agentmemory doctor') +
+        '<a class="empty-link" href="' + esc(REST) + '/agentmemory/status" target="_blank" rel="noopener">same report as a plain page &rarr;</a>' + copyBtn('curl -s ' + apiBase() + '/status', 'curl command') + '</div>';
+      return html + '</div>';
+    }
+
+    function engineCardHtml(r, snap) {
+      var ports = (r && r.service && r.service.ports) || {};
+      var kv = snap.kvConnectivity;
+      var backend = r && r.service ? r.service.stateBackend : null;
+      var streamText = conn.state === 'live' ? 'live' : conn.state;
+      return '<div class="card"><div class="card-title">Engine and connection ' + help('engineConnection') + '</div>' +
+        hrow('Engine connection', esc(snap.connectionState || 'unknown'), 'engineConnection', 'The worker\'s link to the iii engine, which stores the data and runs the functions.') +
+        ((kv || backend) ? hrow('State store', esc((backend ? backend + (kv ? ' · ' : '') : '') + (kv ? kv.status + (kv.latencyMs !== undefined ? ' · ' + kv.latencyMs + ' ms' : '') + (kv.error ? ' · ' + kv.error : '') : '')), 'stateBackend', backend === 'redis' ? 'Stored in Redis (AGENTMEMORY_STATE_BACKEND=redis). If Redis restarts, restart agentmemory so the live stream resumes.' : 'Stored in the engine\'s local files (the default). Set AGENTMEMORY_STATE_BACKEND=redis to use Redis.') : '') +
+        hrow('Viewer stream', esc(streamText), 'live', 'This page\'s own connection. Offline means the numbers here stop changing.') +
+        (snap.streamRelay ? hrow('Redis event relay', esc(snap.streamRelay), 'live', snap.streamRelay === 'down' ? 'The engine stopped relaying live events through Redis, usually after Redis restarted. Data is still saved. Restart agentmemory to resume live updates.' : 'A test event sent through Redis every 30 seconds came back to the worker.') : '') +
+        hrow('Uptime', esc(formatUptime(snap.uptimeSeconds)), 'uptime') +
+        hrow('Version', esc('v' + (store.version || (r && r.service.version) || '?') + (r ? ' · engine ' + r.service.engineVersion : ''))) +
+        hrow('Ports', esc('REST ' + (ports.rest || '?') + ' · streams ' + (ports.streams || '?') + ' · viewer ' + (ports.viewer || 'off'))) +
+        '</div>';
+    }
+
+    function legText(leg) {
+      if (!leg) return 'not saved yet';
+      if (leg.lastError) return 'failing: ' + leg.lastError;
+      var saved = leg.lastSavedAt ? 'saved ' + timeAgo(leg.lastSavedAt) : 'not saved since start';
+      return leg.dirtySince ? saved + ', unsaved changes since ' + timeAgo(leg.dirtySince) : saved;
+    }
+
+    function indexCardHtml(r, idx, c) {
+      var ri = (r && r.index) || {};
+      var b = ri.breakdown;
+      var p = idx.persistence || (r && r.indexPersistence) || null;
+      var hasVectors = store.embeddingProvider && store.embeddingProvider !== 'none';
+      var html = '<div class="card"><div class="card-title">Search index ' + help('bm25') + '</div>';
+      html += hrow('Keyword index', esc(fmtNum(idx.bm25Documents) + ' documents'), 'bm25',
+        (b ? esc(fmtNum(b.observations) + ' observations + ' + fmtNum(b.memories) + ' memories + ' + fmtNum(b.lessons) + ' lessons. ') : '') + esc(BM25_EXPLAINER));
+      html += hrow('Vector index', hasVectors ? esc(fmtNum(idx.vectorDocuments) + ' vectors') : 'off', 'vector',
+        hasVectors ? 'Meaning-based search. Each vector is one embedded record.' : 'No embedding provider, so search is keyword only. Set an embedding provider key (for example OPENAI_API_KEY) and restart.');
+      var bfState = ri.vectorBackfillState;
+      var bfNote = bfState === 'paused' ? 'Paused because the embedding provider did not return vectors. Retried on the next start.' :
+        bfState === 'waiting-for-opt-in' ? 'Waiting for AGENTMEMORY_VECTOR_BACKFILL=all and a restart.' :
+        'Embedded in the background in batches of AGENTMEMORY_VECTOR_BACKFILL_MAX. If agentmemory stops first, it continues on the next start.';
+      html += hrow('Waiting for embeddings', esc(fmtNum(idx.pendingVectorBackfill || 0) + (bfState && bfState !== 'idle' && idx.pendingVectorBackfill ? ' · ' + (bfState === 'waiting-for-opt-in' ? 'waiting for opt-in' : bfState) : '')), 'pendingBackfill', idx.pendingVectorBackfill ? esc(bfNote) : '');
+      html += hrow('Missing from index', ri.missingObservations === null || ri.missingObservations === undefined ? 'not checked yet' : esc(fmtNum(ri.missingObservations)), 'missingFromIndex');
+      html += hrow('Keyword rebuild', ri.bm25Incomplete ? '<span style="color:var(--accent);">incomplete</span>' : 'complete', null, 'Rebuilt from stored data at every start, so it is never saved to disk.');
+      if (p) {
+        html += hrow('Vector save', esc(legText(p.vector)), null, 'Saved at most every ' + esc(durationText(p.saveIntervalMs || 600000)) + ' (AGENTMEMORY_INDEX_SAVE_INTERVAL_MS). ' + esc(fmtNum(p.buckets) + ' bucket' + (p.buckets === 1 ? '' : 's') + ', ' + fmtNum(p.pendingChanges) + ' unsaved change' + (p.pendingChanges === 1 ? '' : 's') + (p.saving ? ', saving now' : '') + '.'));
+        if (typeof p.pendingLog === 'number') {
+          html += hrow('Pending vector log', esc(fmtNum(p.pendingLog) + ' vector change' + (p.pendingLog === 1 ? '' : 's')), null,
+            p.pendingLogError ? '<span style="color:var(--accent);overflow-wrap:anywhere;">' + esc('Log writes failing: ' + p.pendingLogError) + '</span>' :
+            'New and removed vectors are written here right away and replayed after a crash, so nothing is embedded twice. Each save empties it.');
+        }
+      }
+      html += hrow('Graph', esc(fmtNum(c.graphNodes) + ' nodes · ' + fmtNum(c.graphEdges) + ' edges'), 'graph', store.graph && store.graph.updatedAt ? 'Snapshot rebuilt ' + esc(timeAgo(store.graph.updatedAt)) + '.' : '');
+      if (r && r.graphCompaction) html += graphCompactionRowHtml(r.graphCompaction);
+      return html + '</div>';
+    }
+
+    function graphCompactionRowHtml(g) {
+      var where = g.phase === 'snapshot' || g.total === null || g.total === undefined ? (g.phase || 'nodes') : g.phase + ' ' + fmtNum(g.processed || 0) + ' of ' + fmtNum(g.total);
+      var text = g.state === 'off' ? 'off' : g.state === 'pending' ? 'pending' : g.state === 'running' ? 'running, ' + where : g.state === 'failed' ? 'failed at ' + where : 'done';
+      var note = 'A one-time pass that trims each graph node and edge to its newest 32 source observations, so stores from older versions stop slowing graph search.';
+      if (g.state === 'done') note = fmtNum(g.trimmed || 0) + ' records trimmed, ' + fmtNum(g.idsRemoved || 0) + ' ids removed' + (g.completedAt ? ', finished ' + timeAgo(g.completedAt) : '') + '. It does not run again.';
+      else if (g.state === 'running') note += ' It runs in the background, resumes after a restart and stops by itself.';
+      else if (g.state === 'off') note = 'Turned off with AGENTMEMORY_GRAPH_COMPACT_ON_BOOT=false. Run it by hand if graph search is slow:';
+      else if (g.state === 'failed') note = esc(g.error || 'unknown error') + '. It resumes on the next start. To run it now:';
+      var cmd = g.state === 'off' || g.state === 'failed' ? cmdBlock(curlPost('graph/compact', {})) : '';
+      return hrow('Provenance compaction', esc(text), null, (g.state === 'failed' ? note : esc(note)) + cmd);
+    }
+
+    function llmCardHtml(r) {
+      var cb = store.circuitBreaker;
+      var noLlm = store.provider === 'noop' || (r && r.provider.llm === 'noop');
+      var off = (r && r.provider.offWithoutLlm) || [];
+      var html = '<div class="card"><div class="card-title">LLM and embeddings ' + help('circuitBreaker') + '</div>';
+      html += hrow('LLM provider', noLlm ? '<span class="badge badge-muted">none</span>' : '<span class="badge badge-green">configured</span>', null,
+        noLlm ? 'Capture, keyword and vector search, saved memories, lessons and the structural graph all work without one.' : 'Used for summaries, consolidation, typed graph extraction and optional compression.');
+      if (noLlm && off.length) {
+        html += hrow('Off without an LLM', esc(off.join(', ')), null, esc(LLM_KEY_FIX) + cmdBlock("echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.agentmemory/.env"));
+      }
+      var emb = (r && r.provider.embeddings) || store.embeddingProvider || 'none';
+      html += hrow('Embeddings', esc(emb === 'none' ? 'none (keyword search only)' : emb), 'vector', emb === 'none' ? 'Meaning-based search is off.' : 'The number in brackets is the vector size (dimensions) the provider returns.');
+      html += hrow('Circuit breaker', esc(cb ? cb.state + ' (' + (cb.failures || 0) + ' failures)' : 'not in use'), 'circuitBreaker');
+      return html + '</div>';
+    }
+
+    function flagsCardHtml(r) {
+      var byKey = {};
+      (store.flags || []).forEach(function(f) { byKey[f.key] = f; });
+      var flags = (r && r.flags) || store.flags || [];
+      var html = '<div class="card"><div class="card-title">Feature flags ' + help('flags') + '</div>';
+      if (!flags.length) return html + '<p class="hnote">No flag data yet. It arrives with the first report.</p></div>';
+      flags.forEach(function(f) {
+        var meta = byKey[f.key] || {};
+        var badge = !f.enabled ? '<span class="badge badge-muted">off</span>' : f.inactiveReason ? '<span class="badge badge-yellow">on, inactive</span>' : '<span class="badge badge-green">on</span>';
+        html += '<div class="flag-row"><div class="flag-head"><strong>' + esc(f.label) + '</strong>' + badge + '<code>' + esc(f.key) + '</code></div>' +
+          (meta.description ? '<div class="hnote">' + esc(meta.description) + '</div>' : '') +
+          (f.inactiveReason ? '<div class="flag-how" style="color:var(--yellow);">Inactive: ' + esc(f.inactiveReason) + '.</div>' : '') +
+          '<div class="flag-how">' + esc(flagHowText(f)) + '</div></div>';
+      });
+      return html + '</div>';
+    }
+
+    function processCardHtml(snap) {
+      var m = snap.memory;
+      var html = '<div class="card"><div class="card-title">Process ' + help('heap') + '</div>';
+      if (!m) return html + '<p class="hnote">No process numbers yet. They arrive with the first health report.</p></div>';
+      var limit = m.heapLimit || m.heapTotal || 1;
+      var pct = Math.round((m.heapUsed / limit) * 100);
+      var bigRss = (m.rss || 0) >= 512 * 1048576;
+      var cls = pct > 95 && bigRss ? 'bad' : pct > 80 && bigRss ? 'warn' : '';
+      html += hrow('Heap', esc(mb(m.heapUsed) + ' of ' + mb(limit) + ' MB (' + pct + '%)') + '<div class="hbar ' + cls + '"><span style="width:' + Math.min(100, pct) + '%"></span></div>', 'heap',
+        'JavaScript memory in use against the most it may grow to. It only matters above 80% while RSS is also over 512 MB.');
+      html += hrow('RSS', esc(mb(m.rss) + ' MB'), 'rss', 'Everything the process holds from the operating system, including code and buffers.');
+      var lag = snap.eventLoopLagMs;
+      html += hrow('Event loop delay', lag !== undefined ? esc(Number(lag).toFixed(1) + ' ms') : '-', 'eventLoop', 'How far behind the worker is. Under 100 ms is fine; above that requests answer slowly.');
+      if (snap.cpu) html += hrow('CPU', esc(Math.round(snap.cpu.percent || 0) + '%'), null, 'Share of one core used since the last report. Short bursts during imports are normal.');
+      (snap.notes || []).forEach(function(n) { html += '<div class="hnote" style="margin-top:6px;">' + esc(humanizeHealthFlag(n)) + '</div>'; });
+      return html + '</div>';
+    }
+
+    function captureCardHtml(r) {
+      var cap = r && r.capture;
+      var html = '<div class="card"><div class="card-title">Capture ' + help('captureInbox') + '</div>';
+      if (!cap) return html + hrow('Capture', 'waiting for the first report', null, 'Shows whether observations from hooks are stored, retried or waiting offline.') + '</div>';
+      var inbox = cap.inbox;
+      var since = cap.sinceStart || {};
+      var waiting = (cap.spool || []).reduce(function(n, s) { return n + (s.records || 0); }, 0);
+      var bytes = (cap.spool || []).reduce(function(n, s) { return n + (s.bytes || 0); }, 0);
+      var spoolOn = (cap.spool || []).some(function(s) { return s.enabled; });
+      var drainedAt = (cap.spool || []).map(function(s) { return s.stats && s.stats.lastDrainAt; }).filter(Boolean).sort().pop();
+      var dropped = (cap.spool || []).reduce(function(n, s) { return n + ((s.stats && s.stats.dropped) || 0); }, 0);
+      html += hrow('Inbox', inbox ? esc(fmtNum(inbox.pending) + ' pending · ' + fmtNum(inbox.retrying) + ' retrying · ' + fmtNum(inbox.dead) + ' dead') : 'not checked', 'captureInbox',
+        inbox && inbox.dead ? '<span style="overflow-wrap:anywhere;">' + esc(inbox.lastError || 'Could not be stored.') + '</span> Fix the cause, then retry them:' + cmdBlock(curlPost('capture/retry', { all: true })) :
+        inbox && inbox.retrying ? '<span style="overflow-wrap:anywhere;">' + esc('Retried every ' + durationText(cap.policy.retryIntervalMs) + ' with backoff, up to ' + cap.policy.maxAttempts + ' attempts' + (inbox.lastError ? '. Last error: ' + inbox.lastError : '.')) + '</span>' :
+        'Empty means every accepted observation is stored.');
+      html += hrow('Since start', esc(fmtNum(since.accepted || 0) + ' accepted · ' + fmtNum(since.completed || 0) + ' stored · ' + fmtNum(since.duplicates || 0) + ' duplicates skipped · ' + fmtNum(since.recovered || 0) + ' recovered by retry · ' + fmtNum(since.deadLettered || 0) + ' dead'), null,
+        'Duplicates are the same event delivered twice, for example a replay after a timeout. They are kept once.');
+      if (r.observeDedup) {
+        html += hrow('Repeats skipped', esc(fmtNum(r.observeDedup.skippedSinceStart || 0) + ' since start'), null,
+          esc('A tool call with the same input and the same output as one stored in the last ' + durationText((r.observeDedup.windowSeconds || 300) * 1000) + ' is skipped when the hook sends no event id.'));
+      }
+      html += hrow('Offline spool', !spoolOn ? 'off' : waiting ? esc(fmtNum(waiting) + ' waiting · ' + Math.ceil(bytes / 1024) + ' KiB') : 'empty', 'captureSpool',
+        !spoolOn ? 'Turned off with AGENTMEMORY_CAPTURE_SPOOL=false, so hooks drop observations while the server is down.' :
+        (waiting ? 'Sent on the next hook call or at the next start. To send now:' + cmdBlock(curlPost('capture/drain', {})) : esc('Hooks write here only while the server is unreachable.' + (drainedAt ? ' Last drained ' + timeAgo(drainedAt) + '.' : ''))) +
+        (dropped ? '<div class="hnote" style="color:var(--accent);">' + esc(fmtNum(dropped) + ' dropped because the spool was full or too old. Raise AGENTMEMORY_CAPTURE_SPOOL_MAX_BYTES.') + '</div>' : ''));
+      html += hrow('Inspect', esc('from a terminal'), null, 'Spool and inbox, with --drain to send the spool now:' + cmdBlock((customPort() ? 'AGENTMEMORY_URL=' + agentUrl() + ' ' : '') + 'npx @agentmemory/agentmemory capture') + 'Waiting and dead events as JSON:' + cmdBlock(curlGet('capture?status=dead')));
+      return html + '</div>';
+    }
+
+    function recordsCardHtml(c) {
+      return '<div class="card"><div class="card-title">Stored records</div>' +
+        hrow('Sessions', esc(fmtNum(c.sessions) + ' (' + fmtNum(c.activeSessions) + ' running)'), 'session') +
+        hrow('Observations', esc(fmtNum(c.observations)), 'observation') +
+        hrow('Memories', esc(fmtNum(c.latestMemories) + ' latest · ' + fmtNum(c.memories) + ' including older versions'), 'memory') +
+        hrow('Lessons / crystals', esc(fmtNum(c.lessons) + ' / ' + fmtNum(c.crystals)), 'lesson') +
+        hrow('Semantic facts / procedures', esc(fmtNum(c.semantic) + ' / ' + fmtNum(c.procedural)), 'consolidation', '<a class="empty-link" href="#health/consolidation">Why these can be empty &rarr;</a>') +
+        '</div>';
+    }
+
+    function functionsCardHtml(r) {
+      var fns = ((r && r.functions) || store.functionMetrics || []).slice().sort(function(a, b) { return (b.totalCalls || 0) - (a.totalCalls || 0); });
+      var html = '<div class="card" style="margin-top:16px;"><div class="card-title">Functions ' + help('functionCalls') + '</div>';
+      if (!fns.length) {
+        return html + emptyState({ compact: true, title: 'No function has run since the worker started',
+          what: 'Call counts, failures and latency for every agentmemory function (observe, search, remember, summarize).',
+          why: 'Nothing has called the worker yet in this process. Rows appear here live as agents observe, search and save.',
+          steps: [{ label: 'Make a first call from a terminal:', cmd: curlPost('smart-search', { query: 'test' }) }] }) + '</div>';
+      }
+      html += '<div class="table-wrap"><table class="metric-table"><tr><th>Function</th><th style="text-align:right">Calls</th><th style="text-align:right">Failed</th><th style="text-align:right">Failure rate ' + help('failureRate') + '</th><th style="text-align:right">Avg latency ' + help('latency') + '</th></tr>';
+      fns.forEach(function(f) {
+        var total = f.totalCalls || 0;
+        var rate = total > 0 ? (f.failureCount || 0) / total : 0;
+        var off = !!f.offWithoutLlm;
+        var bad = !off && total >= 5 && rate >= 0.2;
+        html += '<tr><td class="metric-fn">' + esc(f.functionId) + (off ? ' <span class="badge badge-muted">off, no LLM</span>' : '') + '</td>' +
+          '<td class="metric-num">' + fmtNum(total) + '</td>' +
+          '<td class="metric-num" style="color:' + ((f.failureCount || 0) > 0 && !off ? 'var(--red)' : 'var(--ink-faint)') + '">' + (off ? '-' : fmtNum(f.failureCount || 0)) + '</td>' +
+          '<td class="metric-num" style="color:' + (bad ? 'var(--red)' : 'var(--ink-muted)') + '">' + (off ? 'off' : Math.round(rate * 100) + '%') + '</td>' +
+          '<td class="metric-num">' + Math.round(f.avgLatencyMs || 0) + ' ms</td></tr>';
+      });
+      return html + '</table></div></div>';
+    }
+
+    function consolidationResultText(name, res) {
+      if (!res) return '';
+      if (res.error) return 'failed: ' + res.error;
+      if (res.skipped) return 'skipped: ' + (res.reason || 'not enough input');
+      if (name === 'semantic') return fmtNum(res.newFacts || 0) + ' new facts from ' + fmtNum(res.totalSummaries || 0) + ' summaries';
+      if (name === 'procedural') return fmtNum(res.newProcedures || 0) + ' new procedures from ' + fmtNum(res.patternsAnalyzed || 0) + ' patterns';
+      if (name === 'decay') return 'checked ' + fmtNum(res.semantic || 0) + ' facts and ' + fmtNum(res.procedural || 0) + ' procedures';
+      if (name === 'reflect') return res.success === false ? 'no insights' : fmtNum(res.newInsights || 0) + ' new insights';
+      if (name === 'obsidianExport') return res.success ? 'exported' : 'export failed';
+      return '';
+    }
+
+    function consolidationWhyEmpty(cs, c) {
+      if (!cs.llmConfigured) return { text: 'No LLM provider is configured on this instance, so no session summaries are written and consolidation never runs. Semantic facts and procedures stay at zero.', cmd: "echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.agentmemory/.env" };
+      if (!cs.enabled) return { text: 'CONSOLIDATION_ENABLED is set to false, so consolidation is switched off even though an LLM key exists. Remove that line from ~/.agentmemory/.env (or set it to true) and restart. Find it with:', cmd: 'grep -n CONSOLIDATION_ENABLED ~/.agentmemory/.env' };
+      var t = cs.thresholds || {};
+      if ((c.semantic || 0) === 0 && cs.summaries < (t.semanticMinSummaries || 5)) return { text: 'Not enough finished sessions yet: semantic facts need ' + (t.semanticMinSummaries || 5) + ' session summaries and there are ' + cs.summaries + '. End sessions normally (the Stop hook does it) so each one gets a summary.', cmd: curlPost('session/end', { sessionId: 'ses_...' }) };
+      if ((c.procedural || 0) === 0 && cs.recurringPatterns < (t.proceduralMinPatterns || 2)) return { text: 'Procedures need ' + (t.proceduralMinPatterns || 2) + ' pattern memories that each appear in ' + (t.proceduralMinSessionsPerPattern || 2) + '+ sessions; there are ' + cs.recurringPatterns + '. They build up as the same workflow repeats across sessions.', cmd: '' };
+      return null;
+    }
+
+    function consolidationPanelHtml(cs, c) {
+      var html = '<div class="card" id="health-consolidation" style="margin-top:16px;"><div class="card-title">How consolidation works ' + help('consolidation');
+      if (cs) {
+        var on = cs.enabled && cs.llmConfigured;
+        html += ' <span class="badge ' + (on ? 'badge-green' : 'badge-muted') + '">' + (on ? 'on' : 'off') + '</span>';
       }
       html += '</div>';
 
