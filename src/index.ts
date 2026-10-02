@@ -162,8 +162,6 @@ process.on("unhandledRejection", (reason) => {
 });
 
 function resolveWorkerSecret(): string {
-  const configured = getEnvVar("AGENTMEMORY_SECRET")?.trim();
-  if (configured) return configured;
   try {
     const { secret, source } = ensureServerSecret();
     if (source === "generated") {

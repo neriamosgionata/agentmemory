@@ -135,21 +135,59 @@ function redactSensitivePreview(preview) {
   return redactPemBlocks(preview).split("\n").map(redactSensitiveLine).join("\n");
 }
 
-function storedSecret(url) {
+function usableSecret(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || (trimmed.startsWith("${") && trimmed.endsWith("}"))) return "";
+  return trimmed;
+}
+
+function readAgentmemoryFile(name) {
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    if (host !== "localhost" && host !== "::1" && !/^127\./.test(host)) return "";
-    return readFileSync(join(homedir(), ".agentmemory", "secret"), "utf-8").trim();
+    return readFileSync(join(homedir(), ".agentmemory", name), "utf-8");
   } catch {
     return "";
   }
+}
+
+function envFileSecret() {
+  let found = "";
+  for (const line of readAgentmemoryFile(".env").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== "AGENTMEMORY_SECRET") continue;
+    let value = trimmed.slice(eq + 1).trim();
+    const quote = value[0];
+    const close = quote === '"' || quote === "'" ? value.indexOf(quote, 1) : -1;
+    if (close > 0) value = value.slice(1, close);
+    else if (value.includes(" #")) value = value.slice(0, value.indexOf(" #"));
+    found = usableSecret(value);
+  }
+  return found;
+}
+
+function isLoopbackUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
+export function resolveSecret(url, explicit) {
+  const configured = usableSecret(explicit);
+  if (configured) return configured;
+  if (!isLoopbackUrl(url)) return "";
+  return envFileSecret() || usableSecret(readAgentmemoryFile("secret"));
 }
 
 export class FilesystemWatcher {
   constructor(config = {}) {
     this.roots = (config.roots || []).map((r) => resolve(r));
     this.baseUrl = (config.baseUrl || "http://localhost:3111").replace(/\/+$/, "");
-    this.secret = config.secret || storedSecret(this.baseUrl);
+    this.secret = resolveSecret(this.baseUrl, config.secret);
     this.project =
       config.project ||
       (this.roots[0] ? deriveProjectName(this.roots[0]) : "filesystem-watcher");

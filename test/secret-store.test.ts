@@ -17,17 +17,25 @@ const KEY = "AGENTMEMORY_SECRET";
 
 describe("stored API secret", () => {
   let home: string;
-  const saved = { home: process.env.HOME, value: process.env[KEY], url: process.env.AGENTMEMORY_URL };
+  const saved = {
+    home: process.env.HOME,
+    profile: process.env.USERPROFILE,
+    value: process.env[KEY],
+    url: process.env.AGENTMEMORY_URL,
+  };
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "am-secret-"));
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     delete process.env[KEY];
     delete process.env.AGENTMEMORY_URL;
   });
 
   afterEach(() => {
     process.env.HOME = saved.home;
+    if (saved.profile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.profile;
     if (saved.value === undefined) delete process.env[KEY];
     else process.env[KEY] = saved.value;
     if (saved.url === undefined) delete process.env.AGENTMEMORY_URL;
@@ -135,6 +143,7 @@ describe("stored API secret", () => {
       const env: NodeJS.ProcessEnv = {
         PATH: process.env.PATH,
         HOME: home,
+        USERPROFILE: home,
         AGENTMEMORY_URL: `http://127.0.0.1:${port}`,
       };
       await runHook(join(process.cwd(), "plugin", "scripts", "session-start.mjs"), env);
