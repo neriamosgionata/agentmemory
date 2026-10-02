@@ -100,6 +100,11 @@ describe("stripPrivateData patterns", () => {
     assertClean(out);
   });
 
+  it("redacts URL passwords that have an empty username", () => {
+    const out = stripPrivateData("cache at redis://:hunter2pass@cache.internal:6379/0");
+    expect(out).toBe("cache at redis://[REDACTED_SECRET]@cache.internal:6379/0");
+  });
+
   it("leaves ordinary URLs untouched", () => {
     const plain = "see https://example.com/a?b=c and mailto:me@example.com";
     expect(stripPrivateData(plain)).toBe(plain);
@@ -228,6 +233,28 @@ describe("write paths store scrubbed text", () => {
     const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: { actionIds: ["act_1"] } })) as { success: boolean };
     expect(result.success).toBe(true);
     assertClean(await kv.list(KV.crystals));
+  });
+
+  it("crystal metadata supplied by the caller", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    const summarize = vi.fn().mockResolvedValue(
+      JSON.stringify({ narrative: "n", keyOutcomes: [], filesAffected: [], lessons: [] }),
+    );
+    registerCrystallizeFunction(sdk as never, kv as never, { name: "t", compress: vi.fn(), summarize } as never);
+    const now = new Date().toISOString();
+    await kv.set(KV.actions, "act_2", {
+      id: "act_2", title: "t", description: "d", status: "done", priority: 5,
+      createdAt: now, updatedAt: now, createdBy: "a", tags: [], sourceObservationIds: [], sourceMemoryIds: [],
+    });
+    const result = (await sdk.trigger({
+      function_id: "mem::crystallize",
+      payload: { actionIds: ["act_2"], project: HTTPS_URL, sessionId: DB_URL },
+    })) as { success: boolean };
+    expect(result.success).toBe(true);
+    const crystals = await kv.list<{ project?: string }>(KV.crystals);
+    expect(crystals[0]?.project).toBe("https://[REDACTED_SECRET]@git.example.com/repo.git");
+    assertClean(crystals);
   });
 
   it("graph node properties", async () => {

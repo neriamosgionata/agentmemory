@@ -15,6 +15,12 @@ vi.mock("node:fs/promises", () => ({
   writeFile: vi.fn(async (path: string, content: string) => {
     writtenFiles.set(path, content);
   }),
+  open: vi.fn(async (path: string) => ({
+    writeFile: vi.fn(async (content: string) => {
+      writtenFiles.set(path, content);
+    }),
+    close: vi.fn(async () => {}),
+  })),
 }));
 
 import { registerObsidianExportFunction } from "../src/functions/obsidian-export.js";

@@ -23,7 +23,7 @@ const PRIVATE_KEY_BLOCK_RE =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g;
 
 const URL_CREDENTIALS_RE =
-  /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@:"'<>]+:[^\s/?#@"'<>]+@/gi;
+  /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@:"'<>]*:[^\s/?#@"'<>]+@/gi;
 
 export function stripPrivateData(input: string): string {
   let result = input.replace(PRIVATE_TAG_RE, "[REDACTED]");

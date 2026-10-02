@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,8 @@ import { allowedFileRoots, confinePath } from "../src/functions/path-guard.js";
 import { registerGraphImportFunction } from "../src/functions/graph-import.js";
 import { registerReplayFunctions } from "../src/functions/replay.js";
 import { registerCompressFileFunction } from "../src/functions/compress-file.js";
+import { registerObsidianExportFunction } from "../src/functions/obsidian-export.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -136,5 +138,86 @@ describe("file path confinement", () => {
     })) as { success: boolean; error?: string };
     expect(result.success).toBe(false);
     expect(summarize).not.toHaveBeenCalled();
+  });
+});
+
+describe("export and backup destinations", () => {
+  let base: string;
+  let root: string;
+  let outside: string;
+  const saved = { exportRoot: process.env.AGENTMEMORY_EXPORT_ROOT, importRoot: process.env.AGENTMEMORY_IMPORT_ROOT };
+
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "am-dest-"));
+    root = join(base, "allowed");
+    outside = join(base, "outside");
+    mkdirSync(root, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    process.env.AGENTMEMORY_EXPORT_ROOT = root;
+    process.env.AGENTMEMORY_IMPORT_ROOT = root;
+  });
+
+  afterEach(() => {
+    for (const [key, value] of [["AGENTMEMORY_EXPORT_ROOT", saved.exportRoot], ["AGENTMEMORY_IMPORT_ROOT", saved.importRoot]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  async function exportVault(kv = mockKV()) {
+    const now = new Date().toISOString();
+    await kv.set(KV.memories, "mem_1", { id: "mem_1", title: "t", content: "c", type: "fact", isLatest: true, createdAt: now, updatedAt: now });
+    const sdk = mockSdk();
+    registerObsidianExportFunction(sdk as never, kv as never);
+    return (await sdk.trigger({ function_id: "mem::obsidian-export", payload: {} })) as {
+      success: boolean;
+      errors?: Array<{ id: string }>;
+    };
+  }
+
+  it("obsidian export refuses a pre-existing directory symlink that points outside the root", async () => {
+    mkdirSync(join(root, "vault"), { recursive: true });
+    symlinkSync(outside, join(root, "vault", "memories"));
+    const result = await exportVault();
+    expect(result.success).toBe(false);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it("obsidian export refuses pre-existing file symlinks for memories and the MOC", async () => {
+    mkdirSync(join(root, "vault", "memories"), { recursive: true });
+    writeFileSync(join(outside, "memory.md"), "original memory");
+    writeFileSync(join(outside, "moc.md"), "original moc");
+    symlinkSync(join(outside, "memory.md"), join(root, "vault", "memories", "mem_1.md"));
+    symlinkSync(join(outside, "moc.md"), join(root, "vault", "MOC.md"));
+    const result = await exportVault();
+    expect(result.success).toBe(false);
+    expect(readFileSync(join(outside, "memory.md"), "utf-8")).toBe("original memory");
+    expect(readFileSync(join(outside, "moc.md"), "utf-8")).toBe("original moc");
+  });
+
+  it("obsidian export refuses a file symlink that stays inside the root", async () => {
+    mkdirSync(join(root, "vault", "memories"), { recursive: true });
+    writeFileSync(join(root, "keep.md"), "keep");
+    symlinkSync(join(root, "keep.md"), join(root, "vault", "memories", "mem_1.md"));
+    const result = await exportVault();
+    expect(result.errors?.map((e) => e.id)).toEqual(["mem_1"]);
+    expect(readFileSync(join(root, "keep.md"), "utf-8")).toBe("keep");
+  });
+
+  it("compress-file refuses a backup destination that is a symlink out of the root", async () => {
+    writeFileSync(join(root, "notes.md"), "# Title\n\nSome long prose here.\n");
+    writeFileSync(join(outside, "target.md"), "untouched");
+    symlinkSync(join(outside, "target.md"), join(root, "notes.original.md"));
+    const summarize = vi.fn(async () => "# Title\n\nProse.\n");
+    const sdk = mockSdk();
+    registerCompressFileFunction(sdk as never, mockKV() as never, { name: "t", summarize, compress: summarize } as never);
+    const result = (await sdk.trigger({
+      function_id: "mem::compress-file",
+      payload: { filePath: join(root, "notes.md") },
+    })) as { success: boolean; error?: string };
+    expect(result.success).toBe(false);
+    expect(readFileSync(join(outside, "target.md"), "utf-8")).toBe("untouched");
+    expect(readFileSync(join(root, "notes.md"), "utf-8")).toBe("# Title\n\nSome long prose here.\n");
   });
 });

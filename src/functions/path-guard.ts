@@ -1,4 +1,5 @@
-import { realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
@@ -78,4 +79,29 @@ export async function confinePath(
     ok: false,
     error: `path is outside the allowed roots (${roots.join(", ")}). Set ${IMPORT_ROOT_ENV} to a directory to allow file access under it.`,
   };
+}
+
+const WRITE_NO_FOLLOW = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW;
+
+async function requireConfined(path: string, roots: string[]): Promise<string> {
+  const confined = await confinePath(path, roots);
+  if (!confined.ok) throw new Error(confined.error);
+  return confined.path;
+}
+
+export async function mkdirConfined(dir: string, roots: string[]): Promise<string> {
+  const path = await requireConfined(dir, roots);
+  await mkdir(path, { recursive: true });
+  return requireConfined(path, roots);
+}
+
+export async function writeConfinedFile(path: string, content: string, roots: string[]): Promise<string> {
+  const target = await requireConfined(path, roots);
+  const handle = await open(target, WRITE_NO_FOLLOW);
+  try {
+    await handle.writeFile(content, "utf-8");
+  } finally {
+    await handle.close();
+  }
+  return target;
 }

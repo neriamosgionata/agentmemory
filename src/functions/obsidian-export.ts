@@ -1,4 +1,3 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { ISdk } from "../iii.js";
@@ -11,7 +10,7 @@ import type {
   Session,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
-import { confinePath } from "./path-guard.js";
+import { confinePath, mkdirConfined, writeConfinedFile } from "./path-guard.js";
 const DEFAULT_EXPORT_ROOT = join(homedir(), ".agentmemory");
 
 function getExportRoot(): string {
@@ -283,9 +282,8 @@ export function registerObsidianExportFunction(
       // TypeError as `{"error":"[object Object]"}`. With this guard the
       // worst case is `{success: false, error: <string>}`.
       try {
-        await Promise.all(
-          Object.values(dirs).map((dir) => mkdir(dir, { recursive: true })),
-        );
+        const roots = [getExportRoot()];
+        await Promise.all(Object.values(dirs).map((dir) => mkdirConfined(dir, roots)));
 
         const stats = { memories: 0, lessons: 0, crystals: 0, sessions: 0 };
         const errors: ExportError[] = [];
@@ -307,7 +305,7 @@ export function registerObsidianExportFunction(
           const filename = `${sanitize(m.id)}.md`;
           const filepath = join(dirs.memories, filename);
           try {
-            await writeFile(filepath, memoryToMd(m));
+            await writeConfinedFile(filepath, memoryToMd(m), roots);
             stats.memories++;
             memoryMoc.push(
               `- [[memories/${sanitize(m.id)}|${safeString(m.title, m.id)}]] (${m.type}, strength: ${m.strength ?? 0})`,
@@ -327,7 +325,7 @@ export function registerObsidianExportFunction(
           const filename = `${sanitize(l.id)}.md`;
           const filepath = join(dirs.lessons, filename);
           try {
-            await writeFile(filepath, lessonToMd(l));
+            await writeConfinedFile(filepath, lessonToMd(l), roots);
             stats.lessons++;
             const headline = safeString(l.content).slice(0, 60) || l.id;
             lessonMoc.push(
@@ -346,7 +344,7 @@ export function registerObsidianExportFunction(
           const filename = `${sanitize(c.id)}.md`;
           const filepath = join(dirs.crystals, filename);
           try {
-            await writeFile(filepath, crystalToMd(c));
+            await writeConfinedFile(filepath, crystalToMd(c), roots);
             stats.crystals++;
             const headline = safeString(c.narrative).slice(0, 60) || c.id;
             crystalMoc.push(`- [[crystals/${sanitize(c.id)}|${headline}]]`);
@@ -367,7 +365,7 @@ export function registerObsidianExportFunction(
           const filename = `${sanitize(s.id)}.md`;
           const filepath = join(dirs.sessions, filename);
           try {
-            await writeFile(filepath, sessionToMd(s));
+            await writeConfinedFile(filepath, sessionToMd(s), roots);
             stats.sessions++;
             sessionMoc.push(
               `- [[sessions/${sanitize(s.id)}|${safeString(s.project, "unknown")} (${safeString(s.status, "unknown")})]]`,
@@ -405,7 +403,7 @@ export function registerObsidianExportFunction(
           ...sessionMoc,
         ].join("\n");
 
-        await writeFile(join(vaultDir, "MOC.md"), moc);
+        await writeConfinedFile(join(vaultDir, "MOC.md"), moc, roots);
 
         await recordAudit(kv, "obsidian_export", "mem::obsidian-export", [], {
           vaultDir,
