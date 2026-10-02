@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
-import { mkdir, open, realpath } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
@@ -81,7 +82,7 @@ export async function confinePath(
   };
 }
 
-const WRITE_NO_FOLLOW = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW;
+const CREATE_EXCLUSIVE_NO_FOLLOW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 
 async function requireConfined(path: string, roots: string[]): Promise<string> {
   const confined = await confinePath(path, roots);
@@ -97,11 +98,23 @@ export async function mkdirConfined(dir: string, roots: string[]): Promise<strin
 
 export async function writeConfinedFile(path: string, content: string, roots: string[]): Promise<string> {
   const target = await requireConfined(path, roots);
-  const handle = await open(target, WRITE_NO_FOLLOW);
+  const existing = await lstat(target).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  });
+  if (existing?.isSymbolicLink()) throw new Error(`refusing to write through a symbolic link: ${target}`);
+  const temp = await requireConfined(join(dirname(target), `.${basename(target)}.${randomBytes(6).toString("hex")}.tmp`), roots);
   try {
-    await handle.writeFile(content, "utf-8");
-  } finally {
-    await handle.close();
+    const handle = await open(temp, CREATE_EXCLUSIVE_NO_FOLLOW, existing ? existing.mode & 0o777 : 0o644);
+    try {
+      await handle.writeFile(content, "utf-8");
+    } finally {
+      await handle.close();
+    }
+    await rename(temp, target);
+  } catch (err) {
+    await rm(temp, { force: true }).catch(() => {});
+    throw err;
   }
   return target;
 }
