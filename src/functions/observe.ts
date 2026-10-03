@@ -17,6 +17,7 @@ import {
 } from "./search.js";
 import { isCaptureKey } from "../capture/event-record.js";
 import { getVectorIndex } from "./search.js";
+import { claimBackfillPrompt, isBackfillPrompt, recordLivePrompt } from "../capture/prompt-ledger.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
@@ -182,13 +183,23 @@ export function registerObserveFunction(
       }
 
       const pendingImageData = extractedImage;
+      const submittedPrompt =
+        payload.hookType === "prompt_submit" && typeof raw.userPrompt === "string" ? raw.userPrompt : undefined;
+      const backfillPrompt = submittedPrompt && isBackfillPrompt(payload.data) ? submittedPrompt : undefined;
+      const livePrompt = submittedPrompt && !backfillPrompt ? submittedPrompt : undefined;
+      const promptRef = durable || typeof payload.eventId !== "string" ? obsId : payload.eventId;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
         const existing = await kv.list<CompressedObservation>(KV.observations(payload.sessionId));
         const stored = durable ? existing.find((o) => o?.id === obsId) : undefined;
         if (stored) {
+          if (livePrompt) await recordLivePrompt(kv, payload.sessionId, livePrompt, promptRef);
           await restoreIndexEntries(stored);
           return { observationId: obsId, deduplicated: true, existing: true };
+        }
+        if (backfillPrompt && (await claimBackfillPrompt(kv, payload.sessionId, backfillPrompt, promptRef))) {
+          recordDedupSkip();
+          return { deduplicated: true, sessionId: payload.sessionId };
         }
         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
           const existing = await kv.list<RawObservation & { importance?: number }>(
@@ -313,6 +324,7 @@ export function registerObserveFunction(
         if (dedupMap && dedupHash) {
           dedupMap.record(dedupHash);
         }
+        if (livePrompt) await recordLivePrompt(kv, payload.sessionId, livePrompt, promptRef);
 
         await sdk.trigger({
           function_id: "stream::set",

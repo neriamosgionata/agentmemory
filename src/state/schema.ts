@@ -86,6 +86,7 @@ export const KV = {
   obsSessionIndex: (shard: number) => `mem:idx:obs:${shard}`,
   captureInbox: "mem:capture:inbox",
   captureEvents: (shard: string) => `mem:capture:events:${shard}`,
+  capturePrompts: "mem:capture:prompts",
 } as const;
 
 export const STREAM = {
