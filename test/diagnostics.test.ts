@@ -903,6 +903,70 @@ describe("Diagnostics Functions", () => {
         expect(result.checks.find((c) => c.name === "index-orphan-shards")?.status).toBe("pass");
       });
 
+      it("index category: accepts layout-3 v2 vector manifests with bucketed shards", async () => {
+        await kv.set(KV.bm25Index, "data:manifest", {
+          v: 1,
+          generation: "gen_bm25_1",
+          shards: [{ scope: "mem:index:bm25:bm25:gen_bm25_1:00000", key: "data", chars: 50 }],
+          chars: 50,
+        });
+        await kv.set(KV.bm25Index, "vectors:manifest", {
+          v: 2,
+          layout: 3,
+          buckets: 2,
+          chunkChars: 100,
+          shards: {
+            b0000: { chunks: 1, hash: "aa" },
+            b0001: { chunks: 1, hash: "bb" },
+          },
+        });
+        await kv.set(KV.bm25Index, "generations:registry", {
+          v: 1,
+          generations: {},
+        });
+
+        const result = (await sdk.trigger("mem::diagnose", {
+          categories: ["index"],
+        })) as { checks: DiagnosticCheck[] };
+
+        expect(result.checks.find((c) => c.name === "index-manifest-vectors")?.status).toBe("pass");
+        expect(result.checks.find((c) => c.name === "index-manifest-vectors")?.message).toContain("2 shards");
+        expect(result.checks.find((c) => c.name === "index-orphan-shards")?.status).toBe("pass");
+      });
+
+      it("index category: fails on malformed v2 vector manifests", async () => {
+        await kv.set(KV.bm25Index, "data:manifest", {
+          v: 1,
+          generation: "gen_bm25_1",
+          shards: [{ scope: "mem:index:bm25:bm25:gen_bm25_1:00000", key: "data", chars: 50 }],
+          chars: 50,
+        });
+        await kv.set(KV.bm25Index, "vectors:manifest", {
+          v: 2,
+          layout: 3,
+          shards: "not-a-map",
+        });
+
+        const result = (await sdk.trigger("mem::diagnose", {
+          categories: ["index"],
+        })) as { checks: DiagnosticCheck[] };
+
+        expect(result.checks.find((c) => c.name === "index-manifest-bm25")?.status).toBe("pass");
+        expect(result.checks.find((c) => c.name === "index-manifest-vectors")?.status).toBe("fail");
+
+        await kv.set(KV.bm25Index, "vectors:manifest", { v: 2, shards: [] });
+        const arrayShards = (await sdk.trigger("mem::diagnose", {
+          categories: ["index"],
+        })) as { checks: DiagnosticCheck[] };
+        expect(arrayShards.checks.find((c) => c.name === "index-manifest-vectors")?.status).toBe("fail");
+
+        await kv.set(KV.bm25Index, "vectors:manifest", { v: 3, shards: { b0000: {} } });
+        const unknownVersion = (await sdk.trigger("mem::diagnose", {
+          categories: ["index"],
+        })) as { checks: DiagnosticCheck[] };
+        expect(unknownVersion.checks.find((c) => c.name === "index-manifest-vectors")?.status).toBe("fail");
+      });
+
       it("index category: warns on missing manifests", async () => {
         const result = (await sdk.trigger("mem::diagnose", {
           categories: ["index"],

@@ -43,6 +43,30 @@ const ALL_CATEGORIES = [
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
+// Vector manifests moved from a v1 flat shard array to a v2 layout-3
+// bucketed map (see VectorBucketManifest in state/index-persistence.ts).
+// Legacy v1 array manifests must still validate so pre-migration stores
+// don't read as corrupt during an upgrade.
+function isVectorManifestShape(m: unknown): boolean {
+  if (!m || typeof m !== "object") return false;
+  const manifest = m as { v?: unknown; shards?: unknown };
+  if (manifest.v === 1) return Array.isArray(manifest.shards);
+  if (manifest.v === 2) {
+    return (
+      typeof manifest.shards === "object" &&
+      manifest.shards !== null &&
+      !Array.isArray(manifest.shards)
+    );
+  }
+  return false;
+}
+
+function countManifestShards(shards: unknown): number {
+  if (Array.isArray(shards)) return shards.length;
+  if (shards && typeof shards === "object") return Object.keys(shards).length;
+  return 0;
+}
+
 export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::diagnose", 
     async (data: { categories?: string[] }) => {
@@ -701,7 +725,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
         let vectorManifest: {
           v: number;
           generation?: string;
-          shards?: unknown[];
+          shards?: unknown[] | Record<string, unknown>;
           chars?: number;
         } | null = null;
         if (vectorSettled.status === "fulfilled") {
@@ -717,14 +741,14 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
                 "Vector index manifest not found (index not yet persisted or empty)",
               fixable: false,
             });
-          } else if (m && m.v === 1 && Array.isArray(m.shards)) {
+          } else if (isVectorManifestShape(m)) {
             vectorEligible = true;
             vectorManifest = m;
             checks.push({
               name: "index-manifest-vectors",
               category: "index",
               status: "pass",
-              message: `Vector index manifest is valid (${m.shards.length} shards)`,
+              message: `Vector index manifest is valid (${countManifestShards(m.shards)} shards)`,
               fixable: false,
             });
           } else {
@@ -1301,7 +1325,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
         let vectorManifest: {
           v: number;
           generation?: string;
-          shards?: unknown[];
+          shards?: unknown[] | Record<string, unknown>;
           chars?: number;
         } | null = null;
         if (vectorSettled.status === "fulfilled") {
@@ -1309,7 +1333,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
           if (m === null || m === undefined) {
             vectorEligible = true;
             vectorManifest = null;
-          } else if (m && m.v === 1 && Array.isArray(m.shards)) {
+          } else if (isVectorManifestShape(m)) {
             vectorEligible = true;
             vectorManifest = m;
           }
