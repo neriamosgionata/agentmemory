@@ -21,8 +21,10 @@ function mockKV() {
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
-      const entries = store.get(scope);
-      return entries ? (Array.from(entries.values()) as T[]) : [];
+      throw new Error(`state::list must not be used by queryAudit (scope=${scope})`);
+    },
+    listKeys: async (scope: string): Promise<string[]> => {
+      return [...(store.get(scope)?.keys() ?? [])];
     },
   };
 }
@@ -102,5 +104,36 @@ describe("Audit Functions", () => {
 
     const entries = await queryAudit(kv as never, { limit: 3 });
     expect(entries.length).toBe(3);
+  });
+
+  it("queryAudit pages through keys instead of listing the scope", async () => {
+    // 5 observes first (older), then 150 deletes (newer). An operation
+    // filter for "observe" must skip past more than one 100-key batch of
+    // non-matching keys to find them, proving the paging loop works and
+    // that state::list is never touched.
+    for (let i = 0; i < 5; i++) {
+      await recordAudit(kv as never, "observe", `obs${i}`, [], {});
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    for (let i = 0; i < 150; i++) {
+      await recordAudit(kv as never, "delete", `del${i}`, [], {});
+      await new Promise((r) => setTimeout(r, 2));
+    }
+
+    const entries = await queryAudit(kv as never, {
+      operation: "observe",
+      limit: 5,
+    });
+    expect(entries.length).toBe(5);
+    expect(entries.every((e) => e.operation === "observe")).toBe(true);
+  });
+
+  it("queryAudit rejects invalid date filters", async () => {
+    await expect(
+      queryAudit(kv as never, { dateFrom: "not-a-date" }),
+    ).rejects.toThrow("Invalid dateFrom");
+    await expect(
+      queryAudit(kv as never, { dateTo: "not-a-date" }),
+    ).rejects.toThrow("Invalid dateTo");
   });
 });

@@ -77,6 +77,18 @@ export async function safeAudit(
   }
 }
 
+// state::list over the full audit scope is the one call that can kill the
+// state worker: at 70k+ rows the response exceeds the worker's WebSocket
+// write budget, the connection resets, and the unflushed response keeps
+// poisoning every reconnect until the daemon restarts (observed live
+// 2026-10-04). list_keys returns ids only (~2 MB / ~80 ms for 70k keys), so
+// the query pages newest-first through keys and fetches only the entries it
+// needs. The scan cap bounds the pathological case of a filter matching
+// nothing; id order is timestamp order to millisecond precision, with rare
+// same-millisecond inversions smoothed by the final sort.
+const AUDIT_QUERY_BATCH = 100;
+const AUDIT_QUERY_SCAN_CAP = 20_000;
+
 export async function queryAudit(
   kv: StateKV,
   filter?: {
@@ -86,28 +98,48 @@ export async function queryAudit(
     limit?: number;
   },
 ): Promise<AuditEntry[]> {
-  const all = await kv.list<AuditEntry>(KV.audit);
-  let entries = [...all].sort(
-    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-  );
-
-  if (filter?.operation) {
-    entries = entries.filter((e) => e.operation === filter.operation);
-  }
+  const limit = filter?.limit || 100;
+  let fromMs: number | undefined;
+  let toMs: number | undefined;
   if (filter?.dateFrom) {
-    const from = new Date(filter.dateFrom).getTime();
-    if (Number.isNaN(from)) {
+    fromMs = new Date(filter.dateFrom).getTime();
+    if (Number.isNaN(fromMs)) {
       throw new Error(`Invalid dateFrom: ${filter.dateFrom}`);
     }
-    entries = entries.filter((e) => new Date(e.timestamp).getTime() >= from);
   }
   if (filter?.dateTo) {
-    const to = new Date(filter.dateTo).getTime();
-    if (Number.isNaN(to)) {
+    toMs = new Date(filter.dateTo).getTime();
+    if (Number.isNaN(toMs)) {
       throw new Error(`Invalid dateTo: ${filter.dateTo}`);
     }
-    entries = entries.filter((e) => new Date(e.timestamp).getTime() <= to);
   }
 
-  return entries.slice(0, filter?.limit || 100);
+  const keys = (await kv.listKeys(KV.audit)).sort((a, b) =>
+    a < b ? 1 : a > b ? -1 : 0,
+  );
+  const scanLimit = Math.min(keys.length, AUDIT_QUERY_SCAN_CAP);
+  const matched: AuditEntry[] = [];
+
+  for (
+    let scanned = 0;
+    scanned < scanLimit && matched.length < limit;
+    scanned += AUDIT_QUERY_BATCH
+  ) {
+    const batch = keys.slice(scanned, Math.min(scanned + AUDIT_QUERY_BATCH, scanLimit));
+    const rows = await Promise.all(
+      batch.map((key) => kv.get<AuditEntry>(KV.audit, key)),
+    );
+    for (const entry of rows) {
+      if (!entry) continue;
+      if (filter?.operation && entry.operation !== filter.operation) continue;
+      const at = new Date(entry.timestamp).getTime();
+      if (fromMs !== undefined && at < fromMs) continue;
+      if (toMs !== undefined && at > toMs) continue;
+      matched.push(entry);
+    }
+  }
+
+  return matched
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, limit);
 }

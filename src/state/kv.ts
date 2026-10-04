@@ -98,4 +98,22 @@ export class StateKV {
       timeoutMs: KV_TIMEOUT_MS,
     })
   }
+
+  // Keys-only listing. state::list returns full values and can wedge the
+  // state worker on huge scopes (the audit scope at 70k+ rows exceeds the
+  // worker's WebSocket write budget and poisons its reconnect queue —
+  // observed live 2026-10-04). list_keys streams ids only, which stays
+  // small (~2 MB for 70k keys) and safe.
+  async listKeys(scope: string): Promise<string[]> {
+    const result = await this.sdk.trigger<
+      { scope: string },
+      { keys?: string[] } | string[]
+    >({
+      function_id: 'state::list_keys',
+      payload: { scope },
+      timeoutMs: KV_TIMEOUT_MS,
+    })
+    if (Array.isArray(result)) return result
+    return Array.isArray(result?.keys) ? result.keys : []
+  }
 }
