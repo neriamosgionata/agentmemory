@@ -416,6 +416,22 @@ function parseAttrs(raw: string): Record<string, string> {
   return attrs;
 }
 
+// LLM output occasionally smuggles prompt text into the `type` attribute:
+// the prompt's allowed-type list verbatim ("file|function|concept|…"),
+// a sentence fragment ("function and "), or odd casing. Accept a clean
+// type token as-is (heuristics and importers legitimately emit types
+// beyond the prompt list, e.g. "class", "table"), lowercase it, and fold
+// anything else into the generic "concept" so malformed values cannot
+// pollute the graph's type histogram or viewer facets.
+const NODE_TYPE_TOKEN = /^[a-z][a-z0-9_]{0,31}$/;
+
+function normalizeNodeType(raw: string | undefined): GraphNode["type"] | undefined {
+  if (!raw) return undefined;
+  const token = raw.trim().toLowerCase();
+  if (token.length === 0) return undefined;
+  return NODE_TYPE_TOKEN.test(token) ? (token as GraphNode["type"]) : "concept";
+}
+
 function parseGraphXml(
   xml: string,
   observationIds: string[],
@@ -439,7 +455,7 @@ function parseGraphXml(
 
   const addEntity = (rawAttrs: string, propsBlock = ""): void => {
     const attrs = parseAttrs(rawAttrs);
-    const type = attrs["type"] as GraphNode["type"] | undefined;
+    const type = normalizeNodeType(attrs["type"]);
     const rawName = attrs["name"];
     if (!type || !rawName) return;
     const name =

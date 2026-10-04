@@ -172,6 +172,52 @@ describe("Graph Functions", () => {
     expect(edges[0].weight).toBeCloseTo(0.9, 5);
   });
 
+  it("graph-extract coerces malformed entity types to concept", async () => {
+    // Seen in the wild: the LLM echoes the prompt's allowed-type list
+    // verbatim, or emits a sentence fragment. Those values used to be
+    // persisted as node types, polluting nodesByType and viewer facets.
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="file|function|concept|error|decision|pattern|library|person" name="pipe-echo"/>
+<entity type="function and " name="fragment"/>
+<entity type="File" name="src/index.ts"/>
+<entity type="" name="empty-type"/>
+<entity name="missing-type"/>
+</entities>
+<relationships>
+<relationship type="uses" source="pipe-echo" target="fragment"/>
+</relationships>`);
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; nodesAdded: number; edgesAdded: number };
+
+    expect(result.success).toBe(true);
+
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    const byName = new Map(nodes.map((n) => [n.name, n.type]));
+    expect(byName.get("pipe-echo")).toBe("concept");
+    expect(byName.get("fragment")).toBe("concept");
+    expect(byName.get("src/index.ts")).toBe("file");
+    expect(byName.has("empty-type")).toBe(false);
+    expect(byName.has("missing-type")).toBe(false);
+    for (const type of byName.values()) {
+      expect(type).toMatch(/^[a-z][a-z0-9_]{0,31}$/);
+    }
+  });
+
+  it("graph-extract keeps legit off-prompt types from heuristics and importers", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="table" name="portfolio_orders"/>
+<entity type="subagent" name="cavecrew-builder"/>
+</entities>`);
+
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    expect(nodes.find((n) => n.name === "portfolio_orders")?.type).toBe("table");
+    expect(nodes.find((n) => n.name === "cavecrew-builder")?.type).toBe("subagent");
+  });
+
   it("graph-query with search returns matching nodes", async () => {
     await sdk.trigger("mem::graph-extract", { observations: [testObs] });
 
