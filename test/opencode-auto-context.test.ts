@@ -129,3 +129,66 @@ describe("OpenCode plugin file-tool matching", () => {
     expect(plugin).toContain('FILE_TOOLS.has(String(input.tool ?? "").toLowerCase())');
   });
 });
+
+describe("OpenCode plugin graph freshness on idle", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("kicks graph tail extraction alongside summarize when a session goes idle", async () => {
+    // The graph used to freeze at the last full build because /session/end
+    // only fires on explicit session deletion. The idle kick keeps the
+    // watermark-idempotent tail extraction running per turn.
+    const { AgentmemoryCapturePlugin } = await import(
+      "../plugin/opencode/agentmemory-capture.ts"
+    );
+    const handlers = await (AgentmemoryCapturePlugin as (c: unknown) => Promise<{
+      event: (msg: unknown) => Promise<void>;
+    }>)({ project: { id: "/repo/alpha" }, worktree: "/repo/alpha" });
+
+    await handlers.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "s1", status: { type: "idle" } },
+      },
+    });
+
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.endsWith("/agentmemory/summarize"))).toBe(true);
+
+    const extractCall = fetchMock.mock.calls.find((c) =>
+      String(c[0]).endsWith("/agentmemory/graph/extract-session"),
+    );
+    expect(extractCall).toBeDefined();
+    expect(JSON.parse((extractCall![1] as { body: string }).body)).toEqual({
+      sessionId: "s1",
+    });
+  });
+
+  it("does not kick graph extraction for non-idle status updates", async () => {
+    const { AgentmemoryCapturePlugin } = await import(
+      "../plugin/opencode/agentmemory-capture.ts"
+    );
+    const handlers = await (AgentmemoryCapturePlugin as (c: unknown) => Promise<{
+      event: (msg: unknown) => Promise<void>;
+    }>)({ project: { id: "/repo/alpha" }, worktree: "/repo/alpha" });
+
+    await handlers.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "s1", status: { type: "busy" } },
+      },
+    });
+
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.endsWith("/agentmemory/graph/extract-session"))).toBe(false);
+  });
+});

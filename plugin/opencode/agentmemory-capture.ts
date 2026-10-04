@@ -279,6 +279,12 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         if (!sid || !status) return;
         if (status.type === "idle") {
           await post("/summarize", { sessionId: sid });
+          // OpenCode fires session.deleted only on explicit deletion, so a
+          // normal session never reaches /session/end and the graph would
+          // freeze at the last full build. Extraction is watermark-idempotent
+          // (server processes only the unextracted tail), so an idle kick is
+          // cheap when nothing new was compressed.
+          await post("/graph/extract-session", { sessionId: sid });
         }
         await observe(sid, "session_status", {
           status_type: status.type,

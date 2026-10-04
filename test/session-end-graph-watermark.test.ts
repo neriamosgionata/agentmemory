@@ -21,7 +21,7 @@ vi.mock("../src/functions/slots.js", () => ({
 import { registerEventTriggers } from "../src/triggers/events.js";
 import { registerGraphFunction } from "../src/functions/graph.js";
 import { KV } from "../src/state/schema.js";
-import { getGraphBatchSize } from "../src/config.js";
+import { getGraphBatchSize, isGraphExtractionEnabled } from "../src/config.js";
 import type {
   CompressedObservation,
   GraphExtractionWatermark,
@@ -584,6 +584,55 @@ describe("session-stop graph-extraction watermark (R4/R5)", () => {
     expect(h.extractCalls()).toHaveLength(1);
     const watermark = await readWatermark(h.kv, "ses_1");
     expect(watermark?.extractedCount).toBe(2);
+  });
+});
+
+describe("mem::graph-extract-session (on-demand tail extraction)", () => {
+  it("extracts the unextracted tail and records the watermark", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1"), obs("o2")]);
+    const handler = h.handlers.get("mem::graph-extract-session")!;
+
+    const result = await handler({ sessionId: "ses_1" });
+
+    expect(result).toMatchObject({ success: true });
+    expect(h.extractCalls().map((b) => b.observations.map((o) => o.id))).toEqual([
+      ["o1", "o2"],
+    ]);
+    expect((await readWatermark(h.kv, "ses_1"))?.extractedCount).toBe(2);
+  });
+
+  it("is a no-op for a session that is already fully extracted", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1")]);
+    await h.stopped({ sessionId: "ses_1" });
+    const handler = h.handlers.get("mem::graph-extract-session")!;
+
+    const result = await handler({ sessionId: "ses_1" });
+
+    expect(result).toMatchObject({ success: true });
+    expect(h.extractCalls()).toHaveLength(1);
+  });
+
+  it("skips when graph extraction is disabled", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    await seedObservations(h.kv, "ses_1", [obs("o1")]);
+    vi.mocked(isGraphExtractionEnabled).mockReturnValueOnce(false);
+    const handler = h.handlers.get("mem::graph-extract-session")!;
+
+    const result = await handler({ sessionId: "ses_1" });
+
+    expect(result).toMatchObject({ success: false, skipped: true });
+    expect(h.extractCalls()).toHaveLength(0);
+  });
+
+  it("rejects a missing or blank sessionId", async () => {
+    const h = createEventsHarness(async () => ({ success: true }));
+    const handler = h.handlers.get("mem::graph-extract-session")!;
+
+    expect(await handler({ sessionId: "" })).toMatchObject({ success: false });
+    expect(await handler({ sessionId: "   " })).toMatchObject({ success: false });
+    expect(h.extractCalls()).toHaveLength(0);
   });
 });
 

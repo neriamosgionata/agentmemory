@@ -1750,6 +1750,45 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/extract", http_method: "POST" },
   });
 
+  // On-demand tail extraction for clients whose lifecycle never reaches
+  // /session/end (OpenCode emits session.deleted only on explicit deletion,
+  // so normal idle sessions would never update the graph). Fire-and-forget:
+  // extraction is watermark-idempotent and can run up to a minute, so the
+  // HTTP response must not wait on it; a dropped dispatch is retried by the
+  // next idle.
+  sdk.registerFunction("api::graph-extract-session",
+    async (req: ApiRequest<{ sessionId: string }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const sessionId =
+        typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+      if (!sessionId) {
+        return { status_code: 400, body: { error: "sessionId is required" } };
+      }
+      sdk
+        .trigger({
+          function_id: "mem::graph-extract-session",
+          payload: { sessionId },
+          action: TriggerAction.Void(),
+        })
+        .catch((err) =>
+          logger.warn("mem::graph-extract-session trigger failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      return { status_code: 200, body: { success: true, scheduled: true } };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-extract-session",
+    config: {
+      api_path: "/agentmemory/graph/extract-session",
+      http_method: "POST",
+    },
+  });
+
   // Backfill the knowledge graph from existing compressed observations.
   // Viewer calls this when the graph is empty (#666). Iterates every
   // session, collects observations that have a `title` (compressed only),

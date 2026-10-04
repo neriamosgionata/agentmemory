@@ -311,6 +311,38 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.session.stopped" },
   });
 
+  // On-demand tail extraction. Session stop is the primary trigger, but
+  // clients that never emit a stop — OpenCode only posts /session/end on
+  // explicit session.deleted, so a normal idle session never reaches it —
+  // would otherwise let the graph freeze at the last build. Idempotent:
+  // the per-session watermark makes repeated calls process only the
+  // observations added since the last extraction.
+  sdk.registerFunction(
+    "mem::graph-extract-session",
+    async (data: { sessionId?: string }) => {
+      const sessionId =
+        typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+      if (!sessionId) {
+        return { success: false, error: "sessionId is required" };
+      }
+      if (!isGraphExtractionEnabled()) {
+        return {
+          success: false,
+          skipped: true,
+          reason: "graph_extraction_disabled",
+        };
+      }
+      try {
+        await extractGraphSessionTail(sdk, kv, sessionId);
+        return { success: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn("graph-extract-session failed", { sessionId, error: message });
+        return { success: false, error: message };
+      }
+    },
+  );
+
   sdk.registerFunction(
     "event::session::ended",
     async (data: { sessionId: string }) => {

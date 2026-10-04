@@ -69,6 +69,32 @@ describe("api::graph-build endpoint (#666)", () => {
   });
 });
 
+// OpenCode's plugin only posts /session/end on explicit session deletion, so
+// idle sessions never reached the stop-bound graph extraction and the graph
+// froze at the last full build. The dedicated endpoint lets any client drive
+// the watermark-idempotent tail extraction without ending the session.
+describe("api::graph-extract-session endpoint", () => {
+  const api = readFileSync("src/triggers/api.ts", "utf-8");
+
+  it("registers the endpoint at /agentmemory/graph/extract-session", () => {
+    expect(api).toMatch(/registerFunction\("api::graph-extract-session"/);
+    expect(api).toMatch(
+      /api_path:\s*"\/agentmemory\/graph\/extract-session",\s*http_method:\s*"POST"/,
+    );
+  });
+
+  it("rejects a missing sessionId with 400", () => {
+    expect(api).toMatch(/error:\s*"sessionId is required"/);
+    expect(api).toMatch(/status_code:\s*400/);
+  });
+
+  it("fires mem::graph-extract-session with TriggerAction.Void", () => {
+    expect(api).toMatch(
+      /function_id:\s*"mem::graph-extract-session"[\s\S]*?action:\s*TriggerAction\.Void\(\)/,
+    );
+  });
+});
+
 // #666: `agentmemory status` showed Memories/Observations as 0 because it
 // fetched /agentmemory/export which times out on iii-engine's file-based
 // KV under concurrent kv.list() pressure. Switch to /memories for the
