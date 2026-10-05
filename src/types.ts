@@ -253,6 +253,11 @@ export interface FunctionMetrics {
   failureCount: number;
   avgLatencyMs: number;
   avgQualityScore: number;
+  windowStartedAt?: string;
+  windowMs?: number;
+  lastCallAt?: string;
+  lastFailureAt?: string;
+  qualitySampleCount?: number;
 }
 
 export interface HealthSnapshot {
