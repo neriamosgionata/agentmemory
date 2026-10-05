@@ -116,6 +116,7 @@ interface Validated {
   memoryIds?: string[];
   reason?: string;
   expandIds?: string[];
+  status?: string;
 }
 
 function parseExpandIds(raw: unknown): string[] | undefined {
@@ -187,6 +188,12 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
     }
     case "memory_sessions": {
       v.limit = parseLimit(args["limit"], 20);
+      if (typeof args["project"] === "string" && args["project"].trim()) {
+        v.project = args["project"].trim();
+      }
+      if (typeof args["status"] === "string" && args["status"].trim()) {
+        v.status = args["status"].trim();
+      }
       return v;
     }
     case "memory_governance_delete": {
@@ -263,8 +270,11 @@ async function handleProxy(
       return textResponse(result, true);
     }
     case "memory_sessions": {
+      const params = new URLSearchParams({ limit: String(v.limit) });
+      if (v.project != null) params.set("project", v.project);
+      if (v.status != null) params.set("status", v.status);
       const result = await handle.call(
-        `/agentmemory/sessions?limit=${v.limit}`,
+        `/agentmemory/sessions?${params.toString()}`,
         { method: "GET" },
       );
       return textResponse(result, true);
@@ -382,7 +392,15 @@ async function handleLocal(
       const sessions =
         await kvInstance.list<Record<string, unknown>>("mem:sessions");
       const limit = v.limit ?? 20;
-      return textResponse({ sessions: sessions.slice(0, limit) }, true);
+      const filtered = sessions
+        .filter((s) => v.project == null || s["project"] === v.project)
+        .filter((s) => v.status == null || s["status"] === v.status)
+        .sort((a, b) =>
+          String(b["startedAt"] ?? "").localeCompare(
+            String(a["startedAt"] ?? ""),
+          ),
+        );
+      return textResponse({ sessions: filtered.slice(0, limit) }, true);
     }
 
     case "memory_governance_delete": {

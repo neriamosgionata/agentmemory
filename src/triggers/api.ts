@@ -948,6 +948,8 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? validSessions.filter((s) => s.agentId === filterAgentId)
         : validSessions;
+      const normalizedStatus = asNonEmptyString(req.query_params?.["status"]);
+      const normalizedProject = asNonEmptyString(req.query_params?.["project"]);
       const requestedLimit = parseOptionalPositiveInt(
         req.query_params?.["limit"],
       );
@@ -957,10 +959,16 @@ export function registerApiTriggers(
           body: { error: "invalid numeric parameter: limit" },
         };
       }
+      const scoped = filtered
+        .filter((s) => !normalizedStatus || s.status === normalizedStatus)
+        .filter((s) => !normalizedProject || s.project === normalizedProject)
+        .sort((a, b) =>
+          String(b.startedAt ?? "").localeCompare(String(a.startedAt ?? "")),
+        );
       const limited =
         requestedLimit === undefined
-          ? filtered
-          : filtered.slice(0, Math.min(requestedLimit, 500));
+          ? scoped
+          : scoped.slice(0, Math.min(requestedLimit, 500));
       const summariesList = await kv.list<SessionSummary>(KV.summaries).catch(() => []);
       const summaryBySessionId = new Map<string, SessionSummary>();
       for (const sm of summariesList) {
@@ -972,7 +980,7 @@ export function registerApiTriggers(
       });
       return {
         status_code: 200,
-        body: { sessions: withSummary, total: filtered.length },
+        body: { sessions: withSummary, total: scoped.length },
       };
     },
   );
