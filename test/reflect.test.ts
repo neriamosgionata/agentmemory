@@ -272,6 +272,47 @@ describe("Reflect", () => {
       expect(provider.summarize).toHaveBeenCalledTimes(1);
     });
 
+    it("stops starting clusters once the wall-clock budget is spent", async () => {
+      await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+      await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+      await kv.set("mem:graph:nodes", "node_gamma", makeConceptNode("gamma"));
+      await kv.set("mem:graph:nodes", "node_delta", makeConceptNode("delta"));
+      await kv.set("mem:graph:nodes", "node_epsilon", makeConceptNode("epsilon"));
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+      await kv.set("mem:graph:edges", "edge_bg", makeEdge("beta", "gamma"));
+      await kv.set("mem:graph:edges", "edge_ga", makeEdge("gamma", "alpha"));
+      await kv.set("mem:graph:edges", "edge_de", makeEdge("delta", "epsilon"));
+
+      await kv.set("mem:semantic", "sem_a1", makeSemantic("alpha beta gamma pipeline"));
+      await kv.set("mem:semantic", "sem_a2", makeSemantic("alpha caching layer"));
+      await kv.set("mem:semantic", "sem_a3", makeSemantic("beta gamma queue"));
+      await kv.set("mem:semantic", "sem_b1", makeSemantic("delta epsilon storage"));
+      await kv.set("mem:semantic", "sem_b2", makeSemantic("delta epsilon index"));
+      await kv.set("mem:semantic", "sem_b3", makeSemantic("epsilon delta flush"));
+
+      vi.useFakeTimers({ now: new Date("2026-04-01T00:00:00Z") });
+      provider.summarize.mockImplementation(async () => {
+        vi.advanceTimersByTime(90_000);
+        return XML_RESPONSE;
+      });
+      process.env["AGENTMEMORY_REFLECT_BUDGET_MS"] = "50000";
+      try {
+        const result = (await sdk.trigger("mem::reflect", {})) as {
+          clustersProcessed: number;
+          newInsights: number;
+          budgetExhausted: boolean;
+        };
+
+        expect(result.clustersProcessed).toBe(1);
+        expect(result.newInsights).toBeGreaterThan(0);
+        expect(result.budgetExhausted).toBe(true);
+        expect(provider.summarize).toHaveBeenCalledTimes(1);
+      } finally {
+        delete process.env["AGENTMEMORY_REFLECT_BUDGET_MS"];
+        vi.useRealTimers();
+      }
+    });
+
     it("falls back to Jaccard grouping when graph is empty", async () => {
       await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("security testing prevents bugs"));
