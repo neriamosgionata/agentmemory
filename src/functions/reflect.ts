@@ -15,6 +15,21 @@ import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 
 export const INSIGHT_MAX_SOURCE_IDS = 20;
 
+// The engine bounds a function invocation (observed: 180s), and each cluster
+// costs one LLM round-trip. Without a wall-clock budget a large corpus pushes
+// mem::reflect past that bound, the invocation is killed, and no insights are
+// produced at all. Stop starting new clusters once the budget is spent so the
+// invocation returns partial progress and the next scheduled run continues.
+const DEFAULT_REFLECT_BUDGET_MS = 120_000;
+
+function getReflectBudgetMs(): number {
+  const raw = process.env["AGENTMEMORY_REFLECT_BUDGET_MS"];
+  if (!raw) return DEFAULT_REFLECT_BUDGET_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REFLECT_BUDGET_MS;
+  return Math.floor(parsed);
+}
+
 interface ConceptCluster {
   concepts: string[];
   facts: Array<{ fact: string; confidence: number }>;
@@ -206,10 +221,18 @@ export function registerReflectFunctions(
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
+      let clustersProcessed = 0;
       let totalInsights = 0;
+      let budgetExhausted = false;
+      const budgetMs = getReflectBudgetMs();
+      const startedAt = Date.now();
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
+        if (Date.now() - startedAt >= budgetMs) {
+          budgetExhausted = true;
+          break;
+        }
 
         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
 
@@ -239,6 +262,7 @@ export function registerReflectFunctions(
           clustersSkipped++;
           continue;
         }
+        clustersProcessed++;
 
         const cluster: ConceptCluster = {
           concepts: conceptNames,
@@ -344,9 +368,10 @@ export function registerReflectFunctions(
         await recordAudit(kv, "reflect", "mem::reflect", [], {
           newInsights,
           reinforced,
-          clustersProcessed: conceptClusters.length - clustersSkipped,
+          clustersProcessed,
           clustersSkipped,
           usedFallback,
+          budgetExhausted,
         });
       } catch {}
 
@@ -354,9 +379,10 @@ export function registerReflectFunctions(
         success: true,
         newInsights,
         reinforced,
-        clustersProcessed: conceptClusters.length - clustersSkipped,
+        clustersProcessed,
         clustersSkipped,
         usedFallback,
+        budgetExhausted,
       };
     },
   );

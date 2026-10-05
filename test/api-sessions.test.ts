@@ -102,6 +102,49 @@ describe("api::sessions (#1326)", () => {
     expect(res.body["total"]).toBe(5);
   });
 
+  it("filters by status/project and returns newest first", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses_old", {
+      ...session("ses_old"),
+      status: "active",
+      startedAt: "2026-09-01T00:00:00Z",
+    });
+    await kv.set(KV.sessions, "ses_new", {
+      ...session("ses_new"),
+      status: "completed",
+      startedAt: "2026-09-03T00:00:00Z",
+    });
+    await kv.set(KV.sessions, "ses_mid", {
+      ...session("ses_mid"),
+      status: "active",
+      startedAt: "2026-09-02T00:00:00Z",
+      project: "other",
+    });
+    const sdk = mockSdk();
+    registerApiTriggers(sdk as never, kv as never, SECRET);
+
+    const all = await callSessions(sdk);
+    expect(
+      (all.body["sessions"] as Array<Record<string, unknown>>).map(
+        (s) => s["id"],
+      ),
+    ).toEqual(["ses_new", "ses_mid", "ses_old"]);
+
+    const active = await callSessions(sdk, { status: "active" });
+    expect(active.body["total"]).toBe(2);
+    expect(
+      (active.body["sessions"] as Array<Record<string, unknown>>).map(
+        (s) => s["id"],
+      ),
+    ).toEqual(["ses_mid", "ses_old"]);
+
+    const scoped = await callSessions(sdk, { project: "other" });
+    expect(scoped.body["total"]).toBe(1);
+    expect(
+      (scoped.body["sessions"] as Array<Record<string, unknown>>)[0]?.["id"],
+    ).toBe("ses_mid");
+  });
+
   it("rejects a malformed limit", async () => {
     const kv = mockKV();
     const sdk = mockSdk();

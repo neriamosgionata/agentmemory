@@ -56,6 +56,70 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(calls.find((c) => c.url.includes("/sessions"))).toBeDefined();
   });
 
+  it("forwards project/status on memory_sessions", async () => {
+    let sessionsUrl = "";
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) {
+        return new Response("ok", { status: 200 });
+      }
+      if (url.includes("/agentmemory/sessions")) {
+        sessionsUrl = url;
+        return new Response(JSON.stringify({ sessions: [], total: 0 }), {
+          status: 200,
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await handleToolCall("memory_sessions", {
+      limit: 5,
+      project: "acme-widgets",
+      status: "active",
+    });
+
+    const parsed = new URL(sessionsUrl);
+    expect(parsed.pathname).toBe("/agentmemory/sessions");
+    expect(parsed.searchParams.get("limit")).toBe("5");
+    expect(parsed.searchParams.get("project")).toBe("acme-widgets");
+    expect(parsed.searchParams.get("status")).toBe("active");
+  });
+
+  it("local fallback filters memory_sessions by project/status and sorts newest first", async () => {
+    installFetch(() => {
+      throw new Error("ECONNREFUSED");
+    });
+    const localKv = new InMemoryKV(undefined);
+    await localKv.set("mem:sessions", "ses_old", {
+      id: "ses_old",
+      project: "proj-alpha",
+      status: "active",
+      startedAt: "2026-09-01T00:00:00Z",
+    });
+    await localKv.set("mem:sessions", "ses_new", {
+      id: "ses_new",
+      project: "proj-beta",
+      status: "completed",
+      startedAt: "2026-09-03T00:00:00Z",
+    });
+    await localKv.set("mem:sessions", "ses_mid", {
+      id: "ses_mid",
+      project: "proj-alpha",
+      status: "active",
+      startedAt: "2026-09-02T00:00:00Z",
+    });
+
+    const res = await handleToolCall(
+      "memory_sessions",
+      { project: "proj-alpha", status: "active" },
+      localKv,
+    );
+    const body = JSON.parse(res.content[0].text);
+    expect(body.sessions.map((s: { id: string }) => s.id)).toEqual([
+      "ses_mid",
+      "ses_old",
+    ]);
+  });
+
   it("forwards expandIds on memory_smart_search (#889)", async () => {
     let captured: Record<string, unknown> = {};
     installFetch((url, init) => {
