@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { hydrateHookEnv } from "./_env.js";
 hydrateHookEnv();
-
+import { shouldCaptureTool } from "./_capture-filter.js";
 import { resolveProject, hookCwd } from "./_project.js";
 import { isSelfCaptureTool } from "./self-capture.js";
 
@@ -39,6 +39,8 @@ async function main() {
 
   const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
   const toolName = data.tool_name ?? data.toolName;
+  if (!shouldCaptureTool(toolName)) return;
+
   const toolInput = data.tool_input ?? data.toolArgs;
   const error = data.error ?? data.errorMessage;
 
@@ -69,7 +71,7 @@ async function main() {
     }),
     signal: AbortSignal.timeout(3000),
   }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
+  setTimeout(() => process.exit(0), 3000).unref();
 }
 
 main().catch(() => process.exit(0));

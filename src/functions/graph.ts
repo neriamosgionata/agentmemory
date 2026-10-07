@@ -21,6 +21,7 @@ import {
 } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -128,6 +129,27 @@ async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
   }
 }
 
+async function readSnapshotStrict(kv: StateKV): Promise<GraphSnapshot | null> {
+  let raw: unknown;
+  try {
+    raw = await kv.get<unknown>(KV.graphSnapshot, SNAPSHOT_KEY);
+  } catch (err) {
+    logger.warn("Graph snapshot read failed, retrying once", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    raw = await kv.get<unknown>(KV.graphSnapshot, SNAPSHOT_KEY);
+  }
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "object" && (raw as { version?: unknown }).version === 1) {
+    return raw as GraphSnapshot;
+  }
+  throw new Error(
+    `Graph snapshot has unknown schema version: ${JSON.stringify(
+      (raw as { version?: unknown }).version,
+    )}`,
+  );
+}
+
 function buildSnapshotFromArrays(
   nodes: GraphNode[],
   edges: GraphEdge[],
@@ -187,9 +209,10 @@ function paginateFromSnapshot(
   const filteredNodes = filterType
     ? snap.topNodes.filter((n) => n.type === filterType)
     : snap.topNodes;
-  const total = filterType
+  const totalRaw = filterType
     ? snap.stats.nodesByType[filterType] ?? 0
     : snap.stats.totalNodes;
+  const total = Math.max(totalRaw, filteredNodes.length);
   const pageNodes = filteredNodes.slice(offset, offset + limit);
   const pageIds = new Set(pageNodes.map((n) => n.id));
   const pageEdges = snap.topEdges.filter(
@@ -644,7 +667,6 @@ export function extractGraphHeuristics(
 // maintenance — which also makes re-imports idempotent: an existing
 // (type, name) resolves through the name index and merges instead of
 // duplicating.
-//
 // #814 v2: targeted name-index lookups replace the O(n) scan over
 // `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the list payload
 // exceeds the iii heartbeat budget and the worker dies before merge can
@@ -655,7 +677,8 @@ export async function persistGraphDelta(
   edges: GraphEdge[],
   obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
-  const snap = (await readSnapshot(kv)) ?? emptySnapshot();
+  return withKeyedLock("graph:persist", async () => {
+  const snap = (await readSnapshotStrict(kv)) ?? emptySnapshot();
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
@@ -778,6 +801,7 @@ export async function persistGraphDelta(
   }
 
   return { newNodeCount, newEdgeCount };
+  });
 }
 
 export function registerGraphFunction(

@@ -42,6 +42,15 @@ function hydrateHookEnv(envPath = hookEnvPath()) {
 	for (const [key, value] of Object.entries(vars)) if (process.env[key] === void 0) process.env[key] = value;
 }
 //#endregion
+//#region src/hooks/_capture-filter.ts
+function preCompactBudget() {
+	const raw = process.env["AGENTMEMORY_PRE_COMPACT_BUDGET"];
+	if (raw?.trim() === "0") return 0;
+	if (!raw?.trim()) return 1500;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1500;
+}
+//#endregion
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -107,6 +116,8 @@ async function main() {
 			signal: AbortSignal.timeout(5e3)
 		});
 	} catch {}
+	const budget = preCompactBudget();
+	if (budget === 0) return;
 	try {
 		const res = await fetch(`${REST_URL}/agentmemory/context`, {
 			method: "POST",
@@ -114,7 +125,7 @@ async function main() {
 			body: JSON.stringify({
 				sessionId,
 				project,
-				budget: 1500
+				budget
 			}),
 			signal: AbortSignal.timeout(5e3)
 		});
