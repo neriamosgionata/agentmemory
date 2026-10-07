@@ -1,5 +1,10 @@
 import { drainSpool, parseSentMark, retainSent, spoolSummary, type SendOutcome, type SpoolRecord } from "../capture/spool.js";
-import { CURL_AUTH_HEADER } from "../functions/status.js";
+
+// Authorization header snippet for curl recovery commands, printed in
+// --drain output. Kept here (not in the skipped /status feature) because the
+// capture CLI is the only consumer.
+export const CURL_AUTH_HEADER =
+  '-H "Authorization: Bearer ${AGENTMEMORY_SECRET:-$(cat ~/.agentmemory/secret)}"';
 
 interface CaptureCommandOptions {
   base: string;

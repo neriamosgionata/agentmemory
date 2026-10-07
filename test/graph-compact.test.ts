@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -90,6 +90,19 @@ async function seedEdge(
 
 const node = (kv: KV, id: string) => kv.get<GraphNode>("mem:graph:nodes", id);
 const edge = (kv: KV, id: string) => kv.get<GraphEdge>("mem:graph:edges", id);
+
+const ORIG_GRAPH_MAX_SOURCE_IDS = process.env["GRAPH_MAX_SOURCE_IDS"];
+
+beforeEach(() => {
+  // These upstream tests assert the fixed 32-cap; fork keeps the cap
+  // configurable (default 10), so pin it for this file.
+  process.env["GRAPH_MAX_SOURCE_IDS"] = "32";
+});
+
+afterEach(() => {
+  if (ORIG_GRAPH_MAX_SOURCE_IDS === undefined) delete process.env["GRAPH_MAX_SOURCE_IDS"];
+  else process.env["GRAPH_MAX_SOURCE_IDS"] = ORIG_GRAPH_MAX_SOURCE_IDS;
+});
 
 describe("compactGraphProvenance", () => {
   it("trims an oversized node to the newest ids and keeps every other field", async () => {
@@ -529,6 +542,8 @@ describe("mem::graph-compact audit", () => {
     const scopes = [...new Set(kv.calls.set.map((k) => k.slice(0, k.lastIndexOf("/"))))].filter(
       (s) => /^mem:audit:\d{4}-\d{2}$/.test(s),
     );
+    // The fork keeps the single-scope audit store; read it too.
+    scopes.push("mem:audit");
     const rows = await Promise.all(
       scopes.map((s) =>
         kv.list<{ operation: string; functionId: string; details: Record<string, unknown> }>(s),

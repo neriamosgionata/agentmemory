@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -74,6 +74,19 @@ function mockSdk() {
     },
   };
 }
+
+const ORIG_GRAPH_MAX_SOURCE_IDS = process.env["GRAPH_MAX_SOURCE_IDS"];
+
+beforeEach(() => {
+  // These upstream tests assert the fixed 32-cap; fork keeps the cap
+  // configurable (default 10), so pin it for this file.
+  process.env["GRAPH_MAX_SOURCE_IDS"] = "32";
+});
+
+afterEach(() => {
+  if (ORIG_GRAPH_MAX_SOURCE_IDS === undefined) delete process.env["GRAPH_MAX_SOURCE_IDS"];
+  else process.env["GRAPH_MAX_SOURCE_IDS"] = ORIG_GRAPH_MAX_SOURCE_IDS;
+});
 
 describe("Snapshot Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
