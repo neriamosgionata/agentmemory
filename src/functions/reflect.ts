@@ -22,6 +22,13 @@ export const INSIGHT_MAX_SOURCE_IDS = 20;
 // invocation returns partial progress and the next scheduled run continues.
 const DEFAULT_REFLECT_BUDGET_MS = 120_000;
 
+// A cluster's LLM call cannot be interrupted once started, so the budget alone
+// is not enough: a call begun just under the budget can still push the whole
+// invocation past the engine's bound. Reserve room for one call before
+// starting another, falling back to this allowance until a real call duration
+// is observed in the current run.
+const DEFAULT_CALL_ALLOWANCE_MS = 45_000;
+
 function getReflectBudgetMs(): number {
   const raw = process.env["AGENTMEMORY_REFLECT_BUDGET_MS"];
   if (!raw) return DEFAULT_REFLECT_BUDGET_MS;
@@ -226,10 +233,13 @@ export function registerReflectFunctions(
       let budgetExhausted = false;
       const budgetMs = getReflectBudgetMs();
       const startedAt = Date.now();
+      let maxCallMs = 0;
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
-        if (Date.now() - startedAt >= budgetMs) {
+        const elapsedMs = Date.now() - startedAt;
+        const reserveMs = Math.max(maxCallMs, DEFAULT_CALL_ALLOWANCE_MS);
+        if (elapsedMs + reserveMs > budgetMs) {
           budgetExhausted = true;
           break;
         }
@@ -282,7 +292,9 @@ export function registerReflectFunctions(
 
         try {
           const prompt = buildReflectPrompt(cluster);
+          const callStartedAt = Date.now();
           const response = await provider.summarize(REFLECT_SYSTEM, prompt);
+          maxCallMs = Math.max(maxCallMs, Date.now() - callStartedAt);
 
           const insightRegex =
             /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
