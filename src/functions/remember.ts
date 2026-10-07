@@ -4,6 +4,8 @@ import type { Memory, Session } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { removeSessionFromProjectIndex } from "../state/session-index.js";
+import { unindexObservationSession } from "../state/obs-index.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
@@ -318,6 +320,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         if (!obs) return false;
         await markCaptureEventDeleted(kv, { ...obs, id: obsId, sessionId });
         await kv.delete(KV.observations(sessionId), obsId);
+        await unindexObservationSession(kv, obsId).catch(() => {});
         deletedObservationIds.push(obsId);
         getSearchIndex().remove(obsId);
         vectorIndexRemove(obsId);
@@ -380,6 +383,11 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           if (!session) return false;
           await kv.delete(KV.sessions, sessionId);
           deletedSession = true;
+          await removeSessionFromProjectIndex(
+            kv,
+            session.project,
+            sessionId,
+          ).catch(() => {});
           return true;
         });
         try {

@@ -9,6 +9,8 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { removeSessionFromProjectIndex } from "../state/session-index.js";
+import { unindexObservationSession } from "../state/obs-index.js";
 import { isConsolidationEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
@@ -210,10 +212,16 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 });
                 continue;
               }
+              await unindexObservationSession(kv, o.id).catch(() => {});
               getSearchIndex().remove(o.id);
               vectorIndexRemove(o.id);
               indexMutations++;
             }
+            await removeSessionFromProjectIndex(
+              kv,
+              session.project,
+              session.id,
+            ).catch(() => {});
             await clearSessionDerivedState(kv, session.id);
             await recordAudit(kv, "delete", "mem::evict", [session.id], {
               resource: "session",
@@ -252,6 +260,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               try {
                 await markCaptureEventDeleted(kv, o);
                 await kv.delete(KV.observations(session.id), o.id);
+                await unindexObservationSession(kv, o.id).catch(() => {});
                 deletedObs.push({ sessionId: session.id, obsId: o.id });
                 stats.lowImportanceObs++;
               } catch (err) {
@@ -300,6 +309,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               try {
                 await markCaptureEventDeleted(kv, o);
                 await kv.delete(KV.observations(o.sessionId), o.id);
+                await unindexObservationSession(kv, o.id).catch(() => {});
                 deletedObs.push({ sessionId: o.sessionId, obsId: o.id });
                 stats.capEvictions++;
               } catch (err) {

@@ -8,6 +8,7 @@ import type {
 } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { addSessionToProjectIndex } from "../state/session-index.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   isLlmActivityTrackingActive,
@@ -220,6 +221,16 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         ...(agentId ? { agentId } : {}),
       };
       await kv.set(KV.sessions, data.sessionId, session);
+      await addSessionToProjectIndex(kv, session.project, {
+        id: session.id,
+        startedAt: session.startedAt,
+        ...(agentId ? { agentId } : {}),
+      }).catch((err) => {
+        logger.warn("session index update failed", {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string; agentId?: string },
         { context: string }

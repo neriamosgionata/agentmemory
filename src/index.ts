@@ -47,6 +47,8 @@ import {
   setHybridRanker,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
+import { registerSessionIndexMaintenanceFunction } from "./functions/session-index-maintenance.js";
+import { rebuildSessionIndexIfStale } from "./state/session-index.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
 import { registerFileIndexFunction } from "./functions/file-index.js";
@@ -268,6 +270,18 @@ async function main() {
   registerRecompressFunction(sdk, kv);
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
+  registerSessionIndexMaintenanceFunction(sdk, kv);
+  void rebuildSessionIndexIfStale(kv)
+    .then((result) => {
+      if (result) {
+        bootLog(
+          `Session index rebuilt: ${result.projects} projects, ${result.sessions} sessions`,
+        );
+      }
+    })
+    .catch((err) => {
+      bootWarn(`Failed to rebuild session index at boot: ${String(err)}`);
+    });
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
   registerMigrateFunction(sdk, kv);
   registerFileIndexFunction(sdk, kv);

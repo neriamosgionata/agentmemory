@@ -4,6 +4,11 @@ import type { RawObservation, HookPayload, Origin, Session } from "../types.js";
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
 import { KV, STREAM, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { addSessionToProjectIndex } from "../state/session-index.js";
+import {
+  indexObservationSession,
+  unindexObservationSession,
+} from "../state/obs-index.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap, recordDedupSkip } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -227,6 +232,7 @@ export function registerObserveFunction(
             for (const victim of victims) {
               try {
                 await kv.delete(KV.observations(payload.sessionId), victim.id);
+                await unindexObservationSession(kv, victim.id).catch(() => {});
                 evicted++;
                 deletedObs.push({
                   sessionId: payload.sessionId,
@@ -299,6 +305,15 @@ export function registerObserveFunction(
         try {
 
           await kv.set(KV.observations(payload.sessionId), obsId, raw);
+          await indexObservationSession(kv, obsId, payload.sessionId).catch(
+            (err) => {
+              logger.warn("observation index update failed", {
+                obsId,
+                sessionId: payload.sessionId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            },
+          );
 
         } catch (error) {
           if (raw.imageData) {
@@ -392,11 +407,12 @@ export function registerObserveFunction(
               ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
               : undefined;
           const ts = new Date().toISOString();
+          const startedAt = payload.timestamp ?? ts;
           await kv.set(KV.sessions, payload.sessionId, {
             id: payload.sessionId,
             project: payload.project,
             cwd: payload.cwd,
-            startedAt: payload.timestamp ?? ts,
+            startedAt,
             updatedAt: ts,
             status: "active",
             observationCount: 1,
@@ -404,6 +420,16 @@ export function registerObserveFunction(
             ...(trimmedPrompt && trimmedPrompt.length > 0
               ? { firstPrompt: trimmedPrompt }
               : {}),
+          });
+          await addSessionToProjectIndex(kv, payload.project, {
+            id: payload.sessionId,
+            startedAt,
+            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+          }).catch((err) => {
+            logger.warn("session index update failed", {
+              sessionId: payload.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
         }
 
