@@ -7,7 +7,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, getVectorIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
 import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { logger } from "../logger.js";
@@ -70,7 +70,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           ? data.project.trim()
           : undefined;
 
-      return withKeyedLock("mem:remember", async () => {
+      const { memory, supersededId, nearMatch } = await withKeyedLock("mem:remember", async () => {
         // Candidate generation: query the BM25 index with the new content
         // and Jaccard-compare only the top hits, instead of walking the
         // full memory corpus on every save. The index receives every
@@ -199,50 +199,64 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         // restart-time rebuild will pick the memory up either way.
         try {
           getSearchIndex().add(memoryToObservation(memory));
+          scheduleIndexSave();
         } catch (err) {
           logger.warn("Failed to index saved memory into BM25", {
             memId: memory.id,
             error: err instanceof Error ? err.message : String(err),
           });
         }
-        await vectorIndexAddGuarded(
-          memory.id,
-          memory.sessionIds?.[0] ?? "memory",
-          memory.title + " " + memory.content,
-          { kind: "memory", logId: memory.id },
-        );
-        scheduleIndexSave();
-
-        if (supersededId) {
-          await sdk.trigger({
-            function_id: "mem::cascade-update",
-            payload: {
-              supersededMemoryId: supersededId,
-            },
-            action: TriggerAction.Void(),
-          });
-        }
-
-        logger.info("Memory saved", {
-          memId: memory.id,
-          type: memory.type,
-          project: memory.project,
-        });
-        // similarTo is advisory only: a close-but-not-superseding match
-        // the caller may want to consolidate via memory_update/forget.
-        return {
-          success: true,
-          memory,
-          ...(nearMatch && !supersededId
-            ? {
-                similarTo: {
-                  ...nearMatch,
-                  similarity: Math.round(nearMatch.similarity * 100) / 100,
-                },
-              }
-            : {}),
-        };
+        return { memory, supersededId, nearMatch };
       });
+
+      await vectorIndexAddGuarded(
+        memory.id,
+        memory.sessionIds?.[0] ?? "memory",
+        memory.title + " " + memory.content,
+        { kind: "memory", logId: memory.id },
+        (embedding) =>
+          withKeyedLock("mem:remember", async () => {
+            const current = await kv.get<Memory>(KV.memories, memory.id);
+            if (!current || current.isLatest === false) return false;
+            getVectorIndex()?.add(
+              memory.id,
+              memory.sessionIds?.[0] ?? "memory",
+              embedding,
+            );
+            scheduleIndexSave();
+            return true;
+          }),
+      );
+
+      if (supersededId) {
+        await sdk.trigger({
+          function_id: "mem::cascade-update",
+          payload: {
+            supersededMemoryId: supersededId,
+          },
+          action: TriggerAction.Void(),
+        });
+      }
+
+      logger.info("Memory saved", {
+        memId: memory.id,
+        type: memory.type,
+        project: memory.project,
+      });
+      // similarTo is advisory only: a close-but-not-superseding match
+      // the caller may want to consolidate via memory_update/forget.
+      return {
+        success: true,
+        memory,
+        ...(nearMatch && !supersededId
+          ? {
+              similarTo: {
+                ...nearMatch,
+                similarity: Math.round(nearMatch.similarity * 100) / 100,
+              },
+            }
+          : {}),
+      };
     },
   );
 
