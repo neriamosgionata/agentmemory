@@ -2235,8 +2235,8 @@ describe("index_persist audit gating", () => {
     }
   });
 
-  async function indexPersistEntries(): Promise<Array<{ operation: string }>> {
-    const entries = await kv.list<{ operation: string }>("mem:audit");
+  async function indexPersistEntries(): Promise<Array<{ operation: string; details: { action?: string } }>> {
+    const entries = await kv.list<{ operation: string; details: { action?: string } }>("mem:audit");
     return entries.filter((entry) => entry.operation === "index_persist");
   }
 
@@ -2264,7 +2264,12 @@ describe("index_persist audit gating", () => {
 
       await persistence.save();
 
-      expect((await indexPersistEntries()).length).toBeGreaterThan(0);
+      const entries = await indexPersistEntries();
+      expect(entries.length).toBeGreaterThan(0);
+      const actions = new Set(entries.map((entry) => entry.details.action));
+      expect(actions.has("shard_write")).toBe(true);
+      expect(actions.has("manifest_publish")).toBe(true);
+      expect(actions.has("delete")).toBe(true);
     },
   );
 
