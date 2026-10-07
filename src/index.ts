@@ -39,6 +39,7 @@ import { registerCompressFunction } from "./functions/compress.js";
 import { registerRecompressFunction } from "./functions/recompress.js";
 import {
   registerSearchFunction,
+  backfillMissingVectors,
   rebuildIndex,
   getSearchIndex,
   setVectorIndex,
@@ -517,6 +518,18 @@ async function main() {
     }
   }
 
+  if (vectorIndex) {
+    const replay = await indexPersistence
+      .replayPendingLog(embeddingProvider?.dimensions ?? 0)
+      .catch(() => null);
+    if (replay && replay.entries > 0) {
+      bootLog(
+        `Recovered ${replay.added} vectors and ${replay.removed} removals written after the last index save, without calling the embedding provider` +
+          (replay.skipped > 0 ? ` (${replay.skipped} entries skipped)` : ""),
+      );
+    }
+  }
+
   // A vector load that rejected every bucket it read is the one failure BM25
   // cannot stand in for: BM25 restores fine, so the store looks healthy, while
   // the vectors sit on disk unreadable and nothing re-reads them. Rebuilding is
@@ -623,6 +636,33 @@ async function main() {
         `[agentmemory] Failed to backfill memories into BM25:`,
         err,
       );
+    }
+    if (vectorIndex && embeddingProvider && bm25Index.size > 0) {
+      const marker = await indexPersistence
+        .readBackfillMarker()
+        .catch(() => null);
+      if (marker !== null && vectorIndex.size >= bm25Index.size) {
+        await indexPersistence.clearBackfillMarker().catch(() => undefined);
+      } else if (vectorIndex.size < bm25Index.size || marker !== null) {
+        await indexPersistence
+          .markBackfillSince(new Date().toISOString())
+          .catch(() => undefined);
+        void (async () => {
+          try {
+            const result = await backfillMissingVectors(kv);
+            if (result.complete)
+              await indexPersistence.clearBackfillMarker().catch(() => {});
+            if (result.added > 0)
+              bootLog(`Vector index backfilled: ${result.added} entries`);
+            if (!result.complete)
+              bootWarn(
+                `Vector backfill stopped with ${result.remaining} documents still missing a vector. They are retried on the next start.`,
+              );
+          } catch (err) {
+            console.warn(`[agentmemory] Failed to backfill vectors:`, err);
+          }
+        })();
+      }
     }
   }
 
