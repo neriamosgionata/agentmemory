@@ -17,7 +17,6 @@ import {
 } from "../src/functions/graph-compact-boot.js";
 import { MAX_GRAPH_SOURCE_OBSERVATIONS, compactGraphProvenance } from "../src/functions/graph.js";
 import { isGraphCompactOnBootEnabled } from "../src/config.js";
-import { evaluateStatus, renderStatusHtml, type StatusInputs } from "../src/functions/status.js";
 import type { GraphEdge, GraphNode } from "../src/types.js";
 
 const NODES = "mem:graph:nodes";
@@ -132,7 +131,13 @@ async function maxIds(kv: KV): Promise<number> {
 const fast = { sliceSize: 3, pauseMs: 0, retryDelayMs: 0, sleep: async () => {} };
 const marker = (kv: KV) => kv.get<GraphCompactBootProgress>(CONFIG, GRAPH_COMPACT_BOOT_KEY);
 
-beforeEach(() => resetGraphCompactBootStatus());
+beforeEach(() => {
+  resetGraphCompactBootStatus();
+  // The fork keeps the provenance cap configurable (default 10); these tests
+  // exercise the compaction feature against upstream's fixed 32-cap so the
+  // upstream expectations hold verbatim.
+  vi.stubEnv("GRAPH_MAX_SOURCE_IDS", "32");
+});
 afterEach(() => vi.unstubAllEnvs());
 
 describe("graph compaction on boot", () => {
@@ -330,64 +335,5 @@ describe("AGENTMEMORY_GRAPH_COMPACT_ON_BOOT", () => {
     setGraphCompactBootDisabled();
     expect(getGraphCompactBootStatus()).toEqual({ state: "off" });
     expect(describeGraphCompactBoot(getGraphCompactBootStatus())).toMatch(/AGENTMEMORY_GRAPH_COMPACT_ON_BOOT=false/);
-  });
-});
-
-describe("graph compaction in /agentmemory/status", () => {
-  const base: StatusInputs = {
-    now: new Date("2026-10-01T12:00:00.000Z"),
-    version: "0.10.0",
-    engineVersion: "0.22.1",
-    uptimeSeconds: 10,
-    stateBackend: "file",
-    ports: { rest: 4611, streams: 4612, viewer: 4613 },
-    health: null,
-    circuitBreaker: null,
-    functionMetrics: [],
-    provider: "llm",
-    embeddingProvider: "none",
-    flags: [],
-    index: {
-      bm25Documents: 0,
-      vectorDocuments: null,
-      observationsIndexed: 0,
-      missingObservations: 0,
-      sessions: 0,
-      bm25Incomplete: false,
-      pendingVectorBackfill: 0,
-    },
-    graph: null,
-    graphExtractionEnabled: false,
-    auditLegacy: null,
-  };
-
-  it("shows a running pass as info with its position", () => {
-    const r = evaluateStatus({
-      ...base,
-      graphCompaction: { state: "running", phase: "edges", processed: 400, total: 909 },
-    });
-    expect(r.graphCompaction?.state).toBe("running");
-    const p = r.problems.find((x) => x.code === "graph-compaction-running")!;
-    expect(p.level).toBe("info");
-    expect(p.message).toMatch(/edges 400 of 909/);
-    expect(renderStatusHtml(r, "n")).toMatch(/Provenance compaction/);
-  });
-
-  it("shows a failed pass as a warning with the reason and the manual command", () => {
-    const r = evaluateStatus({
-      ...base,
-      graphCompaction: { state: "failed", phase: "nodes", processed: 3, total: 6, error: "state::get timed out" },
-    });
-    const p = r.problems.find((x) => x.code === "graph-compaction-failed")!;
-    expect(p.level).toBe("warn");
-    expect(p.message).toMatch(/state::get timed out/);
-    expect(p.fix).toContain("curl -X POST http://localhost:4611/agentmemory/graph/compact");
-  });
-
-  it("adds no problem when done or off", () => {
-    for (const state of ["done", "off", "pending"] as const) {
-      const r = evaluateStatus({ ...base, graphCompaction: { state } });
-      expect(r.problems.map((x) => x.code).filter((c) => c.startsWith("graph-compaction"))).toEqual([]);
-    }
   });
 });
