@@ -17,7 +17,12 @@ import {
   setIndexPersistence,
 } from "../src/functions/search.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
+import { KV } from "../src/state/schema.js";
 import type { Memory } from "../src/types.js";
+
+// The fork keeps the single-scope audit store; upstream's monthly-scope
+// helper does not exist here.
+const currentAuditScope = (): string => KV.audit;
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();

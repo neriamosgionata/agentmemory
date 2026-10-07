@@ -34,15 +34,18 @@ export function configuredSaveIntervalMs(renderedConfig: string): number | null 
 }
 
 export const ENGINE_DEFAULT_SAVE_INTERVAL_MS = 5000;
-export const AGENTMEMORY_STATE_SAVE_INTERVAL_MS = 2000;
 export const ENGINE_FLUSH_MARGIN_MS = 1500;
+export const ENGINE_FLUSH_WAIT_CAP_MS = 15_000;
 
 export function engineFlushWaitMs(
   stateBackend: "file" | "redis",
   configTexts: readonly string[],
 ): number {
   if (stateBackend === "redis") return 0;
-  return engineSaveIntervalMs(configTexts) + ENGINE_FLUSH_MARGIN_MS;
+  const interval =
+    configTexts.map(configuredSaveIntervalMs).find((ms) => ms !== null) ??
+    ENGINE_DEFAULT_SAVE_INTERVAL_MS;
+  return Math.min(interval + ENGINE_FLUSH_MARGIN_MS, ENGINE_FLUSH_WAIT_CAP_MS);
 }
 
 export function captureDurableAfterMs(
