@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execSync } from "node:child_process";
+import { captureObservation, isDrainChild, runDrainChild, withEventId } from "./_capture.mjs";
 //#region src/hooks/_env.ts
 function hookEnvPath() {
 	return join(homedir(), ".agentmemory", ".env");
@@ -79,14 +80,10 @@ function isSdkChildContext(payload) {
 	if (!payload || typeof payload !== "object") return false;
 	return payload.entrypoint === "sdk-ts";
 }
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-function authHeaders() {
-	const h = { "Content-Type": "application/json" };
-	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-	return h;
-}
+const OBSERVE_TIMEOUT_MS = 3e3;
+const EXIT_CAP_MS = 3500;
 async function main() {
+	if (isDrainChild()) return runDrainChild();
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
 	let data;
@@ -99,20 +96,15 @@ async function main() {
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const cwd = hookCwd(data) || process.cwd();
-	fetch(`${REST_URL}/agentmemory/observe`, {
-		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({
-			hookType: "prompt_submit",
-			sessionId,
-			project: resolveProject(cwd),
-			cwd,
-			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-			data: { prompt: data.prompt ?? data.userPrompt }
-		}),
-		signal: AbortSignal.timeout(3e3)
-	}).catch(() => {});
-	setTimeout(() => process.exit(0), 3e3).unref();
+	captureObservation(withEventId({
+		hookType: "prompt_submit",
+		sessionId,
+		project: resolveProject(cwd),
+		cwd,
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		data: { prompt: data.prompt ?? data.userPrompt }
+	}, data), OBSERVE_TIMEOUT_MS);
+	setTimeout(() => process.exit(0), EXIT_CAP_MS).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

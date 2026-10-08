@@ -86,6 +86,8 @@ import { knownAgents } from "./cli/connect/index.js";
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
 import { resolveDataDir } from "./cli-data-dir.js";
+import { runCaptureCommand } from "./cli/capture.js";
+import { bearerHeaders, resolveClientSecret } from "./secret-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -217,6 +219,10 @@ Commands:
   mcp                Start standalone MCP shim — opt-in surface for MCP-only clients
                      (Cursor, Gemini CLI, etc). REST always available at :3111.
   import-jsonl [p]   Import Claude Code JSONL transcripts (default: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects)
+  capture [--drain]  Show capture health: the local offline spool and the server
+                     inbox (pending, retrying, dead letters). --drain sends
+                     spooled observations now. --json for machine output.
+  import-jsonl [p]   Import Claude Code JSONL transcripts (default: ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
 
@@ -241,6 +247,9 @@ Environment:
   AGENTMEMORY_USE_DOCKER=1     Prefer the bundled docker-compose path over the
                                native iii-engine binary on first run.
   AGENTMEMORY_III_VERSION      Override pinned iii-engine version (default ${IIPINNED_VERSION}).
+  AGENTMEMORY_III_CONFIG       Engine config to start from (default: ./iii-config.yaml,
+                               then ~/.agentmemory/iii-config.yaml, then the bundled
+                               loopback-only config).
   AGENTMEMORY_FOLLOWUP_WINDOW_SECONDS
                                Window (seconds) for the smart-search follow-up diagnostic
                                (default 30). Long values overcount, short values undercount.
@@ -268,7 +277,7 @@ if (toolsIdx !== -1 && args[toolsIdx + 1]) {
   process.env["AGENTMEMORY_TOOLS"] = toolsMode;
 }
 
-const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp"]);
+const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture"]);
 let hasExplicitLocalPortOverride = false;
 let selectedInstance = 0;
 
@@ -2248,9 +2257,7 @@ async function main() {
 
 async function apiFetch<T = unknown>(base: string, path: string, timeoutMs = 5000): Promise<T | null> {
   try {
-    const headers: Record<string, string> = {};
-    const secret = process.env["AGENTMEMORY_SECRET"];
-    if (secret) headers["Authorization"] = `Bearer ${secret}`;
+    const headers: Record<string, string> = bearerHeaders(base);
     const res = await fetch(`${base}/agentmemory/${path}`, {
       signal: AbortSignal.timeout(timeoutMs),
       headers,
@@ -2918,7 +2925,7 @@ async function postJson<T = unknown>(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -2936,7 +2943,7 @@ async function postJsonStrict<T = unknown>(
 ): Promise<T | null> {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -2978,7 +2985,7 @@ async function seedDemoSession(
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(5000),
       });
@@ -3825,12 +3832,10 @@ async function runImportJsonl(): Promise<void> {
   }
 
   const body: Record<string, unknown> = {};
-  if (pathArg) body["path"] = pathArg;
+  if (pathArg) body["path"] = resolve(pathArg.startsWith("~") ? join(homedir(), pathArg.slice(1)) : pathArg);
   if (maxFiles !== undefined) body["maxFiles"] = maxFiles;
 
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const secret = process.env["AGENTMEMORY_SECRET"];
-  if (secret) headers["authorization"] = `Bearer ${secret}`;
+  const headers: Record<string, string> = { "content-type": "application/json", ...bearerHeaders(base) };
 
   p.log.info(
     `Importing JSONL from ${pathArg || join(claudeConfigDir(), "projects")}…`,
@@ -4107,6 +4112,15 @@ async function runRemove(): Promise<void> {
   );
 }
 
+async function runCapture(): Promise<void> {
+  const code = await runCaptureCommand({
+    base: getBaseUrl(),
+    args: args.slice(1),
+    secret: resolveClientSecret(getBaseUrl()),
+  });
+  process.exit(code);
+}
+
 const commands: Record<string, () => Promise<void>> = {
   init: runInit,
   connect: runConnectCmd,
@@ -4118,6 +4132,7 @@ const commands: Record<string, () => Promise<void>> = {
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
+  capture: runCapture,
 };
 
 const first = args[0] ?? "";

@@ -145,24 +145,14 @@ export async function vectorIndexAddGuarded(
   sessionId: string,
   text: string,
   context: { kind: "memory" | "observation" | "synthetic"; logId: string },
+  commit?: (embedding: Float32Array) => Promise<boolean> | boolean,
 ): Promise<boolean> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
   if (!vi || !ep) return false
+  let embedding: Float32Array
   try {
-    const embedding = await ep.embed(clipEmbedInput(text))
-    if (embedding.length !== ep.dimensions) {
-      logger.warn("vector-index add: dimension mismatch — skipping", {
-        kind: context.kind,
-        id: context.logId,
-        provider: ep.name,
-        expected: ep.dimensions,
-        received: embedding.length,
-      })
-      return false
-    }
-    vi.add(id, sessionId, embedding)
-    return true
+    embedding = await ep.embed(clipEmbedInput(text))
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
       kind: context.kind,
@@ -172,6 +162,31 @@ export async function vectorIndexAddGuarded(
     })
     return false
   }
+  if (embedding.length !== ep.dimensions) {
+    logger.warn("vector-index add: dimension mismatch — skipping", {
+      kind: context.kind,
+      id: context.logId,
+      provider: ep.name,
+      expected: ep.dimensions,
+      received: embedding.length,
+    })
+    return false
+  }
+  if (commit) {
+    try {
+      return await commit(embedding)
+    } catch (err) {
+      logger.warn("vector-index add: commit failed — skipping", {
+        kind: context.kind,
+        id: context.logId,
+        provider: ep.name,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return false
+    }
+  }
+  vi.add(id, sessionId, embedding)
+  return true
 }
 
 // Batched variant: calls EmbeddingProvider.embedBatch ONCE for the whole
@@ -265,6 +280,109 @@ function getRebuildEmbedBatchSize(): number {
   if (!raw) return DEFAULT_REBUILD_EMBED_BATCH
   const n = parseInt(raw, 10)
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
+}
+
+export type VectorBackfillJob = {
+  id: string;
+  sessionId: string;
+  text: string;
+  context: { kind: "memory" | "observation" | "synthetic"; logId: string };
+};
+
+export type VectorBackfillResult = {
+  added: number;
+  failed: number;
+  remaining: number;
+  complete: boolean;
+};
+
+export async function collectMissingVectorJobs(
+  kv: StateKV,
+): Promise<VectorBackfillJob[]> {
+  const vi = vectorIndex;
+  if (!vi || !currentEmbeddingProvider) return [];
+  const jobs: VectorBackfillJob[] = [];
+  try {
+    const memories = await kv.list<Memory>(KV.memories);
+    for (const memory of memories) {
+      if (memory.isLatest === false) continue;
+      if (!memory.title || !memory.content) continue;
+      if (vi.has(memory.id)) continue;
+      jobs.push({
+        id: memory.id,
+        sessionId: memory.sessionIds?.[0] ?? "memory",
+        text: memory.title + " " + memory.content,
+        context: { kind: "memory", logId: memory.id },
+      });
+    }
+  } catch (err) {
+    logger.warn("backfillMissingVectors: failed to load memories", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  let sessions: Session[];
+  try {
+    sessions = await kv.list<Session>(KV.sessions);
+  } catch (err) {
+    logger.warn("backfillMissingVectors: failed to load sessions", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return jobs;
+  }
+  for (let batch = 0; batch < sessions.length; batch += 10) {
+    const chunk = sessions.slice(batch, batch + 10);
+    const results = await Promise.all(
+      chunk.map(async (s) => {
+        try {
+          return await kv.list<CompressedObservation>(KV.observations(s.id));
+        } catch {
+          return [] as CompressedObservation[];
+        }
+      }),
+    );
+    for (const obs of results.flat()) {
+      if (!obs.title || !obs.narrative) continue;
+      if (vi.has(obs.id)) continue;
+      jobs.push({
+        id: obs.id,
+        sessionId: obs.sessionId,
+        text: obs.title + " " + obs.narrative,
+        context: { kind: "observation", logId: obs.id },
+      });
+    }
+  }
+  return jobs;
+}
+
+const BACKFILL_SAVE_EVERY_BATCHES = 10;
+
+export async function backfillMissingVectors(
+  kv: StateKV,
+): Promise<VectorBackfillResult> {
+  const jobs = await collectMissingVectorJobs(kv);
+  const batchSize = getRebuildEmbedBatchSize();
+  let added = 0;
+  let failed = 0;
+  let batchesSinceSave = 0;
+  for (let offset = 0; offset < jobs.length; offset += batchSize) {
+    const batch = jobs
+      .slice(offset, offset + batchSize)
+      .filter((job) => !vectorIndex?.has(job.id));
+    if (batch.length === 0) continue;
+    const result = await vectorIndexAddBatchGuarded(batch);
+    added += result.ok;
+    failed += result.fail;
+    batchesSinceSave++;
+    if (batchesSinceSave >= BACKFILL_SAVE_EVERY_BATCHES) {
+      await flushIndexSave();
+      batchesSinceSave = 0;
+    }
+    if (result.ok === 0) {
+      return { added, failed, remaining: jobs.length - offset, complete: false };
+    }
+  }
+  if (added > 0) await flushIndexSave();
+  return { added, failed, remaining: failed, complete: failed === 0 };
 }
 
 // Shared BM25 + batched-vector indexing for a set of records. The full

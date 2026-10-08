@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { SearchIndex } from "./search-index.js";
-import { VectorIndex } from "./vector-index.js";
+import { VectorIndex, base64ToFloat32, float32ToBase64, type VectorEntry } from "./vector-index.js";
 import type { StateKV } from "./kv.js";
 import { KV, generateId } from "./schema.js";
 import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
+import { getIndexSaveIntervalMs } from "../config.js";
 
-const DEBOUNCE_MS = 5000;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
 const INDEX_PERSISTENCE_FUNCTION_ID = "mem::index-persistence";
 const BM25_KEY = "data";
@@ -36,6 +36,24 @@ type GenerationRegistry = {
 const VECTOR_BUCKET_SCOPE = `${KV.bm25Index}:vectors:v2`;
 const DEFAULT_VECTOR_BUCKETS = 256;
 const MAX_BUCKET_CHUNKS = 10_000;
+const PENDING_CLEAR_KEY = "~clear";
+const PENDING_LOG_SAVE_THRESHOLD = 500;
+const EARLY_SAVE_MIN_GAP_MS = 5_000;
+const BACKFILL_MARKER_KEY = "vectors:backfill";
+
+// mem:audit exists to record structural deletions of user data — that is
+// the policy stated at the top of src/functions/audit.ts. Index shard
+// writes and manifest publishes remove no user rows, so they fall outside
+// it, yet a single save() emits three of them: on a real store they
+// reached 59876 of 84028 entries (71%), which is what makes the audit log
+// slow to query and bloats startup. Off by default; set
+// AGENTMEMORY_AUDIT_INDEX_PERSIST=1 when debugging index persistence.
+function auditIndexPersistEnabled(): boolean {
+  const raw = process.env.AGENTMEMORY_AUDIT_INDEX_PERSIST;
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === "1" || normalized === "true";
+}
 
 type IndexShardManifest = {
   v: 1;
@@ -204,12 +222,84 @@ function bucketBodyMatches(body: string, expected: string): boolean {
   );
 }
 
+type PendingVectorRow = {
+  q: number;
+  id?: string;
+  s?: string;
+  e?: string;
+  t?: 1;
+  c?: 1;
+};
+
+type BackfillMarker = {
+  v: 1;
+  since: string;
+};
+
+export interface PendingReplayResult {
+  entries: number;
+  added: number;
+  removed: number;
+  cleared: boolean;
+  skipped: number;
+}
+
+function isPendingVectorRow(row: unknown): row is PendingVectorRow {
+  if (!row || typeof row !== "object") return false;
+  const candidate = row as PendingVectorRow;
+  if (typeof candidate.q !== "number" || !Number.isFinite(candidate.q))
+    return false;
+  if (candidate.c === 1) return true;
+  if (typeof candidate.id !== "string" || candidate.id.length === 0)
+    return false;
+  return candidate.t === 1 || typeof candidate.e === "string";
+}
+
+async function inPendingBatches<T>(
+  items: T[],
+  size: number,
+  run: (item: T) => Promise<void>,
+): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  for (let offset = 0; offset < items.length; offset += size) {
+    const results = await Promise.allSettled(
+      items.slice(offset, offset + size).map(run),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+  }
+  return failures;
+}
+
 type IndexPersistenceOptions = {
   shardChars?: number;
   createGeneration?: () => string;
   vectorBuckets?: number;
   sweepGracePeriodMs?: number;
+  now?: () => number;
+  saveIntervalMs?: number;
 };
+
+export type IndexLeg = "bm25" | "vector";
+
+export interface IndexLegStatus {
+  pending: boolean;
+  savedAt: string | null;
+  dropped: number;
+  lastError: string | null;
+}
+
+export interface IndexPersistenceStatus {
+  saveIntervalMs: number;
+  saving: boolean;
+  bm25: IndexLegStatus;
+  vector: IndexLegStatus | null;
+}
+
+function emptyLegStatus(): IndexLegStatus {
+  return { pending: false, savedAt: null, dropped: 0, lastError: null };
+}
 
 function vectorBucketCount(options: IndexPersistenceOptions): number {
   const configured = options.vectorBuckets;
@@ -259,7 +349,7 @@ function isValidShardDescriptor(
 
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private lastFailureLogAt = 0;
+  private lastFailureLogAt = new Map<IndexLeg, number>();
   /**
    * Set when a vector load could not read everything the manifest named.
    *
@@ -284,23 +374,62 @@ export class IndexPersistence {
    */
   private vectorLoadRejected = false;
   private saveQueue: Promise<void> = Promise.resolve();
+  private stopped = false;
+  private lastSaveAt: number;
+  private readonly now: () => number;
+  private readonly saveIntervalMs: number;
+  private running: Promise<void> | null = null;
+  private queued: Promise<void> | null = null;
+  private dirtyEpoch = 0;
+  private legs: Record<IndexLeg, IndexLegStatus> = {
+    bm25: emptyLegStatus(),
+    vector: emptyLegStatus(),
+  };
+  private seq = 0;
+  private pendingLog: Map<string, number> = new Map();
+  private logChains: Map<string, Promise<void>> = new Map();
+  private logSuppressed = false;
+  private pendingLogUnknown = false;
+  private pendingLogError: string | null = null;
+  private earlySaveQueued = false;
 
   constructor(
     private kv: StateKV,
     private bm25: SearchIndex,
     private vector: VectorIndex | null,
     private options: IndexPersistenceOptions = {},
-  ) {}
+  ) {
+    this.vector?.setChangeListener((id, entry) => this.logChange(id, entry));
+    this.now = options.now ?? Date.now;
+    const interval = options.saveIntervalMs;
+    this.saveIntervalMs =
+      typeof interval === "number" && Number.isFinite(interval) && interval > 0
+        ? interval
+        : getIndexSaveIntervalMs();
+    this.lastSaveAt = this.now();
+  }
 
   scheduleSave(): void {
-    if (this.timer) clearTimeout(this.timer);
-    // setTimeout discards the returned promise, so any rejection inside
-    // save() would surface as unhandledRejection and crash the process
-    // under sustained iii-engine write timeouts (issue #204). Funnel
-    // rejections through logFailure() instead.
+    if (this.stopped) return;
+    this.dirtyEpoch++;
+    for (const leg of this.activeLegs()) {
+      this.legs[leg].pending = true;
+    }
+    if (this.timer || (this.running && this.queued)) {
+      for (const leg of this.activeLegs()) {
+        this.legs[leg].dropped++;
+      }
+      return;
+    }
+    const delay = Math.max(0, this.lastSaveAt + this.saveIntervalMs - this.now());
     this.timer = setTimeout(() => {
-      this.save().catch((err) => this.logFailure(err));
-    }, DEBOUNCE_MS);
+      this.timer = null;
+      this.save().catch((err) =>
+        logger.warn("index persistence: scheduled save threw outside leg handling", {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }, delay);
   }
 
   /**
@@ -319,43 +448,105 @@ export class IndexPersistence {
     return next;
   }
 
-  async save(): Promise<void> {
-    // Serialize saves: the debounce timer alone cannot prevent an explicit
-    // save() (shutdown flush, delete path) from overlapping a debounce-driven
-    // one and publishing a torn generation. Queueing keeps each generation
-    // whole.
-    const run = async (): Promise<void> => {
-      if (this.timer) {
-        clearTimeout(this.timer);
-        this.timer = null;
-      }
-      // Vectors first. This is the save that has been failing in production — it
-      // is the larger of the two and it runs second, so a BM25 save that consumes
-      // the engine's budget starves it. Going first also makes a vector delete
-      // durable before anything else can get in the way, which is what
-      // flushIndexSave is awaited for on the delete paths.
-      //
-      // Each index gets its own try. One try around both would let a failure in
-      // whichever runs first stop the other from persisting at all — harmless
-      // when BM25 led and vectors trailed, but reversing the order without this
-      // would make a vector failure silently block BM25 too.
-      if (this.vector) {
-        try {
-          await this.saveVectorBuckets(this.vector);
-        } catch (err) {
-          this.logFailure(err);
-        }
-      }
-      try {
-        await this.saveBm25Index(this.bm25.serialize());
-      } catch (err) {
-        this.logFailure(err);
-      }
-    };
+  save(): Promise<void> {
+    this.clearTimer();
+    if (this.queued) return this.queued;
+    if (this.running) {
+      const queued = this.running.then(
+        () => {
+          this.queued = null;
+          return this.startRun();
+        },
+        () => {
+          this.queued = null;
+          return this.startRun();
+        },
+      );
+      this.queued = queued;
+      return queued;
+    }
+    return this.startRun();
+  }
 
-    const next = this.saveQueue.then(run, run);
-    this.saveQueue = next;
-    await next;
+  status(): IndexPersistenceStatus {
+    return {
+      saveIntervalMs: this.saveIntervalMs,
+      saving: this.running !== null,
+      bm25: { ...this.legs.bm25 },
+      vector: this.vector ? { ...this.legs.vector } : null,
+    };
+  }
+
+  private clearTimer(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private activeLegs(): IndexLeg[] {
+    return this.vector ? ["bm25", "vector"] : ["bm25"];
+  }
+
+  private startRun(): Promise<void> {
+    const run = this.saveQueue.then(
+      () => this.runSave(),
+      () => this.runSave(),
+    );
+    this.saveQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    const tracked = run.finally(() => {
+      if (this.running === tracked) this.running = null;
+    });
+    this.running = tracked;
+    return tracked;
+  }
+
+  private async runSave(): Promise<void> {
+    const coveredSeq = this.seq;
+    this.lastSaveAt = this.now();
+    // Vectors first. This is the save that has been failing in production — it
+    // is the larger of the two and it runs second, so a BM25 save that consumes
+    // the engine's budget starves it. Going first also makes a vector delete
+    // durable before anything else can get in the way, which is what
+    // flushIndexSave is awaited for on the delete paths.
+    //
+    // Each index gets its own leg. One try around both would let a failure in
+    // whichever runs first stop the other from persisting at all — harmless
+    // when BM25 led and vectors trailed, but reversing the order without this
+    // would make a vector failure silently block BM25 too.
+    if (this.vector) {
+      const vector = this.vector;
+      await this.saveLeg("vector", async () => {
+        await this.saveVectorBuckets(vector);
+        await this.clearCoveredPendingLog(coveredSeq).catch((err) => {
+          this.pendingLogError = errorMessage(err);
+          this.logFailure("vector", err);
+        });
+      });
+    }
+    await this.saveLeg("bm25", async () => {
+      await this.saveBm25Index(this.bm25.serialize());
+    });
+  }
+
+  private async saveLeg(leg: IndexLeg, run: () => Promise<void>): Promise<void> {
+    const status = this.legs[leg];
+    const epoch = this.dirtyEpoch;
+    try {
+      await run();
+      status.savedAt = new Date(this.now()).toISOString();
+      status.lastError = null;
+      if (this.dirtyEpoch === epoch) {
+        status.pending = false;
+      }
+    } catch (err) {
+      status.lastError = errorMessage(err);
+      status.pending = true;
+      this.logFailure(leg, err);
+    }
   }
 
   async load(): Promise<{
@@ -528,10 +719,224 @@ export class IndexPersistence {
   }
 
   stop(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    this.stopped = true;
+    this.clearTimer();
+  }
+
+  pendingLogSize(): number {
+    return this.vector ? this.pendingLog.size : 0;
+  }
+
+  pendingLogWriteError(): string | null {
+    return this.pendingLogError;
+  }
+
+  async replayPendingLog(
+    expectedDimensions = 0,
+  ): Promise<PendingReplayResult> {
+    const result: PendingReplayResult = {
+      entries: 0,
+      added: 0,
+      removed: 0,
+      cleared: false,
+      skipped: 0,
+    };
+    const vector = this.vector;
+    if (!vector) return result;
+    let rows: unknown[];
+    try {
+      rows = await this.kv.list<unknown>(KV.vectorPendingLog);
+    } catch (err) {
+      this.pendingLogUnknown = true;
+      this.pendingLogError = errorMessage(err);
+      logger.warn("index persistence: could not read the pending vector log", {
+        message: this.pendingLogError,
+      });
+      return result;
     }
+    const valid = (Array.isArray(rows) ? rows : [])
+      .filter(isPendingVectorRow)
+      .sort((a, b) => a.q - b.q);
+    this.logSuppressed = true;
+    try {
+      for (const row of valid) {
+        result.entries++;
+        const key = row.c === 1 ? PENDING_CLEAR_KEY : row.id!;
+        if ((this.pendingLog.get(key) ?? -Infinity) < row.q)
+          this.pendingLog.set(key, row.q);
+        if (row.q > this.seq) this.seq = row.q;
+        if (row.c === 1) {
+          vector.clear();
+          result.cleared = true;
+          continue;
+        }
+        const id = row.id!;
+        if (row.t === 1) {
+          if (vector.has(id)) {
+            vector.remove(id);
+            result.removed++;
+          }
+          continue;
+        }
+        let embedding: Float32Array;
+        try {
+          embedding = base64ToFloat32(row.e!);
+        } catch {
+          result.skipped++;
+          continue;
+        }
+        if (
+          embedding.length === 0 ||
+          (expectedDimensions > 0 && embedding.length !== expectedDimensions)
+        ) {
+          result.skipped++;
+          continue;
+        }
+        vector.add(id, typeof row.s === "string" ? row.s : "", embedding);
+        result.added++;
+      }
+    } finally {
+      this.logSuppressed = false;
+    }
+    if (result.added + result.removed > 0 || result.cleared)
+      this.scheduleSave();
+    return result;
+  }
+
+  async readBackfillMarker(): Promise<string | null> {
+    if (!this.vector) return null;
+    try {
+      const marker = await this.kv.get<BackfillMarker>(
+        KV.bm25Index,
+        BACKFILL_MARKER_KEY,
+      );
+      return marker &&
+        typeof marker.since === "string" &&
+        !Number.isNaN(Date.parse(marker.since))
+        ? marker.since
+        : null;
+    } catch (err) {
+      logger.warn("index persistence: vector backfill marker read failed", {
+        message: errorMessage(err),
+      });
+      return null;
+    }
+  }
+
+  async markBackfillSince(since: string): Promise<void> {
+    if (!this.vector || Number.isNaN(Date.parse(since))) return;
+    const current = await this.readBackfillMarker();
+    if (current !== null && Date.parse(current) <= Date.parse(since)) return;
+    await this.kv.set<BackfillMarker>(KV.bm25Index, BACKFILL_MARKER_KEY, {
+      v: 1,
+      since,
+    });
+  }
+
+  async clearBackfillMarker(): Promise<void> {
+    if (!this.vector) return;
+    await this.kv.delete(KV.bm25Index, BACKFILL_MARKER_KEY);
+  }
+
+  async flushPendingLog(): Promise<void> {
+    await Promise.all([...this.logChains.values()]);
+  }
+
+  private nextSeq(): number {
+    this.seq = Math.max(this.seq + 1, this.now() * 1000);
+    return this.seq;
+  }
+
+  private logChange(id: string | null, entry: VectorEntry | null): void {
+    if (this.logSuppressed) return;
+    const key = id ?? PENDING_CLEAR_KEY;
+    const q = this.nextSeq();
+    let row: PendingVectorRow;
+    if (id === null) {
+      row = { q, c: 1 };
+    } else if (entry) {
+      row = {
+        q,
+        id,
+        s: entry.sessionId,
+        e: float32ToBase64(entry.embedding),
+      };
+    } else {
+      row = { q, id, t: 1 };
+    }
+    this.pendingLog.set(key, q);
+    this.enqueueLog(key, async () => {
+      await this.kv.set<PendingVectorRow>(KV.vectorPendingLog, key, row);
+    }).then(
+      () => {
+        this.pendingLogError = null;
+      },
+      (err) => {
+        this.pendingLogError = errorMessage(err);
+        this.logFailure("vector", err);
+      },
+    );
+    this.maybeEarlySave();
+  }
+
+  private enqueueLog(key: string, op: () => Promise<void>): Promise<void> {
+    const run = (this.logChains.get(key) ?? Promise.resolve()).then(op);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.logChains.set(key, tail);
+    void tail.then(() => {
+      if (this.logChains.get(key) === tail) this.logChains.delete(key);
+    });
+    return run;
+  }
+
+  private maybeEarlySave(): void {
+    if (this.stopped || this.earlySaveQueued) return;
+    if (this.pendingLog.size < PENDING_LOG_SAVE_THRESHOLD) return;
+    if (this.now() - this.lastSaveAt < EARLY_SAVE_MIN_GAP_MS) return;
+    this.earlySaveQueued = true;
+    setTimeout(() => {
+      this.earlySaveQueued = false;
+      this.save().catch((err) => this.logFailure("vector", err));
+    }, 0);
+  }
+
+  private deletePendingKey(
+    key: string,
+    q: number | undefined,
+  ): Promise<void> {
+    return this.enqueueLog(key, async () => {
+      if (this.pendingLog.get(key) !== q) return;
+      await this.kv.delete(KV.vectorPendingLog, key);
+      if (this.pendingLog.get(key) === q) this.pendingLog.delete(key);
+    });
+  }
+
+  private async clearCoveredPendingLog(coveredSeq: number): Promise<void> {
+    const clearSeq = this.pendingLog.get(PENDING_CLEAR_KEY);
+    if (
+      clearSeq !== undefined
+        ? clearSeq <= coveredSeq
+        : this.pendingLogUnknown
+    ) {
+      await this.deletePendingKey(PENDING_CLEAR_KEY, clearSeq);
+    }
+    const covered = [...this.pendingLog].filter(
+      ([key, q]) => key !== PENDING_CLEAR_KEY && q <= coveredSeq,
+    );
+    const failures = await inPendingBatches(
+      covered,
+      32,
+      ([key, q]) => this.deletePendingKey(key, q),
+    );
+    if (failures.length > 0) {
+      throw new Error(
+        `${failures.length} of ${covered.length} pending vector log deletes failed: ${errorMessage(failures[0])}`,
+      );
+    }
+    this.pendingLogUnknown = false;
   }
 
   private async getRegistry(): Promise<GenerationRegistry> {
@@ -562,21 +967,21 @@ export class IndexPersistence {
     );
   }
 
-  private logFailure(err: unknown): void {
-    const now = Date.now();
+  private logFailure(leg: IndexLeg, err: unknown): void {
+    const now = this.now();
     // Throttle: persistence failures under load arrive in bursts
-    // (iii-engine queue pressure). Logging every debounce flush adds
-    // noise without information.
-    if (now - this.lastFailureLogAt < FAILURE_LOG_THROTTLE_MS) return;
-    this.lastFailureLogAt = now;
+    // (iii-engine queue pressure). Logging every flush adds noise
+    // without information.
+    if (now - (this.lastFailureLogAt.get(leg) ?? 0) < FAILURE_LOG_THROTTLE_MS) return;
+    this.lastFailureLogAt.set(leg, now);
     const code = (err as { code?: string })?.code;
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn("index persistence: failed to save BM25/vector index", {
+    logger.warn(`index persistence: failed to save the ${leg === "bm25" ? "BM25" : "vector"} index`, {
       code,
       message,
       hint:
         code === "TIMEOUT"
-          ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next debounce flush"
+          ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next save"
           : undefined,
     });
   }
@@ -670,12 +1075,17 @@ export class IndexPersistence {
       nextShards[bucketKey] = { hash, chunks };
       if (layoutMatches && priorEntry?.hash === hash) continue;
 
-      for (let i = 0; i < chunks; i++) {
-        await this.kv.set(
+      const chunkWrites = Array.from({ length: chunks }, (_, i) =>
+        this.kv.set(
           VECTOR_BUCKET_SCOPE,
           vectorChunkKey(bucketKey, hash, i),
           body.slice(i * chunkChars, (i + 1) * chunkChars),
-        );
+        ),
+      );
+      const settled = await Promise.allSettled(chunkWrites);
+      const failed = settled.find((r) => r.status === "rejected");
+      if (failed) {
+        throw (failed as PromiseRejectedResult).reason;
       }
       written++;
       // The bucket's old content lives under different keys entirely, so it is
@@ -751,13 +1161,20 @@ export class IndexPersistence {
 
     // Safe from here: the new manifest is live and names none of these.
     const undeleted: Array<{ scope: string; key: string }> = [];
-    for (const target of reclaimTargets) {
-      const gone = await this.deleteKey(
-        target.scope,
-        target.key,
-        "vector_bucket_reclaim",
-      );
-      if (!gone) undeleted.push(target);
+    const reclaimResults = await Promise.allSettled(
+      reclaimTargets.map((target) =>
+        this.deleteKey(target.scope, target.key, "vector_bucket_reclaim").then(
+          (gone) => ({ target, gone }),
+        ),
+      ),
+    );
+    for (const [i, result] of reclaimResults.entries()) {
+      if (
+        result.status === "rejected" ||
+        !result.value.gone
+      ) {
+        undeleted.push(reclaimTargets[i]);
+      }
     }
     if (reclaimTargets.length > 0) {
       // Record the drain, keeping anything that did not actually go. Clearing
@@ -940,6 +1357,7 @@ export class IndexPersistence {
     targetIds: string[],
     details: Record<string, unknown>,
   ): Promise<void> {
+    if (!auditIndexPersistEnabled()) return;
     await safeAudit(
       this.kv,
       "index_persist",
@@ -1055,20 +1473,21 @@ export class IndexPersistence {
         corrupt++;
         continue;
       }
-      const parts: string[] = [];
+      const keys = Array.from(
+        { length: entry.chunks },
+        (_, i) => vectorChunkKey(bucketKey, entry.hash, i),
+      );
+      const parts = await Promise.all(
+        keys.map((key) =>
+          this.kv.get<string>(VECTOR_BUCKET_SCOPE, key).catch(() => null),
+        ),
+      );
       let complete = true;
-      for (let i = 0; i < entry.chunks; i++) {
-        const chunk = await this.kv
-          .get<string>(
-            VECTOR_BUCKET_SCOPE,
-            vectorChunkKey(bucketKey, entry.hash, i),
-          )
-          .catch(() => null);
+      for (const chunk of parts) {
         if (typeof chunk !== "string") {
           complete = false;
           break;
         }
-        parts.push(chunk);
       }
       if (!complete) {
         missing++;

@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execSync } from "node:child_process";
+import { captureObservation, isDrainChild, runDrainChild, withEventId } from "./_capture.mjs";
 //#region src/hooks/_env.ts
 function hookEnvPath() {
 	return join(homedir(), ".agentmemory", ".env");
@@ -154,14 +155,10 @@ function isSdkChildContext(payload) {
 	if (!payload || typeof payload !== "object") return false;
 	return payload.entrypoint === "sdk-ts";
 }
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-function authHeaders() {
-	const h = { "Content-Type": "application/json" };
-	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-	return h;
-}
+const OBSERVE_TIMEOUT_MS = 3e3;
+const EXIT_CAP_MS = 3500;
 async function main() {
+	if (isDrainChild()) return runDrainChild();
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
 	let data;
@@ -179,26 +176,26 @@ async function main() {
 	if (isSelfCaptureTool(toolName)) return;
 	const { imageData, cleanOutput } = extractImageData(toolOutput(data));
 	const cwd = hookCwd(data) || process.cwd();
-	const outputMax = captureOutputMax();
-	fetch(`${REST_URL}/agentmemory/observe`, {
-		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({
-			hookType: "post_tool_use",
-			sessionId,
-			project: resolveProject(cwd),
-			cwd,
-			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-			data: {
-				tool_name: toolName,
-				tool_input: toolInput,
-				tool_output: truncateCaptureOutput(cleanOutput, outputMax),
-				...imageData ? { image_data: imageData } : {}
-			}
-		}),
-		signal: AbortSignal.timeout(3e3)
-	}).catch(() => {});
-	setTimeout(() => process.exit(0), 3e3).unref();
+	const toolOutputText = truncateCaptureOutput(cleanOutput, captureOutputMax());
+	captureObservation(withEventId({
+		hookType: "post_tool_use",
+		sessionId,
+		project: resolveProject(cwd),
+		cwd,
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		data: {
+			tool_name: toolName,
+			tool_input: toolInput,
+			tool_output: toolOutputText,
+			...imageData ? { image_data: imageData } : {}
+		}
+	}, data, {
+		tool_name: toolName,
+		tool_input: toolInput,
+		tool_output: toolOutputText,
+		image_data: imageData
+	}), OBSERVE_TIMEOUT_MS);
+	setTimeout(() => process.exit(0), EXIT_CAP_MS).unref();
 }
 function toolOutput(data) {
 	if (data.tool_response !== void 0) return data.tool_response;

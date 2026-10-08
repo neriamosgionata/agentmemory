@@ -2,6 +2,10 @@ import type { CompressedObservation, Memory } from "../types.js";
 import { KV } from "./schema.js";
 import type { StateKV } from "./kv.js";
 import { memoryToObservation } from "./memory-utils.js";
+import {
+  indexObservationSession,
+  lookupObservationSession,
+} from "./obs-index.js";
 
 /**
  * Observation rows live in per-session scopes and are not addressable from an
@@ -21,6 +25,14 @@ export async function findObservation(
     if (obs) return obs;
   }
 
+  const indexedSessionId = await lookupObservationSession(kv, obsId);
+  if (indexedSessionId) {
+    const obs = await kv
+      .get<CompressedObservation>(KV.observations(indexedSessionId), obsId)
+      .catch(() => null);
+    if (obs) return obs;
+  }
+
   const sessions = await kv.list<{ id: string }>(KV.sessions);
   for (let i = 0; i < sessions.length; i += 5) {
     const batch = sessions.slice(i, i + 5);
@@ -31,8 +43,14 @@ export async function findObservation(
           .catch(() => null),
       ),
     );
-    const found = results.find((r) => r !== null);
-    if (found) return found;
+    const foundIndex = results.findIndex((r) => r !== null);
+    if (foundIndex !== -1) {
+      const found = results[foundIndex] as CompressedObservation;
+      await indexObservationSession(kv, obsId, batch[foundIndex].id).catch(
+        () => {},
+      );
+      return found;
+    }
   }
   return null;
 }

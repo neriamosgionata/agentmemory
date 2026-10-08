@@ -1,19 +1,24 @@
-import { TriggerAction, type ISdk, type ApiRequest } from "../iii.js";
+import { InvocationError, TriggerAction, type ISdk, type ApiRequest } from "../iii.js";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
+import { addSessionToProjectIndex } from "../state/session-index.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { ResilientProvider } from "../providers/resilient.js";
 import { VERSION } from "../version.js";
-import { timingSafeCompare } from "../auth.js";
+import { timingSafeCompare, checkRequestGuard, configuredAllowedOrigins } from "../auth.js";
+import { stripPrivateData } from "../functions/privacy.js";
 import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
+import { COMPACT_SCOPES, type GraphCompactScope } from "../functions/graph.js";
 import { logger } from "../logger.js";
+import { isValidEventId } from "../capture/event-id.js";
+import { getCaptureController, type CaptureResult } from "../functions/capture.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -39,10 +44,29 @@ function parseOptionalInt(raw: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function checkAuth(
+let restOriginPorts: () => Array<number | null | undefined> = () => [];
+
+export function setRestOriginPorts(resolve: () => Array<number | null | undefined>): void {
+  restOriginPorts = resolve;
+}
+
+export function checkRestRequest(
+  method: string | undefined,
+  headers: Record<string, string | string[] | undefined> | undefined,
+): Response | null {
+  return checkRequestGuard({
+    method,
+    headers,
+    allowedOrigins: configuredAllowedOrigins(restOriginPorts()),
+  });
+}
+
+export function checkAuth(
   req: ApiRequest,
   secret: string | undefined,
 ): Response | null {
+  const rejected = checkRestRequest(req.method, req.headers);
+  if (rejected) return rejected;
   if (!secret) return null;
   const auth = req.headers?.["authorization"] || req.headers?.["Authorization"];
   if (
@@ -113,6 +137,21 @@ function reflectDisabledResponse(): Response {
   });
 }
 
+export function captureStatusCode(result: CaptureResult): number {
+  if (result.status === "duplicate") return 200;
+  if (result.status === "accepted") return result.state === "completed" ? 201 : 202;
+  return result.retryable ? 503 : 422;
+}
+
+export function captureResponseBody(
+  result: CaptureResult,
+  durability?: { bootId: string; durableAfterMs: number } | null,
+): Record<string, unknown> {
+  if (result.status === "rejected") return { ...result, success: false };
+  if (!durability) return { ...result };
+  return { ...result, bootId: durability.bootId, acceptedAt: new Date().toISOString(), durableAfterMs: durability.durableAfterMs };
+}
+
 function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -148,10 +187,12 @@ export function registerApiTriggers(
   sdk.registerFunction(
     "middleware::api-auth",
     async (input: {
-      request?: { headers?: Record<string, string | undefined> };
+      request?: { method?: string; headers?: Record<string, string | undefined> };
     }) => {
-      if (!secret) return { action: "continue" };
       const headers = input?.request?.headers || {};
+      const rejected = checkRestRequest(input?.request?.method, headers);
+      if (rejected) return { action: "respond", response: rejected };
+      if (!secret) return { action: "continue" };
       const auth = headers["authorization"] || headers["Authorization"];
       if (
         typeof auth !== "string" ||
@@ -171,7 +212,9 @@ export function registerApiTriggers(
   // target from the server instead of port arithmetic, which broke
   // whenever the viewer bound a fallback port. Config is boot-static,
   // so read it once instead of rebuilding the merged env per request.
-  const bootStreamsPort = loadConfig().streamsPort;
+  const bootConfig = loadConfig();
+  const bootStreamsPort = bootConfig.streamsPort;
+  setRestOriginPorts(() => [bootConfig.restPort, bootConfig.viewerPort, getBoundViewerPort()]);
   const instanceInfo = () => ({
     service: "agentmemory",
     viewerPort: getBoundViewerPort(),
@@ -315,6 +358,16 @@ export function registerApiTriggers(
           },
         };
       }
+      const eventId = body.eventId;
+      if (eventId !== undefined && !isValidEventId(eventId)) {
+        return {
+          status_code: 400,
+          body: {
+            status: "rejected",
+            error: "eventId must be 8 to 128 characters of letters, digits, '_', '.', ':' or '-'",
+          },
+        };
+      }
       const agentId = asNonEmptyString(body.agentId);
       const payload: HookPayload = {
         hookType: hookType as HookPayload["hookType"],
@@ -325,10 +378,77 @@ export function registerApiTriggers(
         data: body.data,
         ...(agentId ? { agentId } : {}),
       };
-      const result = await sdk.trigger({ function_id: "mem::observe", payload });
-      return { status_code: 201, body: result };
+      const result = await sdk.trigger<unknown, CaptureResult>({
+        function_id: "mem::capture",
+        payload: { payload, eventId },
+      });
+      return {
+        status_code: captureStatusCode(result),
+        body: captureResponseBody(result, getCaptureController()?.durability() ?? null),
+      };
     },
   );
+
+  sdk.registerFunction("api::capture",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const status = req.query_params?.["status"];
+      const limit = Number(req.query_params?.["limit"]) || 50;
+      const [summary, list] = await Promise.all([
+        getCaptureController()?.status() ?? Promise.resolve(null),
+        sdk.trigger({
+          function_id: "mem::capture-list",
+          payload: {
+            ...(status === "pending" || status === "retrying" || status === "dead" ? { status } : {}),
+            limit,
+          },
+        }),
+      ]);
+      return { status_code: 200, headers: { "Cache-Control": "no-store" }, body: { capture: summary, ...(list as object) } };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::capture",
+    config: { api_path: "/agentmemory/capture", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::capture-retry",
+    async (req: ApiRequest<{ eventId?: string; all?: boolean }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = (req.body ?? {}) as { eventId?: unknown; all?: unknown };
+      const eventId = asNonEmptyString(body.eventId);
+      if (!eventId && body.all !== true) {
+        return { status_code: 400, body: { error: "pass an eventId, or all: true to retry every dead or waiting capture" } };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::capture-retry",
+        payload: eventId ? { eventId } : { all: true },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::capture-retry",
+    config: { api_path: "/agentmemory/capture/retry", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::capture-drain",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({ function_id: "mem::capture-drain", payload: {} });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::capture-drain",
+    config: { api_path: "/agentmemory/capture/drain", http_method: "POST" },
+  });
   sdk.registerTrigger({
     type: "http",
     function_id: "api::observe",
@@ -643,7 +763,7 @@ export function registerApiTriggers(
           },
         };
       }
-      const title = typeof body.title === "string" ? body.title.trim() : undefined;
+      const title = typeof body.title === "string" ? stripPrivateData(body.title.trim()) : undefined;
       // allow session/start to override AGENT_ID from request body
       // (multi-agent runtimes that route many roles through one server
       // process). Falls back to the AGENT_ID env on the server.
@@ -652,7 +772,7 @@ export function registerApiTriggers(
           ? body.agentId.trim().slice(0, 128)
           : undefined;
       const agentId = requestAgentId ?? getAgentId();
-      const session: Session = {
+      const freshSession: Session = {
         id: sessionId,
         project,
         cwd,
@@ -663,7 +783,28 @@ export function registerApiTriggers(
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
       };
-      await kv.set(KV.sessions, sessionId, session);
+      const session = await withKeyedLock(`obs:${sessionId}`, async () => {
+        const existing = await kv.get<Session>(KV.sessions, sessionId);
+        const merged: Session = {
+          ...freshSession,
+          observationCount: existing?.observationCount ?? freshSession.observationCount,
+          firstPrompt: freshSession.firstPrompt ?? existing?.firstPrompt,
+          summary: freshSession.summary ?? existing?.summary,
+          commitShas: existing?.commitShas ?? freshSession.commitShas,
+        };
+        await kv.set(KV.sessions, sessionId, merged);
+        return merged;
+      });
+      await addSessionToProjectIndex(kv, project, {
+        id: sessionId,
+        startedAt: session.startedAt,
+        ...(session.agentId ? { agentId: session.agentId } : {}),
+      }).catch((err) => {
+        logger.warn("session index update failed", {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string; agentId?: string },
         { context: string }
@@ -784,7 +925,8 @@ export function registerApiTriggers(
       const sessionId = asNonEmptyString(body.sessionId) ?? undefined;
       const branch = asNonEmptyString(body.branch) ?? undefined;
       const repo = asNonEmptyString(body.repo) ?? undefined;
-      const message = asNonEmptyString(body.message) ?? undefined;
+      const rawMessage = asNonEmptyString(body.message);
+      const message = rawMessage ? stripPrivateData(rawMessage) : undefined;
       const author = asNonEmptyString(body.author) ?? undefined;
       const authoredAt = asNonEmptyString(body.authoredAt) ?? undefined;
       const files = Array.isArray(body.files)
@@ -814,7 +956,7 @@ export function registerApiTriggers(
       });
 
       if (sessionId) {
-        await withKeyedLock(`session:${sessionId}`, async () => {
+        await withKeyedLock(`obs:${sessionId}`, async () => {
           const session = await kv.get<Session>(KV.sessions, sessionId);
           if (!session) return;
           const shaSet = new Set<string>(session.commitShas ?? []);
@@ -1729,6 +1871,47 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::graph-reset",
     config: { api_path: "/agentmemory/graph/reset", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::graph-compact",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const { scope, offset, limit } = body;
+      if (scope !== undefined && !COMPACT_SCOPES.includes(scope as GraphCompactScope)) {
+        return { status_code: 400, body: { error: "scope must be nodes, edges, history or snapshot" } };
+      }
+      if (offset !== undefined && !(Number.isInteger(offset) && (offset as number) >= 0)) {
+        return { status_code: 400, body: { error: "offset must be a non-negative integer" } };
+      }
+      if (limit !== undefined && !(Number.isInteger(limit) && (limit as number) >= 1)) {
+        return { status_code: 400, body: { error: "limit must be a positive integer" } };
+      }
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-compact",
+          payload: { scope, offset, limit },
+        });
+        if ((result as { success?: boolean } | null)?.success === false) {
+          return { status_code: 500, body: { error: "Graph compaction failed" } };
+        }
+        return { status_code: 200, body: result };
+      } catch (err) {
+        if (err instanceof InvocationError && err.code === "TIMEOUT") {
+          return {
+            status_code: 504,
+            body: { error: "Graph compaction timed out; pass scope, offset and limit to run it in slices" },
+          };
+        }
+        return { status_code: 500, body: { error: "Graph compaction failed" } };
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-compact",
+    config: { api_path: "/agentmemory/graph/compact", http_method: "POST" },
   });
 
   sdk.registerFunction("api::graph-extract",

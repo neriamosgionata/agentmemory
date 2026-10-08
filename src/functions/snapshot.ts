@@ -23,6 +23,8 @@ import { clearSessionDerivedState } from "./observation-lifecycle.js";
 import { flushIndexSave, rebuildIndex } from "./search.js";
 import { invalidateGraphCache } from "../state/graph-cache.js";
 import { resetLessonIndex } from "./lessons.js";
+import { boundRecordSources } from "./graph.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 
@@ -268,15 +270,35 @@ export function registerSnapshotFunction(
         }
 
         if (state.sessions) {
-          await replaceScope(KV.sessions, state.sessions, (r) => String(r["id"]));
+          const incoming = new Map(
+            state.sessions.map((s) => [String(s.id), s]),
+          );
+          const current = await kv
+            .list<Session>(KV.sessions)
+            .catch(() => [] as Session[]);
+          for (const row of current) {
+            if (!incoming.has(String(row.id))) {
+              const staleId = String(row.id);
+              await withKeyedLock(`obs:${staleId}`, () =>
+                kv.delete(KV.sessions, staleId),
+              );
+            }
+          }
+          for (const session of state.sessions) {
+            await withKeyedLock(`obs:${session.id}`, () =>
+              kv.set(KV.sessions, session.id, session),
+            );
+          }
         }
         if (state.memories) {
           await replaceScope(KV.memories, state.memories, (r) => String(r["id"]));
         }
         if (state.graphNodes) {
-          await replaceScope(KV.graphNodes, state.graphNodes, (r) =>
-            String(r["id"]),
-          );
+          for (const node of state.graphNodes) {
+            await withKeyedLock("graph:persist", () =>
+              kv.set(KV.graphNodes, node.id, boundRecordSources(node)),
+            );
+          }
         }
         if (state.observations) {
           for (const [sessionId, obs] of Object.entries(state.observations)) {

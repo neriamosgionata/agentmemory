@@ -57,7 +57,7 @@ describe("persistGraphDelta snapshot safety (#1384, fork sync)", () => {
     );
 
     let settled = false;
-    const delta = persistGraphDelta(kv as never, [node("n1")], [], ["obs_1"]).then(
+    const delta = persistGraphDelta(kv as never, [node("n1")], []).then(
       () => {
         settled = true;
       },
@@ -83,7 +83,7 @@ describe("persistGraphDelta snapshot safety (#1384, fork sync)", () => {
     }) as typeof kv.get;
 
     await expect(
-      persistGraphDelta(kv as never, [node("n1")], [], ["obs_1"]),
+      persistGraphDelta(kv as never, [node("n1")], []),
     ).rejects.toThrow("engine unavailable");
     expect(kv.setCallsFor(KV.graphNodes)).toBe(0);
     expect(kv.setCallsFor(KV.graphSnapshot)).toBe(0);
@@ -94,7 +94,7 @@ describe("persistGraphDelta snapshot safety (#1384, fork sync)", () => {
     storeSnapshot(kv, { version: 99, stats: { totalNodes: 5 } });
 
     await expect(
-      persistGraphDelta(kv as never, [node("n1")], [], ["obs_1"]),
+      persistGraphDelta(kv as never, [node("n1")], []),
     ).rejects.toThrow(/unknown schema version/);
     expect(kv.setCallsFor(KV.graphNodes)).toBe(0);
     expect(kv.setCallsFor(KV.graphSnapshot)).toBe(0);
@@ -103,7 +103,7 @@ describe("persistGraphDelta snapshot safety (#1384, fork sync)", () => {
   it("merges onto an existing snapshot and persists the delta", async () => {
     const kv = mockKV();
     const fresh = mockKV();
-    await persistGraphDelta(fresh as never, [node("n0")], [], ["obs_0"]);
+    await persistGraphDelta(fresh as never, [node("n0")], []);
     const snapshot = fresh.store.get(KV.graphSnapshot)?.get("current");
     kv.store.set(KV.graphSnapshot, new Map([["current", snapshot]]));
 

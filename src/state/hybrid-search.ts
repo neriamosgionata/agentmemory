@@ -9,6 +9,7 @@ import type {
 } from "../types.js";
 import { memoryToObservation } from "./memory-utils.js";
 import { findObservationSession } from "./observation-lookup.js";
+import { lookupObservationSession } from "./obs-index.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
 import {
@@ -338,6 +339,19 @@ export class HybridSearch {
           .get<CompressedObservation>(KV.observations(r.sessionId), r.obsId)
           .catch(() => null);
         if (obs) return obs;
+        const indexedSessionId = await lookupObservationSession(
+          this.kv,
+          r.obsId,
+        );
+        if (indexedSessionId && indexedSessionId !== r.sessionId) {
+          const indexed = await this.kv
+            .get<CompressedObservation>(
+              KV.observations(indexedSessionId),
+              r.obsId,
+            )
+            .catch(() => null);
+          if (indexed) return indexed;
+        }
         // Fallback: indexed entry may originate from mem::remember, which
         // writes to KV.memories with a synthetic sessionId ("memory" or the
         // memory's first associated session). Coerce the Memory record into

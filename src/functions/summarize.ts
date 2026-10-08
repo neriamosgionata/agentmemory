@@ -23,6 +23,7 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { scrubRecord } from "./privacy.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
@@ -605,6 +606,10 @@ export function registerSummarizeFunction(
                 ...summary.concepts,
                 ...partialConcepts,
               ]);
+              // Scrub secrets/credentials before the summary is validated and
+              // stored, so a key that leaks into a narrative cannot be
+              // persisted into summaries or semantic facts.
+              summary = scrubRecord(summary);
               // #1240: a schema failure (e.g. narrative under the length floor)
               // used to end the call after one attempt, so the retry loop never
               // saw it. Validate inside the loop and let attempt 2 fix it.

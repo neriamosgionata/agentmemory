@@ -4,7 +4,7 @@
 // means a future SDK bump touches this file, not 60 call sites.
 import type { IIIClient } from "iii-sdk";
 
-export { TriggerAction, registerWorker } from "iii-sdk";
+export { TriggerAction, registerWorker, InvocationError } from "iii-sdk";
 export type {
   IIIClient,
   IIIConnectionState,

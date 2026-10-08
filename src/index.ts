@@ -14,6 +14,7 @@ import {
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
   isSessionSweepEnabled,
+  isGraphCompactOnBootEnabled,
   getSessionSweepStaleHours,
 } from "./config.js";
 import {
@@ -27,8 +28,9 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
-import { registerPrivacyFunction } from "./functions/privacy.js";
+import { registerPrivacyFunction, withWriteScrubbing } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
+import { registerCaptureFunctions } from "./functions/capture.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
 import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
@@ -37,6 +39,7 @@ import { registerCompressFunction } from "./functions/compress.js";
 import { registerRecompressFunction } from "./functions/recompress.js";
 import {
   registerSearchFunction,
+  backfillMissingVectors,
   rebuildIndex,
   getSearchIndex,
   setVectorIndex,
@@ -45,6 +48,8 @@ import {
   setHybridRanker,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
+import { registerSessionIndexMaintenanceFunction } from "./functions/session-index-maintenance.js";
+import { rebuildSessionIndexIfStale } from "./state/session-index.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
 import { registerFileIndexFunction } from "./functions/file-index.js";
@@ -63,6 +68,7 @@ import { registerExportImportFunction } from "./functions/export-import.js";
 import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
+import { GRAPH_COMPACT_BOOT_DELAY_MS, runGraphCompactOnBoot, setGraphCompactBootDisabled } from "./functions/graph-compact-boot.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -102,11 +108,12 @@ import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
 import { DedupMap } from "./functions/dedup.js";
-import { registerHealthMonitor } from "./health/monitor.js";
+import { registerHealthMonitor, setIndexPersistenceStatusProvider } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
-import { bootLog } from "./logger.js";
+import { bootLog, bootWarn } from "./logger.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
+import { ensureServerSecret, explicitSecret, secretFilePath } from "./secret-store.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -158,6 +165,20 @@ process.on("unhandledRejection", (reason) => {
   );
 });
 
+function resolveWorkerSecret(): string {
+  try {
+    const { secret, source } = ensureServerSecret();
+    if (source === "generated") {
+      bootLog(`Generated an API secret at ${secretFilePath()} (mode 0600). Local clients read it automatically.`);
+    }
+    return secret;
+  } catch (err) {
+    throw new Error(
+      `agentmemory could not create its API secret at ${secretFilePath()}: ${err instanceof Error ? err.message : String(err)}. Set AGENTMEMORY_SECRET explicitly or make the directory writable.`,
+    );
+  }
+}
+
 async function main() {
   // Fold ~/.agentmemory/.env into process.env before anything reads config
   // or raw process.env. Only-if-unset, so real process.env still wins.
@@ -197,7 +218,7 @@ async function main() {
   );
   bootLog(`Streams: ws://localhost:${config.streamsPort}`);
 
-  const sdk = registerWorker(config.engineUrl, {
+  const sdk = withWriteScrubbing(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -217,12 +238,12 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  });
+  }));
 
   writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
-  const secret = getEnvVar("AGENTMEMORY_SECRET");
+  const secret = resolveWorkerSecret();
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
@@ -239,6 +260,7 @@ async function main() {
 
   registerPrivacyFunction(sdk);
   registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
+  const capture = registerCaptureFunctions(sdk, kv, { restPort: config.restPort });
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -249,6 +271,18 @@ async function main() {
   registerRecompressFunction(sdk, kv);
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
+  registerSessionIndexMaintenanceFunction(sdk, kv);
+  void rebuildSessionIndexIfStale(kv)
+    .then((result) => {
+      if (result) {
+        bootLog(
+          `Session index rebuilt: ${result.projects} projects, ${result.sessions} sessions`,
+        );
+      }
+    })
+    .catch((err) => {
+      bootWarn(`Failed to rebuild session index at boot: ${String(err)}`);
+    });
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
   registerMigrateFunction(sdk, kv);
   registerFileIndexFunction(sdk, kv);
@@ -318,7 +352,7 @@ async function main() {
   registerRoutinesFunction(sdk, kv);
   registerSignalsFunction(sdk, kv);
   registerCheckpointsFunction(sdk, kv);
-  registerMeshFunction(sdk, kv, secret);
+  registerMeshFunction(sdk, kv, explicitSecret() || undefined);
   registerBranchAwareFunction(sdk, kv);
   registerFlowCompressFunction(sdk, kv, provider);
   registerSentinelsFunction(sdk, kv);
@@ -405,6 +439,7 @@ async function main() {
   // lost across a hard process exit and the persisted snapshot
   // restores the deleted entry at next boot.
   setIndexPersistence(indexPersistence);
+  setIndexPersistenceStatusProvider(() => indexPersistence.status());
 
   const loaded = await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted index:`, err);
@@ -480,6 +515,18 @@ async function main() {
       vectorIndex.restoreFrom(loaded.vector);
       bootLog(
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
+      );
+    }
+  }
+
+  if (vectorIndex) {
+    const replay = await indexPersistence
+      .replayPendingLog(embeddingProvider?.dimensions ?? 0)
+      .catch(() => null);
+    if (replay && replay.entries > 0) {
+      bootLog(
+        `Recovered ${replay.added} vectors and ${replay.removed} removals written after the last index save, without calling the embedding provider` +
+          (replay.skipped > 0 ? ` (${replay.skipped} entries skipped)` : ""),
       );
     }
   }
@@ -591,6 +638,33 @@ async function main() {
         err,
       );
     }
+    if (vectorIndex && embeddingProvider && bm25Index.size > 0) {
+      const marker = await indexPersistence
+        .readBackfillMarker()
+        .catch(() => null);
+      if (marker !== null && vectorIndex.size >= bm25Index.size) {
+        await indexPersistence.clearBackfillMarker().catch(() => undefined);
+      } else if (vectorIndex.size < bm25Index.size || marker !== null) {
+        await indexPersistence
+          .markBackfillSince(new Date().toISOString())
+          .catch(() => undefined);
+        void (async () => {
+          try {
+            const result = await backfillMissingVectors(kv);
+            if (result.complete)
+              await indexPersistence.clearBackfillMarker().catch(() => {});
+            if (result.added > 0)
+              bootLog(`Vector index backfilled: ${result.added} entries`);
+            if (!result.complete)
+              bootWarn(
+                `Vector backfill stopped with ${result.remaining} documents still missing a vector. They are retried on the next start.`,
+              );
+          } catch (err) {
+            console.warn(`[agentmemory] Failed to backfill vectors:`, err);
+          }
+        })();
+      }
+    }
   }
 
   // Ready / Endpoints lines are emitted via `bootLog` so they're
@@ -601,11 +675,31 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 136 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
+
+  void (async () => {
+    try {
+      const drained = await capture.drainLocalSpool();
+      const delivered = drained.reduce((n, r) => n + r.delivered, 0);
+      const duplicates = drained.reduce((n, r) => n + r.duplicates, 0);
+      const remaining = drained.reduce((n, r) => n + r.remaining, 0);
+      if (delivered + duplicates + remaining > 0) {
+        bootLog(`Capture spool: ${delivered} recovered, ${duplicates} already stored, ${remaining} still waiting`);
+      }
+      const swept = await capture.sweep();
+      if (swept.processed > 0) {
+        bootLog(`Capture inbox: ${swept.recovered} of ${swept.processed} unfinished observations stored after restart`);
+      }
+      await capture.prune();
+    } catch (err) {
+      bootWarn(`Capture recovery at boot failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    capture.start();
+  })();
 
   const viewerServer = startViewerServer(
     config.viewerPort,
@@ -614,6 +708,15 @@ async function main() {
     secret,
     config.restPort,
   );
+
+  if (isGraphCompactOnBootEnabled()) {
+    const graphCompactTimer = setTimeout(() => {
+      void runGraphCompactOnBoot(kv, { log: bootLog, warn: bootWarn }).catch(() => {});
+    }, GRAPH_COMPACT_BOOT_DELAY_MS);
+    graphCompactTimer.unref();
+  } else {
+    setGraphCompactBootDisabled();
+  }
 
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
@@ -687,6 +790,7 @@ async function main() {
     console.log(`\n[agentmemory] Shutting down...`);
     healthMonitor.stop();
     dedupMap.stop();
+    capture.stop();
     indexPersistence.stop();
     await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
     await indexPersistence.save().catch((err) => {

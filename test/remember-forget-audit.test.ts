@@ -8,13 +8,21 @@ vi.mock("../src/state/keyed-mutex.js", () => ({
   withKeyedLock: <T>(_key: string, fn: () => Promise<T>) => fn(),
 }));
 
+const decrementImageRef = vi.fn(async () => {});
+vi.mock("../src/functions/image-refs.js", () => ({ decrementImageRef }));
+
 import { registerRememberFunction } from "../src/functions/remember.js";
 import {
   getSearchIndex,
   setIndexPersistence,
 } from "../src/functions/search.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
+import { KV } from "../src/state/schema.js";
 import type { Memory } from "../src/types.js";
+
+// The fork keeps the single-scope audit store; upstream's monthly-scope
+// helper does not exist here.
+const currentAuditScope = (): string => KV.audit;
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -137,7 +145,15 @@ describe("mem::forget audit coverage (issue #125)", () => {
       payload: { memoryId: "lsn_4f9cb07017a7c8ac" },
     });
 
-    expect(result).toEqual({ success: true, deleted: 0 });
+    expect(result).toMatchObject({
+      success: true,
+      deleted: 0,
+      notFound: ["lsn_4f9cb07017a7c8ac"],
+      failed: 0,
+      failures: undefined,
+      cleanupFailed: 0,
+      cleanupFailures: undefined,
+    });
     // No-op path must not touch the memories keyspace or search index.
     expect(deleteSpy).not.toHaveBeenCalled();
     expect(getSearchIndex().has("lsn_4f9cb07017a7c8ac")).toBe(false);
@@ -226,6 +242,27 @@ describe("mem::forget search-index cleanup", () => {
     expect(getSearchIndex().has("obs_b")).toBe(true);
   });
 
+  it("still unindexes and flushes an observation whose image cleanup fails", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+    setIndexPersistence(persistence);
+    decrementImageRef.mockRejectedValueOnce(new Error("image store down"));
+
+    await kv.set("mem:obs:ses_1", "obs_img", { id: "obs_img", imageRef: "img_1" });
+    getSearchIndex().add(memoryToObservation(makeMemory("obs_img")));
+
+    await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "ses_1", observationIds: ["obs_img"] },
+    });
+
+    expect(await kv.get("mem:obs:ses_1", "obs_img")).toBeNull();
+    expect(getSearchIndex().has("obs_img")).toBe(false);
+    expect(persistence.save).toHaveBeenCalled();
+  });
+
   it("flushes persistence immediately when a memory is forgotten", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
@@ -241,5 +278,119 @@ describe("mem::forget search-index cleanup", () => {
     });
 
     expect(persistence.save).toHaveBeenCalled();
+  });
+});
+
+describe("mem::forget counts only records that were really deleted (#1428)", () => {
+  type ForgetResult = {
+    success: boolean;
+    deleted: number;
+    notFound: string[];
+    failed: number;
+    failures?: Array<{ id: string; error: string }>;
+  };
+
+  it("reports nothing and writes no audit row for an absent session", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_ABSENT" },
+    })) as ForgetResult;
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(0);
+    expect(result.notFound).toEqual(["sess_ABSENT"]);
+    expect(result.failed).toBe(0);
+    expect(await kv.list(currentAuditScope())).toHaveLength(0);
+  });
+
+  it("reports nothing and writes no audit row for absent observation ids", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_ABSENT", observationIds: ["obs_ABSENT"] },
+    })) as ForgetResult;
+
+    expect(result.deleted).toBe(0);
+    expect(result.notFound).toEqual(["obs_ABSENT"]);
+    expect(await kv.list(currentAuditScope())).toHaveLength(0);
+  });
+
+  it("audits only the observation ids that existed", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    await kv.set("mem:obs:sess_1", "obs_a", { id: "obs_a" });
+
+    const result = (await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_1", observationIds: ["obs_a", "obs_missing"] },
+    })) as ForgetResult;
+
+    expect(result.deleted).toBe(1);
+    expect(result.notFound).toEqual(["obs_missing"]);
+    const rows = await kv.list<{
+      targetIds: string[];
+      details: Record<string, unknown>;
+    }>(currentAuditScope());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].targetIds).toEqual(["obs_a"]);
+    expect(rows[0].details.observationsDeleted).toBe(1);
+    expect(rows[0].details.notFound).toBe(1);
+  });
+
+  it("does not count a missing summary for an existing session", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    await kv.set("mem:sessions", "sess_1", { id: "sess_1", project: "p" });
+
+    const result = (await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_1" },
+    })) as ForgetResult;
+
+    expect(result.deleted).toBe(1);
+    const rows = await kv.list<{ details: Record<string, unknown> }>(
+      currentAuditScope(),
+    );
+    expect(rows[0].details.sessionDeleted).toBe(true);
+    expect(rows[0].details.summaryDeleted).toBe(false);
+  });
+
+  it("reports a failed delete separately and keeps it out of the deleted count", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    await kv.set("mem:obs:sess_1", "obs_a", { id: "obs_a" });
+    await kv.set("mem:obs:sess_1", "obs_b", { id: "obs_b" });
+    const realDelete = kv.delete;
+    kv.delete = async (scope: string, key: string) => {
+      if (key === "obs_b") throw new Error("disk full");
+      return realDelete(scope, key);
+    };
+
+    const result = (await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_1", observationIds: ["obs_a", "obs_b"] },
+    })) as ForgetResult;
+
+    expect(result.success).toBe(false);
+    expect(result.deleted).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.failures).toEqual([{ id: "obs_b", error: "delete_failed" }]);
+    const rows = await kv.list<{
+      targetIds: string[];
+      details: Record<string, unknown>;
+    }>(currentAuditScope());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].targetIds).toEqual(["obs_a"]);
+    expect(rows[0].details.failed).toBe(1);
   });
 });

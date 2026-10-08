@@ -82,6 +82,27 @@ export function evaluateHealth(
     notes.push(`memory_heap_tight_${Math.round(memPercent)}%_rss${memMb}mb`);
   }
 
+  const persistence = snapshot.indexPersistence ?? null;
+  if (persistence) {
+    const legs: Array<[string, { pending: boolean; savedAt: string | null; lastError: string | null }]> = [
+      ["bm25", persistence.bm25],
+    ];
+    if (persistence.vector) legs.push(["vector", persistence.vector]);
+    for (const [name, leg] of legs) {
+      if (leg.lastError) {
+        alerts.push(`index_save_failing_${name}`);
+        degraded = true;
+        continue;
+      }
+      if (leg.pending && leg.savedAt) {
+        const ageMs = Date.now() - Date.parse(leg.savedAt);
+        if (!Number.isNaN(ageMs) && ageMs > 2 * persistence.saveIntervalMs) {
+          notes.push(`index_save_stale_${name}`);
+        }
+      }
+    }
+  }
+
   const status = critical ? "critical" : degraded ? "degraded" : "healthy";
   return { status, alerts, notes };
 }

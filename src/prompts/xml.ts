@@ -4,6 +4,17 @@ const VALID_TAG = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 // tag-shaped prose in its preamble ("the <title> field should..."), and the
 // old first-match regex stored that preamble as the payload. Models emit
 // their final answer last, so the last complete tag pair is the payload.
+export function escapeXmlText(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export function escapeXml(s: string): string {
+  return escapeXmlText(s).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
 export function getXmlTag(xml: string, tag: string): string {
   if (!VALID_TAG.test(tag)) return "";
   const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "g");

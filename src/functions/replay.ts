@@ -2,6 +2,8 @@ import { homedir } from "node:os";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { ISdk } from "../iii.js";
+import { allowedFileRoots, confinePath } from "./path-guard.js";
+import { scrubRecord } from "./privacy.js";
 import type {
   CompressedObservation,
   Crystal,
@@ -13,6 +15,7 @@ import { importOrigin } from "../types.js";
 import { claudeConfigDir } from "../config.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { parseJsonlText } from "../replay/jsonl-parser.js";
 import { resetLessonIndex } from "./lessons.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
@@ -314,13 +317,18 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       const expanded = rawPath.startsWith("~")
         ? join(homedir(), rawPath.slice(1))
         : rawPath;
-      const abs = resolve(expanded);
-      if (isSensitive(abs)) {
+      const requested = resolve(expanded);
+      if (isSensitive(requested)) {
         return { success: false, error: "refusing to process sensitive-looking path" };
       }
-      if (await isSymlink(abs)) {
+      if (await isSymlink(requested)) {
         return { success: false, error: "symlinks are not supported" };
       }
+      const confined = await confinePath(requested, allowedFileRoots([defaultRoot]));
+      if (!confined.ok) {
+        return { success: false, error: confined.error };
+      }
+      const abs = confined.path;
 
       let stat;
       try {
@@ -388,6 +396,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
 
         const parsed = parseJsonlText(text, generateId("sess"));
         if (parsed.observations.length === 0) continue;
+        parsed.observations = parsed.observations.map((obs) => scrubRecord(obs));
 
         const firstPromptObs = parsed.observations.find(
           (o) => typeof o.userPrompt === "string" && o.userPrompt.trim().length > 0,
@@ -396,46 +405,48 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
           : undefined;
 
-        const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
-        if (existing) {
-          existing.observationCount =
-            (existing.observationCount || 0) + parsed.observations.length;
-          if (parsed.endedAt > (existing.endedAt || "")) {
-            existing.endedAt = parsed.endedAt;
+        await withKeyedLock(`obs:${parsed.sessionId}`, async () => {
+          const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
+          if (existing) {
+            existing.observationCount =
+              (existing.observationCount || 0) + parsed.observations.length;
+            if (parsed.endedAt > (existing.endedAt || "")) {
+              existing.endedAt = parsed.endedAt;
+            }
+            if (existing.status === "active") existing.status = "completed";
+            const existingTags = existing.tags || [];
+            if (!existingTags.includes("jsonl-import")) {
+              existing.tags = [...existingTags, "jsonl-import"];
+            }
+            if (!existing.firstPrompt && firstPrompt) {
+              existing.firstPrompt = firstPrompt;
+            }
+            // #775: re-key on parsed.sessionId, not existing.id. Older
+            // session rows may be missing the `id` field; existing.id
+            // would then be undefined, JSON.stringify would drop the
+            // `key` from the state::set payload, and the engine would
+            // reject the call with `missing field \`key\``. Because the
+            // rejection aborts the whole import handler, a single
+            // legacy row killed the entire batch. parsed.sessionId is
+            // always populated (parseJsonlText has a three-level
+            // fallback) and is what we just used to read the row.
+            if (!existing.id) existing.id = parsed.sessionId;
+            await kv.set(KV.sessions, parsed.sessionId, existing);
+          } else {
+            const session: Session = {
+              id: parsed.sessionId,
+              project: parsed.project,
+              cwd: parsed.cwd,
+              startedAt: parsed.startedAt,
+              endedAt: parsed.endedAt,
+              status: "completed",
+              observationCount: parsed.observations.length,
+              tags: ["jsonl-import"],
+              firstPrompt,
+            };
+            await kv.set(KV.sessions, session.id, session);
           }
-          if (existing.status === "active") existing.status = "completed";
-          const existingTags = existing.tags || [];
-          if (!existingTags.includes("jsonl-import")) {
-            existing.tags = [...existingTags, "jsonl-import"];
-          }
-          if (!existing.firstPrompt && firstPrompt) {
-            existing.firstPrompt = firstPrompt;
-          }
-          // #775: re-key on parsed.sessionId, not existing.id. Older
-          // session rows may be missing the `id` field; existing.id
-          // would then be undefined, JSON.stringify would drop the
-          // `key` from the state::set payload, and the engine would
-          // reject the call with `missing field \`key\``. Because the
-          // rejection aborts the whole import handler, a single
-          // legacy row killed the entire batch. parsed.sessionId is
-          // always populated (parseJsonlText has a three-level
-          // fallback) and is what we just used to read the row.
-          if (!existing.id) existing.id = parsed.sessionId;
-          await kv.set(KV.sessions, parsed.sessionId, existing);
-        } else {
-          const session: Session = {
-            id: parsed.sessionId,
-            project: parsed.project,
-            cwd: parsed.cwd,
-            startedAt: parsed.startedAt,
-            endedAt: parsed.endedAt,
-            status: "completed",
-            observationCount: parsed.observations.length,
-            tags: ["jsonl-import"],
-            firstPrompt,
-          };
-          await kv.set(KV.sessions, session.id, session);
-        }
+        });
 
         const compressed: CompressedObservation[] = [];
         await Promise.all(

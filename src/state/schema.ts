@@ -15,6 +15,7 @@ export const KV = {
   health: "mem:health",
   embeddings: (obsId: string) => `mem:emb:${obsId}`,
   bm25Index: "mem:index:bm25",
+  vectorPendingLog: "mem:index:vec-pending",
   relations: "mem:relations",
   profiles: "mem:profiles",
   claudeBridge: "mem:claude-bridge",
@@ -82,6 +83,11 @@ export const KV = {
   // #771: tracks the most recent smart-search call per session, used by
   // the followup-rate diagnostic. Key = sessionId. TTL-swept hourly.
   recentSearches: "mem:recent-searches",
+  projectSessionsIndex: "mem:idx:project-sessions",
+  obsSessionIndex: (shard: number) => `mem:idx:obs:${shard}`,
+  captureInbox: "mem:capture:inbox",
+  captureEvents: (shard: string) => `mem:capture:events:${shard}`,
+  capturePrompts: "mem:capture:prompts",
 } as const;
 
 export const STREAM = {

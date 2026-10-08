@@ -9,6 +9,7 @@ import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { scrubRecord } from "./privacy.js";
 
 const VALID_ITEM_TYPES = new Set(["memory", "pattern", "observation"]);
 
@@ -55,7 +56,7 @@ export function registerTeamFunction(
         sharedBy: config.userId,
         sharedAt: new Date().toISOString(),
         type: data.itemType,
-        content,
+        content: scrubRecord(content),
         project: data.project || "",
         visibility: "shared",
       };

@@ -21,6 +21,13 @@ const DATA_DIR = join(homedir(), ".agentmemory");
 const ENV_FILE = join(DATA_DIR, ".env");
 
 let warnPremiumModelShown = false;
+let providerNoticeShown = false;
+
+function writeProviderNoticeOnce(text: string): void {
+  if (providerNoticeShown) return;
+  providerNoticeShown = true;
+  process.stderr.write(text);
+}
 
 // Parsed ~/.agentmemory/.env, memoized for the process lifetime. getMergedEnv()
 // runs on every config getter (~20 of them), so without this cache a single
@@ -158,10 +165,10 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
 
   const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
   if (!allowAgentSdk) {
-    process.stderr.write(
+    writeProviderNoticeOnce(
       pc.dim(
-        "[agentmemory] No LLM provider key set — running zero-LLM with BM25 search. " +
-          "Set EMBEDDING_PROVIDER=local for on-device semantic embeddings. " +
+        "[agentmemory] No LLM provider key set — running zero-LLM: no LLM compression or summaries; search uses BM25 plus any configured embedding provider. " +
+          "Set EMBEDDING_PROVIDER=local for on-device semantic embeddings if none is configured. " +
           "Set ANTHROPIC_API_KEY (or GEMINI/OPENAI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env for LLM compression and summaries. " +
           "Agent-SDK fallback stays off by default to avoid a Stop-hook recursion loop; opt in with AGENTMEMORY_AUTO_COMPRESS=true + AGENTMEMORY_ALLOW_AGENT_SDK=true.\n",
       ),
@@ -173,7 +180,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     };
   }
 
-  process.stderr.write(
+  writeProviderNoticeOnce(
     "[agentmemory] WARNING: agent-sdk fallback enabled via AGENTMEMORY_ALLOW_AGENT_SDK=true. " +
       "This spawns @anthropic-ai/claude-agent-sdk child sessions that can trigger the Stop-hook " +
       "recursion loop. A SDK-child env marker is set to block re-entry, " +
@@ -245,6 +252,10 @@ export function getSessionSweepStaleHours(): number {
   return parsed > 0 ? parsed : 24;
 }
 
+export function isGraphCompactOnBootEnabled(): boolean {
+  return getMergedEnv()["AGENTMEMORY_GRAPH_COMPACT_ON_BOOT"] !== "false";
+}
+
 export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }
@@ -288,7 +299,7 @@ export function detectEmbeddingProvider(
   if (forced) return forced;
 
   if (source["GEMINI_API_KEY"]) return "gemini";
-  if (source["OPENAI_API_KEY"]) return "openai";
+  if (source["OPENAI_API_KEY"] || source["OPENAI_EMBEDDING_API_KEY"]) return "openai";
   if (source["VOYAGE_API_KEY"]) return "voyage";
   if (source["COHERE_API_KEY"]) return "cohere";
   if (source["OPENROUTER_API_KEY"]) return "openrouter";
@@ -548,6 +559,16 @@ export function getConsolidationCooldownMs(): number {
     CONSOLIDATION_COOLDOWN_DEFAULT_MS,
   );
   return raw >= 0 ? raw : CONSOLIDATION_COOLDOWN_DEFAULT_MS;
+}
+
+export const INDEX_SAVE_INTERVAL_DEFAULT_MS = 5000;
+
+export function getIndexSaveIntervalMs(): number {
+  const raw = safeParseInt(
+    getMergedEnv()["AGENTMEMORY_INDEX_SAVE_INTERVAL_MS"],
+    INDEX_SAVE_INTERVAL_DEFAULT_MS,
+  );
+  return raw > 0 ? raw : INDEX_SAVE_INTERVAL_DEFAULT_MS;
 }
 
 export function isStandaloneMcp(): boolean {

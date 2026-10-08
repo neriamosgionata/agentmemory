@@ -23,6 +23,7 @@ import { compressWithRetry } from "../eval/self-correct.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { scrubRecord, stripPrivateData } from "./privacy.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -224,13 +225,14 @@ export function registerCompressFunction(
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
-          ...parsed,
+          ...scrubRecord(parsed),
           confidence: qualityScore / 100,
           ...(hasImage ? { modality: data.raw.modality } : {}),
-          ...(imageDescription ? { imageDescription } : {}),
+          ...(imageDescription ? { imageDescription: stripPrivateData(imageDescription) } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
+          ...(data.raw.captureKey ? { captureKey: data.raw.captureKey } : {}),
         };
 
         await kv.set(

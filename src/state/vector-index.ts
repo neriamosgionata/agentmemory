@@ -7,13 +7,13 @@
 // in #455 / #469 / #584 / #587.
 const VECTOR_SCAN_CHUNK = 8192;
 
-function float32ToBase64(arr: Float32Array): string {
+export function float32ToBase64(arr: Float32Array): string {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString(
     "base64",
   );
 }
 
-function base64ToFloat32(b64: string): Float32Array {
+export function base64ToFloat32(b64: string): Float32Array {
   const buf = Buffer.from(b64, "base64");
   return new Float32Array(
     buf.buffer,
@@ -55,16 +55,41 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
+export type VectorEntry = { embedding: Float32Array; sessionId: string };
+
+export type VectorChangeListener = (
+  obsId: string | null,
+  entry: VectorEntry | null,
+) => void;
+
 export class VectorIndex {
-  private vectors: Map<string, { embedding: Float32Array; sessionId: string }> =
-    new Map();
+  private vectors: Map<string, VectorEntry> = new Map();
+  private listener: VectorChangeListener | null = null;
+
+  setChangeListener(listener: VectorChangeListener | null): void {
+    this.listener = listener;
+  }
 
   add(obsId: string, sessionId: string, embedding: Float32Array): void {
-    this.vectors.set(obsId, { embedding, sessionId });
+    const entry = { embedding, sessionId };
+    this.vectors.set(obsId, entry);
+    this.listener?.(obsId, entry);
   }
 
   remove(obsId: string): void {
-    this.vectors.delete(obsId);
+    if (this.vectors.delete(obsId)) this.listener?.(obsId, null);
+  }
+
+  has(obsId: string): boolean {
+    return this.vectors.has(obsId);
+  }
+
+  get(obsId: string): VectorEntry | undefined {
+    return this.vectors.get(obsId);
+  }
+
+  entries(): IterableIterator<[string, VectorEntry]> {
+    return this.vectors.entries();
   }
 
   search(
@@ -183,7 +208,9 @@ export class VectorIndex {
   }
 
   clear(): void {
+    const hadVectors = this.vectors.size > 0;
     this.vectors.clear();
+    if (hadVectors) this.listener?.(null, null);
   }
 
   restoreFrom(other: VectorIndex): void {

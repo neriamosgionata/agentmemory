@@ -18,28 +18,65 @@ import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
-function applyDecay(
-  items: Array<{
-    strength: number;
-    lastAccessedAt?: string;
-    updatedAt: string;
-  }>,
-  decayDays: number,
-): void {
+function applyDecay(items: Decayable[], decayDays: number): void {
   if (decayDays <= 0 || !Number.isFinite(decayDays)) return;
   const now = Date.now();
   for (const item of items) {
     const lastAccess = item.lastAccessedAt || item.updatedAt;
-    const daysSince =
-      (now - new Date(lastAccess).getTime()) / (1000 * 60 * 60 * 24);
+    const lastAccessTime = new Date(lastAccess).getTime();
+    const lastDecayedTime = item.lastDecayedAt
+      ? new Date(item.lastDecayedAt).getTime()
+      : -Infinity;
+    const anchor = Math.max(lastAccessTime, lastDecayedTime);
+    const daysSince = (now - anchor) / (1000 * 60 * 60 * 24);
     if (daysSince > decayDays) {
       const decayPeriods = Math.floor(daysSince / decayDays);
       item.strength = Math.max(
         0.1,
         item.strength * Math.pow(0.9, decayPeriods),
       );
+      item.lastDecayedAt = new Date(now).toISOString();
     }
   }
+}
+
+const DECAY_STRENGTH_EPSILON = 1e-9;
+
+type Decayable = {
+  id: string;
+  strength: number;
+  lastAccessedAt?: string;
+  updatedAt: string;
+  lastDecayedAt?: string;
+};
+
+function strengthChanged(before: number, after: number): boolean {
+  return Math.abs(after - before) > DECAY_STRENGTH_EPSILON;
+}
+
+async function decayAndWriteChanged<T extends Decayable>(
+  kv: StateKV,
+  scope: string,
+  items: T[],
+  decayDays: number,
+): Promise<{ scanned: number; written: number }> {
+  const before = items.map(
+    (item) => [item.strength, item.lastDecayedAt] as const,
+  );
+  applyDecay(items, decayDays);
+  const dirty = items.filter(
+    (item, i) =>
+      strengthChanged(before[i][0], item.strength) ||
+      before[i][1] !== item.lastDecayedAt,
+  );
+  for (let i = 0; i < dirty.length; i += 10) {
+    await Promise.all(
+      dirty
+        .slice(i, i + 10)
+        .map((item) => kv.set(scope, item.id, item)),
+    );
+  }
+  return { scanned: items.length, written: dirty.length };
 }
 
 export function registerConsolidationPipelineFunction(
@@ -57,8 +94,10 @@ export function registerConsolidationPipelineFunction(
       const results: Record<string, unknown> = {};
 
       if (tier === "all" || tier === "semantic") {
-        const summaries = await kv.list<SessionSummary>(KV.summaries);
-        const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
+        const [summaries, existingSemantic] = await Promise.all([
+          kv.list<SessionSummary>(KV.summaries),
+          kv.list<SemanticMemory>(KV.semantic),
+        ]);
 
         if (summaries.length >= 5) {
           const recentSummaries = summaries
@@ -69,6 +108,7 @@ export function registerConsolidationPipelineFunction(
             )
             .slice(0, 20);
 
+          const recentSessionIds = recentSummaries.map((s) => s.sessionId);
           const prompt = buildSemanticMergePrompt(
             recentSummaries.map((s) => ({
               title: s.title,
@@ -110,7 +150,7 @@ export function registerConsolidationPipelineFunction(
                   id: generateId("sem"),
                   fact,
                   confidence,
-                  sourceSessionIds: recentSummaries.map((s) => s.sessionId),
+                  sourceSessionIds: recentSessionIds,
                   sourceMemoryIds: [],
                   accessCount: 1,
                   lastAccessedAt: now,
@@ -242,21 +282,19 @@ export function registerConsolidationPipelineFunction(
       }
 
       if (tier === "all" || tier === "decay") {
-        const semantic = await kv.list<SemanticMemory>(KV.semantic);
-        applyDecay(semantic, decayDays);
-        for (const s of semantic) {
-          await kv.set(KV.semantic, s.id, s);
-        }
+        const [semantic, procedural] = await Promise.all([
+          kv.list<SemanticMemory>(KV.semantic),
+          kv.list<ProceduralMemory>(KV.procedural),
+        ]);
 
-        const procedural = await kv.list<ProceduralMemory>(KV.procedural);
-        applyDecay(procedural, decayDays);
-        for (const p of procedural) {
-          await kv.set(KV.procedural, p.id, p);
-        }
+        const [semanticResult, proceduralResult] = await Promise.all([
+          decayAndWriteChanged(kv, KV.semantic, semantic, decayDays),
+          decayAndWriteChanged(kv, KV.procedural, procedural, decayDays),
+        ]);
 
         results.decay = {
-          semantic: semantic.length,
-          procedural: procedural.length,
+          semantic: semanticResult,
+          procedural: proceduralResult,
         };
       }
 

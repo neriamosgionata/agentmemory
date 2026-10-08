@@ -2,6 +2,7 @@
 import { hydrateHookEnv } from "./_env.js";
 hydrateHookEnv();
 
+import { resolveClientSecret } from "../secret-store.js";
 import { resolveProject, hookCwd } from "./_project.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
@@ -22,7 +23,7 @@ function isSdkChildContext(payload: unknown): boolean {
 const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+const SECRET = resolveClientSecret(REST_URL);
 
 // When the server is unreachable a 5s timeout multiplies hard under
 // concurrent fan-out (Slack bots, multi-agent harnesses) and becomes a
@@ -37,6 +38,19 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
+function isPlainTextHost(): boolean {
+  return Boolean(
+    process.env["FACTORY_PROJECT_DIR"] || process.env["DROID_PLUGIN_ROOT"],
+  );
+}
+
+function wantsStructuredOutput(data: Record<string, unknown>): boolean {
+  if (process.env["DEVIN_PROJECT_DIR"] || data.prompt_id !== undefined) {
+    return true;
+  }
+  return data.hook_event_name === "SessionStart" && !isPlainTextHost();
+}
+
 function contextPayload(data: Record<string, unknown>, context: string): string {
   if (
     typeof data.cursor_version === "string" ||
@@ -44,7 +58,7 @@ function contextPayload(data: Record<string, unknown>, context: string): string 
   ) {
     return JSON.stringify({ additional_context: context });
   }
-  if (process.env["DEVIN_PROJECT_DIR"] || data.prompt_id !== undefined) {
+  if (wantsStructuredOutput(data)) {
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",

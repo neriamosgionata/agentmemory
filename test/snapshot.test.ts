@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -74,6 +74,19 @@ function mockSdk() {
     },
   };
 }
+
+const ORIG_GRAPH_MAX_SOURCE_IDS = process.env["GRAPH_MAX_SOURCE_IDS"];
+
+beforeEach(() => {
+  // These upstream tests assert the fixed 32-cap; fork keeps the cap
+  // configurable (default 10), so pin it for this file.
+  process.env["GRAPH_MAX_SOURCE_IDS"] = "32";
+});
+
+afterEach(() => {
+  if (ORIG_GRAPH_MAX_SOURCE_IDS === undefined) delete process.env["GRAPH_MAX_SOURCE_IDS"];
+  else process.env["GRAPH_MAX_SOURCE_IDS"] = ORIG_GRAPH_MAX_SOURCE_IDS;
+});
 
 describe("Snapshot Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
@@ -260,5 +273,40 @@ describe("snapshot-create reentrancy guard", () => {
     })) as { success: boolean; snapshot?: unknown };
     expect(r3.success).toBe(true);
     expect(r3.snapshot).toBeDefined();
+  });
+});
+
+const bloatedIds = (prefix: string, n: number) =>
+  Array.from({ length: n }, (_, i) => `${prefix}_${String(i).padStart(3, "0")}`);
+
+describe("snapshot-restore bounds graph provenance", () => {
+  it("caps sourceObservationIds on restored graph nodes", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerSnapshotFunction(sdk as never, kv as never, "/tmp/agentmemory-snapshots");
+    vi.mocked(readFileSync).mockReturnValueOnce(
+      JSON.stringify({
+        version: "0.4.0",
+        sessions: [],
+        memories: [],
+        graphNodes: [
+          {
+            id: "gn_bloat",
+            type: "file",
+            name: "src/hot.ts",
+            properties: {},
+            sourceObservationIds: bloatedIds("obs", 250),
+            createdAt: "2026-03-01T00:00:00Z",
+          },
+        ],
+      }),
+    );
+    const result = (await sdk.trigger("mem::snapshot-restore", {
+      commitHash: "abc1234",
+    })) as { success: boolean };
+    expect(result.success).toBe(true);
+    const n = await kv.get<{ name: string; sourceObservationIds: string[] }>("mem:graph:nodes", "gn_bloat");
+    expect(n!.name).toBe("src/hot.ts");
+    expect(n!.sourceObservationIds).toEqual(bloatedIds("obs", 250).slice(-32));
   });
 });
