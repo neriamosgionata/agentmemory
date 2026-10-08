@@ -11,6 +11,32 @@ Two kinds of numbers live in this directory:
    throughput against a running daemon. This is the file you want when
    somebody asks "what's p99 at 100k memories under concurrency 100?".
 
+3. **Capture cost** — `capture-costs.ts`. Disk growth, resident memory,
+   hook latency, search context bytes, and force-kill recovery of the
+   built capture path, checked against the budgets in
+   `capture-costs-budgets.json` (transcribed from upstream #1464;
+   keyless profile only — the fork has no Redis backend).
+
+## capture-costs.ts
+
+Runs the built CLI (`node dist/cli.mjs`) in an isolated `--instance`
+with a fresh `HOME`, seeds `BENCH_N` observations (budgets exist for
+100, 1000, 10000), times the bundled `post-tool-use` hook, `SIGKILL`s
+the daemon, and requires every seeded marker back after recovery.
+
+```bash
+npm run build
+npm run bench:capture-costs
+BENCH_N=1000 npm run bench:capture-costs
+```
+
+Knobs: `BENCH_N`, `BENCH_SEED`, `BENCH_HOOK_SAMPLE`,
+`AGENTMEMORY_BENCH_AUTOSTART=1` (spawn an isolated daemon; `0` uses
+`AGENTMEMORY_URL`), `BENCH_BUDGETS=off` to skip budget checks,
+`BENCH_ENFORCE_BUDGETS=0` to report without failing. Exit `1` means an
+invariant failed (observations or index lost); exit `2` means a budget
+was exceeded. Reports land in `benchmark/results/` and are git-ignored.
+
 ## load-100k.ts
 
 Hand-rolled, dependency-free load harness. Issues real HTTP against a
