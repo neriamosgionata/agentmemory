@@ -40,7 +40,6 @@ const PENDING_CLEAR_KEY = "~clear";
 const PENDING_LOG_SAVE_THRESHOLD = 500;
 const EARLY_SAVE_MIN_GAP_MS = 5_000;
 const BACKFILL_MARKER_KEY = "vectors:backfill";
-const MEMORY_ID_PREFIX = "mem_";
 
 // mem:audit exists to record structural deletions of user data — that is
 // the policy stated at the top of src/functions/audit.ts. Index shard
@@ -227,7 +226,6 @@ type PendingVectorRow = {
   q: number;
   id?: string;
   s?: string;
-  k?: "memory" | "observation";
   e?: string;
   t?: 1;
   c?: 1;
@@ -426,7 +424,11 @@ export class IndexPersistence {
     const delay = Math.max(0, this.lastSaveAt + this.saveIntervalMs - this.now());
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.save().catch((err) => this.logFailure("bm25", err));
+      this.save().catch((err) =>
+        logger.warn("index persistence: scheduled save threw outside leg handling", {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
     }, delay);
   }
 
@@ -857,7 +859,6 @@ export class IndexPersistence {
         q,
         id,
         s: entry.sessionId,
-        k: id.startsWith(MEMORY_ID_PREFIX) ? "memory" : "observation",
         e: float32ToBase64(entry.embedding),
       };
     } else {
@@ -1074,12 +1075,17 @@ export class IndexPersistence {
       nextShards[bucketKey] = { hash, chunks };
       if (layoutMatches && priorEntry?.hash === hash) continue;
 
-      for (let i = 0; i < chunks; i++) {
-        await this.kv.set(
+      const chunkWrites = Array.from({ length: chunks }, (_, i) =>
+        this.kv.set(
           VECTOR_BUCKET_SCOPE,
           vectorChunkKey(bucketKey, hash, i),
           body.slice(i * chunkChars, (i + 1) * chunkChars),
-        );
+        ),
+      );
+      const settled = await Promise.allSettled(chunkWrites);
+      const failed = settled.find((r) => r.status === "rejected");
+      if (failed) {
+        throw (failed as PromiseRejectedResult).reason;
       }
       written++;
       // The bucket's old content lives under different keys entirely, so it is
@@ -1155,13 +1161,20 @@ export class IndexPersistence {
 
     // Safe from here: the new manifest is live and names none of these.
     const undeleted: Array<{ scope: string; key: string }> = [];
-    for (const target of reclaimTargets) {
-      const gone = await this.deleteKey(
-        target.scope,
-        target.key,
-        "vector_bucket_reclaim",
-      );
-      if (!gone) undeleted.push(target);
+    const reclaimResults = await Promise.allSettled(
+      reclaimTargets.map((target) =>
+        this.deleteKey(target.scope, target.key, "vector_bucket_reclaim").then(
+          (gone) => ({ target, gone }),
+        ),
+      ),
+    );
+    for (const [i, result] of reclaimResults.entries()) {
+      if (
+        result.status === "rejected" ||
+        !result.value.gone
+      ) {
+        undeleted.push(reclaimTargets[i]);
+      }
     }
     if (reclaimTargets.length > 0) {
       // Record the drain, keeping anything that did not actually go. Clearing
@@ -1460,20 +1473,21 @@ export class IndexPersistence {
         corrupt++;
         continue;
       }
-      const parts: string[] = [];
+      const keys = Array.from(
+        { length: entry.chunks },
+        (_, i) => vectorChunkKey(bucketKey, entry.hash, i),
+      );
+      const parts = await Promise.all(
+        keys.map((key) =>
+          this.kv.get<string>(VECTOR_BUCKET_SCOPE, key).catch(() => null),
+        ),
+      );
       let complete = true;
-      for (let i = 0; i < entry.chunks; i++) {
-        const chunk = await this.kv
-          .get<string>(
-            VECTOR_BUCKET_SCOPE,
-            vectorChunkKey(bucketKey, entry.hash, i),
-          )
-          .catch(() => null);
+      for (const chunk of parts) {
         if (typeof chunk !== "string") {
           complete = false;
           break;
         }
-        parts.push(chunk);
       }
       if (!complete) {
         missing++;

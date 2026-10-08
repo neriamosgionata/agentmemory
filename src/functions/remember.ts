@@ -211,9 +211,10 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         return { memory, supersededId, nearMatch };
       });
 
+      const vectorSessionId = memory.sessionIds?.[0] ?? "memory";
       await vectorIndexAddGuarded(
         memory.id,
-        memory.sessionIds?.[0] ?? "memory",
+        vectorSessionId,
         memory.title + " " + memory.content,
         { kind: "memory", logId: memory.id },
         (embedding) =>
@@ -222,7 +223,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             if (!current || current.isLatest === false) return false;
             getVectorIndex()?.add(
               memory.id,
-              memory.sessionIds?.[0] ?? "memory",
+              vectorSessionId,
               embedding,
             );
             scheduleIndexSave();

@@ -4033,7 +4033,7 @@
       if (res.skipped) return 'skipped: ' + (res.reason || 'not enough input');
       if (name === 'semantic') return fmtNum(res.newFacts || 0) + ' new facts from ' + fmtNum(res.totalSummaries || 0) + ' summaries';
       if (name === 'procedural') return fmtNum(res.newProcedures || 0) + ' new procedures from ' + fmtNum(res.patternsAnalyzed || 0) + ' patterns';
-      if (name === 'decay') return 'checked ' + fmtNum(res.semantic || 0) + ' facts and ' + fmtNum(res.procedural || 0) + ' procedures';
+      if (name === 'decay') return 'checked ' + fmtNum(res.semantic?.written ?? 0) + ' facts and ' + fmtNum(res.procedural?.written ?? 0) + ' procedures';
       if (name === 'reflect') return res.success === false ? 'no insights' : fmtNum(res.newInsights || 0) + ' new insights';
       if (name === 'obsidianExport') return res.success ? 'exported' : 'export failed';
       return '';

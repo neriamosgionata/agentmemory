@@ -143,7 +143,6 @@ describe("vector durability: kill-and-restart against fork buckets", () => {
     expect(rows.get("mem_b")).toMatchObject({
       id: "mem_b",
       s: "ses_2",
-      k: "memory",
     });
     expect(typeof rows.get("mem_b")!.e).toBe("string");
     expect(rows.get("obs_a")!.q as number).toBeGreaterThan(
