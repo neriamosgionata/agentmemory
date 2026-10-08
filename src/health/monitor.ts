@@ -2,6 +2,7 @@ import type { ISdk } from "../iii.js";
 import { cpus } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import type { HealthSnapshot } from "../types.js";
+import type { IndexPersistenceStatus } from "../state/index-persistence.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { evaluateHealth } from "./thresholds.js";
@@ -16,6 +17,22 @@ export function normalizeCpuPercent(
 ): number {
   const cores = coreCount > 0 ? coreCount : 1;
   return singleCorePercent / cores;
+}
+
+let indexPersistenceProvider: (() => IndexPersistenceStatus | null) | null = null;
+
+export function setIndexPersistenceStatusProvider(
+  fn: (() => IndexPersistenceStatus | null) | null,
+): void {
+  indexPersistenceProvider = fn;
+}
+
+function readIndexPersistence(): IndexPersistenceStatus | null {
+  try {
+    return indexPersistenceProvider?.() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export function registerHealthMonitor(
@@ -109,6 +126,7 @@ export function registerHealthMonitor(
       kvConnectivity,
       status: "healthy",
       alerts: [],
+      indexPersistence: readIndexPersistence(),
     };
 
     const evaluated = evaluateHealth(snapshot);

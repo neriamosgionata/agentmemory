@@ -108,7 +108,7 @@ import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
 import { DedupMap } from "./functions/dedup.js";
-import { registerHealthMonitor } from "./health/monitor.js";
+import { registerHealthMonitor, setIndexPersistenceStatusProvider } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog, bootWarn } from "./logger.js";
@@ -439,6 +439,7 @@ async function main() {
   // lost across a hard process exit and the persisted snapshot
   // restores the deleted entry at next boot.
   setIndexPersistence(indexPersistence);
+  setIndexPersistenceStatusProvider(() => indexPersistence.status());
 
   const loaded = await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted index:`, err);

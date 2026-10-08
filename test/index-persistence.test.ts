@@ -1248,7 +1248,7 @@ describe("IndexPersistence", () => {
     ]);
 
     expect(maxConcurrentSaves).toBe(1);
-    expect(executionOrder).toEqual(["manifest_gen_1", "manifest_gen_2", "manifest_gen_3"]);
+    expect(executionOrder).toEqual(["manifest_gen_1", "manifest_gen_2"]);
   });
 
   it("fails closed when generation registry is corrupted or throws on get", async () => {

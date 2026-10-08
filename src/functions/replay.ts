@@ -15,6 +15,7 @@ import { importOrigin } from "../types.js";
 import { claudeConfigDir } from "../config.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { parseJsonlText } from "../replay/jsonl-parser.js";
 import { resetLessonIndex } from "./lessons.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
@@ -404,46 +405,48 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
           : undefined;
 
-        const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
-        if (existing) {
-          existing.observationCount =
-            (existing.observationCount || 0) + parsed.observations.length;
-          if (parsed.endedAt > (existing.endedAt || "")) {
-            existing.endedAt = parsed.endedAt;
+        await withKeyedLock(`obs:${parsed.sessionId}`, async () => {
+          const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
+          if (existing) {
+            existing.observationCount =
+              (existing.observationCount || 0) + parsed.observations.length;
+            if (parsed.endedAt > (existing.endedAt || "")) {
+              existing.endedAt = parsed.endedAt;
+            }
+            if (existing.status === "active") existing.status = "completed";
+            const existingTags = existing.tags || [];
+            if (!existingTags.includes("jsonl-import")) {
+              existing.tags = [...existingTags, "jsonl-import"];
+            }
+            if (!existing.firstPrompt && firstPrompt) {
+              existing.firstPrompt = firstPrompt;
+            }
+            // #775: re-key on parsed.sessionId, not existing.id. Older
+            // session rows may be missing the `id` field; existing.id
+            // would then be undefined, JSON.stringify would drop the
+            // `key` from the state::set payload, and the engine would
+            // reject the call with `missing field \`key\``. Because the
+            // rejection aborts the whole import handler, a single
+            // legacy row killed the entire batch. parsed.sessionId is
+            // always populated (parseJsonlText has a three-level
+            // fallback) and is what we just used to read the row.
+            if (!existing.id) existing.id = parsed.sessionId;
+            await kv.set(KV.sessions, parsed.sessionId, existing);
+          } else {
+            const session: Session = {
+              id: parsed.sessionId,
+              project: parsed.project,
+              cwd: parsed.cwd,
+              startedAt: parsed.startedAt,
+              endedAt: parsed.endedAt,
+              status: "completed",
+              observationCount: parsed.observations.length,
+              tags: ["jsonl-import"],
+              firstPrompt,
+            };
+            await kv.set(KV.sessions, session.id, session);
           }
-          if (existing.status === "active") existing.status = "completed";
-          const existingTags = existing.tags || [];
-          if (!existingTags.includes("jsonl-import")) {
-            existing.tags = [...existingTags, "jsonl-import"];
-          }
-          if (!existing.firstPrompt && firstPrompt) {
-            existing.firstPrompt = firstPrompt;
-          }
-          // #775: re-key on parsed.sessionId, not existing.id. Older
-          // session rows may be missing the `id` field; existing.id
-          // would then be undefined, JSON.stringify would drop the
-          // `key` from the state::set payload, and the engine would
-          // reject the call with `missing field \`key\``. Because the
-          // rejection aborts the whole import handler, a single
-          // legacy row killed the entire batch. parsed.sessionId is
-          // always populated (parseJsonlText has a three-level
-          // fallback) and is what we just used to read the row.
-          if (!existing.id) existing.id = parsed.sessionId;
-          await kv.set(KV.sessions, parsed.sessionId, existing);
-        } else {
-          const session: Session = {
-            id: parsed.sessionId,
-            project: parsed.project,
-            cwd: parsed.cwd,
-            startedAt: parsed.startedAt,
-            endedAt: parsed.endedAt,
-            status: "completed",
-            observationCount: parsed.observations.length,
-            tags: ["jsonl-import"],
-            firstPrompt,
-          };
-          await kv.set(KV.sessions, session.id, session);
-        }
+        });
 
         const compressed: CompressedObservation[] = [];
         await Promise.all(

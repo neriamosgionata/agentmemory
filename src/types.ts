@@ -306,6 +306,7 @@ export interface HealthSnapshot {
   status: "healthy" | "degraded" | "critical";
   alerts: string[];
   notes?: string[];
+  indexPersistence?: import("./state/index-persistence.js").IndexPersistenceStatus | null;
 }
 
 export interface CircuitBreakerState {

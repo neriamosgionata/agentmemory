@@ -5,8 +5,8 @@ import type { StateKV } from "./kv.js";
 import { KV, generateId } from "./schema.js";
 import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
+import { getIndexSaveIntervalMs } from "../config.js";
 
-const DEBOUNCE_MS = 5000;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
 const INDEX_PERSISTENCE_FUNCTION_ID = "mem::index-persistence";
 const BM25_KEY = "data";
@@ -280,7 +280,28 @@ type IndexPersistenceOptions = {
   vectorBuckets?: number;
   sweepGracePeriodMs?: number;
   now?: () => number;
+  saveIntervalMs?: number;
 };
+
+export type IndexLeg = "bm25" | "vector";
+
+export interface IndexLegStatus {
+  pending: boolean;
+  savedAt: string | null;
+  dropped: number;
+  lastError: string | null;
+}
+
+export interface IndexPersistenceStatus {
+  saveIntervalMs: number;
+  saving: boolean;
+  bm25: IndexLegStatus;
+  vector: IndexLegStatus | null;
+}
+
+function emptyLegStatus(): IndexLegStatus {
+  return { pending: false, savedAt: null, dropped: 0, lastError: null };
+}
 
 function vectorBucketCount(options: IndexPersistenceOptions): number {
   const configured = options.vectorBuckets;
@@ -330,7 +351,7 @@ function isValidShardDescriptor(
 
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private lastFailureLogAt = 0;
+  private lastFailureLogAt = new Map<IndexLeg, number>();
   /**
    * Set when a vector load could not read everything the manifest named.
    *
@@ -358,6 +379,14 @@ export class IndexPersistence {
   private stopped = false;
   private lastSaveAt: number;
   private readonly now: () => number;
+  private readonly saveIntervalMs: number;
+  private running: Promise<void> | null = null;
+  private queued: Promise<void> | null = null;
+  private dirtyEpoch = 0;
+  private legs: Record<IndexLeg, IndexLegStatus> = {
+    bm25: emptyLegStatus(),
+    vector: emptyLegStatus(),
+  };
   private seq = 0;
   private pendingLog: Map<string, number> = new Map();
   private logChains: Map<string, Promise<void>> = new Map();
@@ -374,19 +403,31 @@ export class IndexPersistence {
   ) {
     this.vector?.setChangeListener((id, entry) => this.logChange(id, entry));
     this.now = options.now ?? Date.now;
+    const interval = options.saveIntervalMs;
+    this.saveIntervalMs =
+      typeof interval === "number" && Number.isFinite(interval) && interval > 0
+        ? interval
+        : getIndexSaveIntervalMs();
     this.lastSaveAt = this.now();
   }
 
   scheduleSave(): void {
     if (this.stopped) return;
-    if (this.timer) clearTimeout(this.timer);
-    // setTimeout discards the returned promise, so any rejection inside
-    // save() would surface as unhandledRejection and crash the process
-    // under sustained iii-engine write timeouts (issue #204). Funnel
-    // rejections through logFailure() instead.
+    this.dirtyEpoch++;
+    for (const leg of this.activeLegs()) {
+      this.legs[leg].pending = true;
+    }
+    if (this.timer || (this.running && this.queued)) {
+      for (const leg of this.activeLegs()) {
+        this.legs[leg].dropped++;
+      }
+      return;
+    }
+    const delay = Math.max(0, this.lastSaveAt + this.saveIntervalMs - this.now());
     this.timer = setTimeout(() => {
-      this.save().catch((err) => this.logFailure(err));
-    }, DEBOUNCE_MS);
+      this.timer = null;
+      this.save().catch((err) => this.logFailure("bm25", err));
+    }, delay);
   }
 
   /**
@@ -405,49 +446,105 @@ export class IndexPersistence {
     return next;
   }
 
-  async save(): Promise<void> {
-    // Serialize saves: the debounce timer alone cannot prevent an explicit
-    // save() (shutdown flush, delete path) from overlapping a debounce-driven
-    // one and publishing a torn generation. Queueing keeps each generation
-    // whole.
-    const run = async (): Promise<void> => {
-      if (this.timer) {
-        clearTimeout(this.timer);
-        this.timer = null;
-      }
-      const coveredSeq = this.seq;
-      this.lastSaveAt = this.now();
-      // Vectors first. This is the save that has been failing in production — it
-      // is the larger of the two and it runs second, so a BM25 save that consumes
-      // the engine's budget starves it. Going first also makes a vector delete
-      // durable before anything else can get in the way, which is what
-      // flushIndexSave is awaited for on the delete paths.
-      //
-      // Each index gets its own try. One try around both would let a failure in
-      // whichever runs first stop the other from persisting at all — harmless
-      // when BM25 led and vectors trailed, but reversing the order without this
-      // would make a vector failure silently block BM25 too.
-      if (this.vector) {
-        try {
-          await this.saveVectorBuckets(this.vector);
-          await this.clearCoveredPendingLog(coveredSeq).catch((err) => {
-            this.pendingLogError = errorMessage(err);
-            this.logFailure(err);
-          });
-        } catch (err) {
-          this.logFailure(err);
-        }
-      }
-      try {
-        await this.saveBm25Index(this.bm25.serialize());
-      } catch (err) {
-        this.logFailure(err);
-      }
-    };
+  save(): Promise<void> {
+    this.clearTimer();
+    if (this.queued) return this.queued;
+    if (this.running) {
+      const queued = this.running.then(
+        () => {
+          this.queued = null;
+          return this.startRun();
+        },
+        () => {
+          this.queued = null;
+          return this.startRun();
+        },
+      );
+      this.queued = queued;
+      return queued;
+    }
+    return this.startRun();
+  }
 
-    const next = this.saveQueue.then(run, run);
-    this.saveQueue = next;
-    await next;
+  status(): IndexPersistenceStatus {
+    return {
+      saveIntervalMs: this.saveIntervalMs,
+      saving: this.running !== null,
+      bm25: { ...this.legs.bm25 },
+      vector: this.vector ? { ...this.legs.vector } : null,
+    };
+  }
+
+  private clearTimer(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private activeLegs(): IndexLeg[] {
+    return this.vector ? ["bm25", "vector"] : ["bm25"];
+  }
+
+  private startRun(): Promise<void> {
+    const run = this.saveQueue.then(
+      () => this.runSave(),
+      () => this.runSave(),
+    );
+    this.saveQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    const tracked = run.finally(() => {
+      if (this.running === tracked) this.running = null;
+    });
+    this.running = tracked;
+    return tracked;
+  }
+
+  private async runSave(): Promise<void> {
+    const coveredSeq = this.seq;
+    this.lastSaveAt = this.now();
+    // Vectors first. This is the save that has been failing in production — it
+    // is the larger of the two and it runs second, so a BM25 save that consumes
+    // the engine's budget starves it. Going first also makes a vector delete
+    // durable before anything else can get in the way, which is what
+    // flushIndexSave is awaited for on the delete paths.
+    //
+    // Each index gets its own leg. One try around both would let a failure in
+    // whichever runs first stop the other from persisting at all — harmless
+    // when BM25 led and vectors trailed, but reversing the order without this
+    // would make a vector failure silently block BM25 too.
+    if (this.vector) {
+      const vector = this.vector;
+      await this.saveLeg("vector", async () => {
+        await this.saveVectorBuckets(vector);
+        await this.clearCoveredPendingLog(coveredSeq).catch((err) => {
+          this.pendingLogError = errorMessage(err);
+          this.logFailure("vector", err);
+        });
+      });
+    }
+    await this.saveLeg("bm25", async () => {
+      await this.saveBm25Index(this.bm25.serialize());
+    });
+  }
+
+  private async saveLeg(leg: IndexLeg, run: () => Promise<void>): Promise<void> {
+    const status = this.legs[leg];
+    const epoch = this.dirtyEpoch;
+    try {
+      await run();
+      status.savedAt = new Date(this.now()).toISOString();
+      status.lastError = null;
+      if (this.dirtyEpoch === epoch) {
+        status.pending = false;
+      }
+    } catch (err) {
+      status.lastError = errorMessage(err);
+      status.pending = true;
+      this.logFailure(leg, err);
+    }
   }
 
   async load(): Promise<{
@@ -621,10 +718,7 @@ export class IndexPersistence {
 
   stop(): void {
     this.stopped = true;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    this.clearTimer();
   }
 
   pendingLogSize(): number {
@@ -778,7 +872,7 @@ export class IndexPersistence {
       },
       (err) => {
         this.pendingLogError = errorMessage(err);
-        this.logFailure(err);
+        this.logFailure("vector", err);
       },
     );
     this.maybeEarlySave();
@@ -804,7 +898,7 @@ export class IndexPersistence {
     this.earlySaveQueued = true;
     setTimeout(() => {
       this.earlySaveQueued = false;
-      this.save().catch((err) => this.logFailure(err));
+      this.save().catch((err) => this.logFailure("vector", err));
     }, 0);
   }
 
@@ -872,21 +966,21 @@ export class IndexPersistence {
     );
   }
 
-  private logFailure(err: unknown): void {
-    const now = Date.now();
+  private logFailure(leg: IndexLeg, err: unknown): void {
+    const now = this.now();
     // Throttle: persistence failures under load arrive in bursts
-    // (iii-engine queue pressure). Logging every debounce flush adds
-    // noise without information.
-    if (now - this.lastFailureLogAt < FAILURE_LOG_THROTTLE_MS) return;
-    this.lastFailureLogAt = now;
+    // (iii-engine queue pressure). Logging every flush adds noise
+    // without information.
+    if (now - (this.lastFailureLogAt.get(leg) ?? 0) < FAILURE_LOG_THROTTLE_MS) return;
+    this.lastFailureLogAt.set(leg, now);
     const code = (err as { code?: string })?.code;
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn("index persistence: failed to save BM25/vector index", {
+    logger.warn(`index persistence: failed to save the ${leg === "bm25" ? "BM25" : "vector"} index`, {
       code,
       message,
       hint:
         code === "TIMEOUT"
-          ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next debounce flush"
+          ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next save"
           : undefined,
     });
   }

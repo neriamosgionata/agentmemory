@@ -772,7 +772,7 @@ export function registerApiTriggers(
           ? body.agentId.trim().slice(0, 128)
           : undefined;
       const agentId = requestAgentId ?? getAgentId();
-      const session: Session = {
+      const freshSession: Session = {
         id: sessionId,
         project,
         cwd,
@@ -783,7 +783,18 @@ export function registerApiTriggers(
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
       };
-      await kv.set(KV.sessions, sessionId, session);
+      const session = await withKeyedLock(`obs:${sessionId}`, async () => {
+        const existing = await kv.get<Session>(KV.sessions, sessionId);
+        const merged: Session = {
+          ...freshSession,
+          observationCount: existing?.observationCount ?? freshSession.observationCount,
+          firstPrompt: freshSession.firstPrompt ?? existing?.firstPrompt,
+          summary: freshSession.summary ?? existing?.summary,
+          commitShas: existing?.commitShas ?? freshSession.commitShas,
+        };
+        await kv.set(KV.sessions, sessionId, merged);
+        return merged;
+      });
       await addSessionToProjectIndex(kv, project, {
         id: sessionId,
         startedAt: session.startedAt,
@@ -945,7 +956,7 @@ export function registerApiTriggers(
       });
 
       if (sessionId) {
-        await withKeyedLock(`session:${sessionId}`, async () => {
+        await withKeyedLock(`obs:${sessionId}`, async () => {
           const session = await kv.get<Session>(KV.sessions, sessionId);
           if (!session) return;
           const shaSet = new Set<string>(session.commitShas ?? []);

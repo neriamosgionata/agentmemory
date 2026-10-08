@@ -120,7 +120,7 @@ async function lwwMergeGraphNodes(
     if (!item.id || typeof item.id !== "string") continue;
     const ts = graphNodeTs(item);
     if (!ts || Number.isNaN(new Date(ts).getTime())) continue;
-    const wrote = await withKeyedLock(`mem:gnode:${item.id}`, async () => {
+    const wrote = await withKeyedLock("graph:persist", async () => {
       const existing = await kv.get<GraphNode>(KV.graphNodes, item.id);
       if (!existing) {
         await kv.set(KV.graphNodes, item.id, boundRecordSources(item));
@@ -516,7 +516,7 @@ async function applySyncData(
     applied += await lwwMergeGraphNodes(kv, data.graphNodes);
   }
   if (scopes.includes("graph:edges")) {
-    applied += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+    applied += await lwwMergeGraphEdges(kv, data.graphEdges);
   }
 
   return applied;

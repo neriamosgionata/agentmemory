@@ -270,7 +270,25 @@ export function registerSnapshotFunction(
         }
 
         if (state.sessions) {
-          await replaceScope(KV.sessions, state.sessions, (r) => String(r["id"]));
+          const incoming = new Map(
+            state.sessions.map((s) => [String(s.id), s]),
+          );
+          const current = await kv
+            .list<Session>(KV.sessions)
+            .catch(() => [] as Session[]);
+          for (const row of current) {
+            if (!incoming.has(String(row.id))) {
+              const staleId = String(row.id);
+              await withKeyedLock(`obs:${staleId}`, () =>
+                kv.delete(KV.sessions, staleId),
+              );
+            }
+          }
+          for (const session of state.sessions) {
+            await withKeyedLock(`obs:${session.id}`, () =>
+              kv.set(KV.sessions, session.id, session),
+            );
+          }
         }
         if (state.memories) {
           await replaceScope(KV.memories, state.memories, (r) => String(r["id"]));
