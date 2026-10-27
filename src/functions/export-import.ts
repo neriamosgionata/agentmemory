@@ -411,6 +411,36 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           error: `Too many total observations (max ${MAX_TOTAL_OBSERVATIONS})`,
         };
       }
+      const badRow = (rows: readonly unknown[], key: string) =>
+        rows.findIndex((row) => {
+          const id = row && typeof row === "object" ? (row as Record<string, unknown>)[key] : undefined;
+          return typeof id !== "string" || id.length === 0;
+        });
+      for (const [sessionId, obs] of Object.entries(importData.observations)) {
+        const index = badRow(obs, "id");
+        if (index >= 0) {
+          return { success: false, error: `observations.${sessionId}[${index}] must be an object with a string id` };
+        }
+      }
+      const rowKeys: Record<string, string> = { summaries: "sessionId", profiles: "project", accessLogs: "memoryId" };
+      const rowSections = new Set<string>(["sessions", "memories", "summaries", "profiles", ...EXPORT_COLLECTION_NAMES]);
+      for (const section of rowSections) {
+        const rows = (importData as Record<string, unknown>)[section];
+        if (rows !== undefined && !Array.isArray(rows)) {
+          return { success: false, error: `${section} must be an array` };
+        }
+        const key = rowKeys[section] ?? "id";
+        const index = badRow((rows as readonly unknown[]) ?? [], key);
+        if (index >= 0) {
+          return { success: false, error: `${section}[${index}] must be an object with a string ${key}` };
+        }
+      }
+      if ((importData.accessLogs?.length ?? 0) > MAX_ACCESS_LOGS) {
+        return {
+          success: false,
+          error: `Too many access logs (max ${MAX_ACCESS_LOGS})`,
+        };
+      }
 
       const stats = {
         sessions: 0,
@@ -888,15 +918,6 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         });
       }
       if (importData.accessLogs) {
-        if (!Array.isArray(importData.accessLogs)) {
-          return { success: false, error: "accessLogs must be an array" };
-        }
-        if (importData.accessLogs.length > MAX_ACCESS_LOGS) {
-          return {
-            success: false,
-            error: `Too many access logs (max ${MAX_ACCESS_LOGS})`,
-          };
-        }
         const memoryIds = new Set<string>(
           importData.memories.map((m) => m.id),
         );
